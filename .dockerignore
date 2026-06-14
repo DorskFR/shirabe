@@ -1,0 +1,12 @@
+target/
+**/target/
+.git/
+.github/
+.claude/
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+docker-compose.yaml
+README.md

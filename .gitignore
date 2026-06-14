@@ -1,0 +1,8 @@
+/target
+.env
+*.swp
+/.cargo/
+/.cargo-home/
+
+# CLAUDE.md is ignored by the user's global gitignore; track it in this repo
+!CLAUDE.md

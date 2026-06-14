@@ -1,0 +1,48 @@
+# Local-dev compose. NOTE: shirabe serves data from a *MusicBrainz mirror* — the
+# real data is the full MB Postgres dump (the `musicbrainz` schema), which is
+# large and NOT created here. Two ways to get a usable DB:
+#
+#   1. Point DATABASE_URL at the existing mirror, e.g. musicbrainz.dorsk.dev,
+#      and skip the postgres service below entirely.
+#   2. Load a MusicBrainz Postgres dump into the `shirabe-postgres` service
+#      (see https://github.com/metabrainz/musicbrainz-docker), then apply the
+#      shirabe index migration:  make db/migrate/up
+#
+# The empty postgres started here only exists so the index migration + the
+# server boot can be smoke-tested locally; it has no MB data until you load a
+# dump.
+
+services:
+  shirabe-postgres:
+    image: postgres:17
+    container_name: shirabe-postgres
+    environment:
+      POSTGRES_USER: musicbrainz
+      POSTGRES_PASSWORD: musicbrainz
+      POSTGRES_DB: musicbrainz_db
+    ports:
+      - "5490:5432"
+    volumes:
+      - shirabe-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U musicbrainz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  shirabe:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: shirabe
+    depends_on:
+      shirabe-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://musicbrainz:musicbrainz@shirabe-postgres:5432/musicbrainz_db
+      SHIRABE_BIND: 0.0.0.0:8800
+    ports:
+      - "8800:8800"
+
+volumes:
+  shirabe-data:
