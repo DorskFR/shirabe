@@ -39,8 +39,14 @@ services:
       shirabe-postgres:
         condition: service_healthy
     environment:
+      # See .env.example for the full env-var surface and meanings.
       DATABASE_URL: postgres://musicbrainz:musicbrainz@shirabe-postgres:5432/musicbrainz_db
       SHIRABE_BIND: 0.0.0.0:8800
+      SHIRABE_DB_POOL_SIZE: "8"
+      SHIRABE_DEFAULT_LIMIT: "25"
+      SHIRABE_MAX_LIMIT: "100"
+      SHIRABE_SIMILARITY_THRESHOLD: "0.2"
+      RUST_LOG: info
     ports:
       - "8800:8800"
 

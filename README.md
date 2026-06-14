@@ -74,15 +74,32 @@ can be dropped without consequence.
 
 ## Environment variables
 
-| Var | Default | Purpose |
-| --- | --- | --- |
-| `DATABASE_URL` | _(required)_ | Postgres DSN for the MB mirror (read-only role) |
-| `SHIRABE_BIND` | `0.0.0.0:8800` | HTTP bind address |
-| `SHIRABE_DB_POOL_SIZE` | `8` | Max Postgres connections |
-| `SHIRABE_DEFAULT_LIMIT` | `25` | Default search `limit` |
-| `SHIRABE_MAX_LIMIT` | `100` | Hard cap on requested `limit` |
-| `SHIRABE_SIMILARITY_THRESHOLD` | `0.2` | Min `pg_trgm` similarity to keep a row |
-| `RUST_LOG` | `info` | tracing filter |
+A ready-to-copy [`.env.example`](.env.example) lists every variable, its
+default, and meaning. `DATABASE_URL` is the only **required** one; startup fails
+fast with a clear error if it is unset.
+
+| Var | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | **yes** | _(none)_ | Postgres DSN for the MB mirror (read-only role) |
+| `SHIRABE_BIND` | no | `0.0.0.0:8800` | HTTP bind address:port (server listens on **8800**) |
+| `SHIRABE_DB_POOL_SIZE` | no | `8` | Max Postgres connections |
+| `SHIRABE_DEFAULT_LIMIT` | no | `25` | Default search `limit` |
+| `SHIRABE_MAX_LIMIT` | no | `100` | Hard cap on requested `limit` |
+| `SHIRABE_SIMILARITY_THRESHOLD` | no | `0.2` | Min `pg_trgm` similarity to keep a row |
+| `RUST_LOG` | no | `info` | tracing/`EnvFilter` filter |
+
+## Deployment
+
+The container `EXPOSE`s and the server listens on **port 8800** (override with
+`SHIRABE_BIND`) — this is the port a Kubernetes `Service`/`HTTPRoute` should
+target. The image is built from `deploy/Dockerfile` (multi-stage,
+`debian:bookworm-slim` runtime) and published via `make image/release`.
+
+In the homelab, the non-secret `SHIRABE_*` tunables + `RUST_LOG` come from a
+kustomize `configMapGenerator`, while `DATABASE_URL` (the read-only MB-mirror
+DSN) is injected from Vault via the `vault.security.banzaicloud.io/vault-env-*`
+annotations on the Deployment — the same wiring the kusaritoi/cctui overlays
+use. shirabe reads it straight from the environment, no app changes needed.
 
 ## Pointing kusaritoi at shirabe
 
