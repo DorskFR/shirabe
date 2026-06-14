@@ -15,9 +15,14 @@ permissions:
   packages: write
 
 jobs:
-  # Build + push the shirabe container image to ghcr, tag-driven. The build is
-  # self-contained: public base images, crates.io deps, runtime-checked sqlx (no
-  # MusicBrainz DB at build), no secrets baked in.
+  # Build + push the shirabe container image to the homelab Harbor registry,
+  # tag-driven. The build is self-contained: public base images, crates.io deps,
+  # runtime-checked sqlx (no MusicBrainz DB at build), no secrets baked in.
+  #
+  # Requires repo/org secrets:
+  #   HARBOR_REGISTRY  e.g. harbor.dorsk.dev
+  #   HARBOR_USERNAME  a Harbor robot/user with push to project "cyberia"
+  #   HARBOR_PASSWORD  its secret/token
   image:
     runs-on: ubuntu-latest
     steps:
@@ -35,12 +40,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Log in to ghcr
+      - name: Log in to Harbor
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ secrets.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
 
       # linux/amd64 only — matches the single-arch deploy the cluster runs;
       # rust-via-QEMU arm64 is too slow to justify here.
@@ -52,5 +57,5 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/dorskfr/shirabe:${{ steps.ver.outputs.version }}
-            ghcr.io/dorskfr/shirabe:latest
+            ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:${{ steps.ver.outputs.version }}
+            ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:latest

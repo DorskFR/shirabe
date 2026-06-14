@@ -8,7 +8,9 @@ export SHIRABE_BIND
 .PHONY: db/up db/down db/migrate/up db/psql
 .PHONY: image/build image/push image/release
 
-IMAGE_REGISTRY ?= ghcr.io/dorskfr
+# The homelab builds shirabe into Harbor (harbor.dorsk.dev, project "cyberia").
+# Override IMAGE_REGISTRY to publish elsewhere (e.g. ghcr.io/dorskfr).
+IMAGE_REGISTRY ?= harbor.dorsk.dev/cyberia
 IMAGE_REPO     ?= shirabe
 IMAGE_VERSION  ?= $(shell awk -F'"' '/^\[package\]/{f=1} f && /^version/{print $$2; exit}' Cargo.toml)
 IMAGE          ?= $(IMAGE_REGISTRY)/$(IMAGE_REPO)
