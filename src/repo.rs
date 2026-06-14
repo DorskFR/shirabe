@@ -2,7 +2,8 @@
 //! schema). Uses sqlx runtime queries (no compile-time macros) so the build
 //! never needs a live DB.
 
-use sqlx::{PgPool, Row};
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
@@ -12,8 +13,22 @@ use crate::models::{
 };
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
-fn to_score(similarity: f64) -> i32 {
-    (similarity * 100.0).round().clamp(0.0, 100.0) as i32
+///
+/// `similarity()` returns Postgres `real` (FLOAT4), so the score is decoded as
+/// `f32`; we widen to `f64` only for the arithmetic here.
+fn to_score(similarity: f32) -> i32 {
+    (f64::from(similarity) * 100.0).round().clamp(0.0, 100.0) as i32
+}
+
+/// Set the `pg_trgm.similarity_threshold` GUC (the cutoff used by the `%`
+/// operator) on a single connection. `set_limit()` clamps to [0,1] and applies
+/// to the session, so it must run on the same connection as the search query.
+async fn set_similarity_limit(
+    conn: &mut PoolConnection<Postgres>,
+    threshold: f64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
+    Ok(())
 }
 
 // ── Artist search ─────────────────────────────────────────
@@ -27,39 +42,41 @@ pub async fn search_artists(
     limit: i64,
     threshold: f64,
 ) -> Result<Vec<Artist>, sqlx::Error> {
-    // GREATEST over name + sort_name similarity so romanised/native variants
-    // both rank. unaccent both sides for diacritic-insensitive matching.
+    // Candidate filter uses the `%` trigram operator against the RAW columns so
+    // the gin_trgm_ops indexes (shirabe_artist_name_trgm / _sortname_trgm) are
+    // used; `set_limit` sets the operator's cutoff for this connection. The
+    // score is the GREATEST over name + sort_name similarity so romanised /
+    // native variants both rank.
+    let mut conn = pool.acquire().await?;
+    set_similarity_limit(&mut conn, threshold).await?;
     let rows = sqlx::query(
         r"
         SELECT a.id, a.gid, a.name,
                GREATEST(
-                 similarity(unaccent(a.name), unaccent($1)),
-                 similarity(unaccent(a.sort_name), unaccent($1))
+                 similarity(a.name, $1),
+                 similarity(a.sort_name, $1)
                ) AS score
         FROM musicbrainz.artist a
-        WHERE GREATEST(
-                 similarity(unaccent(a.name), unaccent($1)),
-                 similarity(unaccent(a.sort_name), unaccent($1))
-              ) >= $2
+        WHERE a.name % $1 OR a.sort_name % $1
         ORDER BY score DESC, a.id ASC
-        LIMIT $3
+        LIMIT $2
         ",
     )
     .bind(name)
-    .bind(threshold)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
+    drop(conn);
 
     let mut artists = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i32 = row.get("id");
-        let gid: Uuid = row.get("gid");
-        let score: f64 = row.get("score");
+        let id: i32 = row.try_get("id")?;
+        let gid: Uuid = row.try_get("gid")?;
+        let score: f32 = row.try_get("score")?;
         let aliases = load_artist_aliases(pool, id).await?;
         artists.push(Artist {
             id: gid.to_string(),
-            name: row.get("name"),
+            name: row.try_get("name")?,
             score: Some(to_score(score)),
             aliases,
         });
@@ -109,12 +126,12 @@ async fn load_artist_credit(
 
     let mut credits = Vec::with_capacity(rows.len());
     for row in rows {
-        let artist_id: i32 = row.get("artist_id");
-        let gid: Uuid = row.get("artist_gid");
+        let artist_id: i32 = row.try_get("artist_id")?;
+        let gid: Uuid = row.try_get("artist_gid")?;
         let aliases =
             if with_aliases { load_artist_aliases(pool, artist_id).await? } else { Vec::new() };
         credits.push(ArtistCredit {
-            artist: ArtistRef { id: gid.to_string(), name: row.get("credit_name"), aliases },
+            artist: ArtistRef { id: gid.to_string(), name: row.try_get("credit_name")?, aliases },
         });
     }
     Ok(credits)
@@ -167,47 +184,49 @@ pub async fn search_releases(
 ) -> Result<Vec<Release>, sqlx::Error> {
     // Combine release-title trigram score with an optional artist-credit-name
     // trigram score. The artist score, when requested, is a weighted bonus so
-    // title remains the dominant signal.
+    // title remains the dominant signal. The candidate filter uses the `%`
+    // operator on the RAW columns (release.name / artist_credit.name) so the
+    // gin_trgm_ops indexes are used; the `%` cutoff is set via `set_limit`.
+    let mut conn = pool.acquire().await?;
+    set_similarity_limit(&mut conn, threshold).await?;
     let rows = sqlx::query(
         r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
                ac.name AS credit_name,
-               similarity(unaccent(r.name), unaccent($1)) AS title_score,
+               similarity(r.name, $1) AS title_score,
                CASE WHEN $2::text IS NULL THEN NULL
-                    ELSE similarity(unaccent(ac.name), unaccent($2)) END AS artist_score
+                    ELSE similarity(ac.name, $2) END AS artist_score
         FROM musicbrainz.release r
         JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
-        WHERE similarity(unaccent(r.name), unaccent($1)) >= $3
-          AND ($2::text IS NULL OR similarity(unaccent(ac.name), unaccent($2)) >= $4)
-          AND ($5::int IS NULL OR EXISTS (
+        WHERE r.name % $1
+          AND ($2::text IS NULL OR ac.name % $2)
+          AND ($3::int IS NULL OR EXISTS (
                 SELECT 1 FROM musicbrainz.release_country rc
-                WHERE rc.release = r.id AND rc.date_year = $5
+                WHERE rc.release = r.id AND rc.date_year = $3
                 UNION ALL
                 SELECT 1 FROM musicbrainz.release_unknown_country ruc
-                WHERE ruc.release = r.id AND ruc.date_year = $5))
-        ORDER BY (similarity(unaccent(r.name), unaccent($1))
+                WHERE ruc.release = r.id AND ruc.date_year = $3))
+        ORDER BY (similarity(r.name, $1)
                   + COALESCE(CASE WHEN $2::text IS NULL THEN 0
-                       ELSE similarity(unaccent(ac.name), unaccent($2)) END, 0) * 0.5) DESC,
+                       ELSE similarity(ac.name, $2) END, 0) * 0.5) DESC,
                  r.id ASC
-        LIMIT $6
+        LIMIT $4
         ",
     )
     .bind(title)
     .bind(artist)
-    .bind(threshold)
-    // Looser artist gate so credited-name variants still pass.
-    .bind((threshold * 0.5).max(0.05))
     .bind(year.and_then(|y| y.parse::<i32>().ok()))
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
+    drop(conn);
 
     let mut releases = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i32 = row.get("id");
-        let gid: Uuid = row.get("gid");
-        let title_score: f64 = row.get("title_score");
-        let artist_credit_id: i32 = row.get("artist_credit");
+        let id: i32 = row.try_get("id")?;
+        let gid: Uuid = row.try_get("gid")?;
+        let title_score: f32 = row.try_get("title_score")?;
+        let artist_credit_id: i32 = row.try_get("artist_credit")?;
         let rg_id: Option<i32> = row.try_get("release_group").ok();
 
         let artist_credit = load_artist_credit(pool, artist_credit_id, false).await?;
@@ -219,7 +238,7 @@ pub async fn search_releases(
 
         releases.push(Release {
             id: gid.to_string(),
-            title: row.get("name"),
+            title: row.try_get("name")?,
             date,
             score: Some(to_score(title_score)),
             status,
@@ -298,7 +317,7 @@ async fn release_track_count(pool: &PgPool, release_id: i32) -> Result<Option<u3
     .bind(release_id)
     .fetch_one(pool)
     .await?;
-    let total: i64 = row.get("total");
+    let total: i64 = row.try_get("total")?;
     Ok(if total > 0 { Some(total as u32) } else { None })
 }
 
@@ -320,8 +339,8 @@ pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>,
         return Ok(None);
     };
 
-    let id: i32 = row.get("id");
-    let artist_credit_id: i32 = row.get("artist_credit");
+    let id: i32 = row.try_get("id")?;
+    let artist_credit_id: i32 = row.try_get("artist_credit")?;
     let rg_id: Option<i32> = row.try_get("release_group").ok();
 
     let artist_credit = load_artist_credit(pool, artist_credit_id, false).await?;
@@ -335,7 +354,7 @@ pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>,
 
     Ok(Some(Release {
         id: gid.to_string(),
-        title: row.get("name"),
+        title: row.try_get("name")?,
         date,
         score: None,
         status,
@@ -365,9 +384,9 @@ async fn load_media(pool: &PgPool, release_id: i32) -> Result<Vec<Medium>, sqlx:
 
     let mut media = Vec::with_capacity(rows.len());
     for row in rows {
-        let medium_id: i32 = row.get("id");
-        let position: i32 = row.get("position");
-        let track_count: i32 = row.get("track_count");
+        let medium_id: i32 = row.try_get("id")?;
+        let position: i32 = row.try_get("position")?;
+        let track_count: i32 = row.try_get("track_count")?;
         let title: Option<String> =
             row.try_get::<String, _>("title").ok().filter(|s| !s.is_empty());
         let tracks = load_tracks(pool, medium_id).await?;
@@ -403,9 +422,9 @@ async fn load_tracks(pool: &PgPool, medium_id: i32) -> Result<Vec<Track>, sqlx::
 
     let mut tracks = Vec::with_capacity(rows.len());
     for row in rows {
-        let track_gid: Uuid = row.get("track_gid");
-        let rec_gid: Uuid = row.get("rec_gid");
-        let position: i32 = row.get("position");
+        let track_gid: Uuid = row.try_get("track_gid")?;
+        let rec_gid: Uuid = row.try_get("rec_gid")?;
+        let position: i32 = row.try_get("position")?;
         let track_ac: Option<i32> = row.try_get("track_ac").ok();
 
         // Track-level credit is only meaningful when present; the consumer
@@ -417,12 +436,12 @@ async fn load_tracks(pool: &PgPool, medium_id: i32) -> Result<Vec<Track>, sqlx::
 
         tracks.push(Track {
             id: track_gid.to_string(),
-            title: row.get("track_name"),
+            title: row.try_get("track_name")?,
             position: position as u32,
-            number: row.get("number"),
+            number: row.try_get("number")?,
             recording: RecordingRef {
                 id: rec_gid.to_string(),
-                title: row.get("rec_name"),
+                title: row.try_get("rec_name")?,
                 length: row.try_get("rec_length").ok(),
             },
             artist_credit,
@@ -476,35 +495,39 @@ pub async fn search_recordings(
     limit: i64,
     threshold: f64,
 ) -> Result<Vec<Recording>, sqlx::Error> {
+    // Candidate filter uses the `%` operator on the RAW recording.name /
+    // artist_credit.name columns so the gin_trgm_ops indexes are used; cutoff
+    // set via `set_limit` on this connection.
+    let mut conn = pool.acquire().await?;
+    set_similarity_limit(&mut conn, threshold).await?;
     let rows = sqlx::query(
         r"
         SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
-               similarity(unaccent(rec.name), unaccent($1)) AS title_score
+               similarity(rec.name, $1) AS title_score
         FROM musicbrainz.recording rec
         JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
-        WHERE similarity(unaccent(rec.name), unaccent($1)) >= $2
-          AND ($3::text IS NULL OR similarity(unaccent(ac.name), unaccent($3)) >= $4)
-        ORDER BY (similarity(unaccent(rec.name), unaccent($1))
-                  + COALESCE(CASE WHEN $3::text IS NULL THEN 0
-                       ELSE similarity(unaccent(ac.name), unaccent($3)) END, 0) * 0.5) DESC,
+        WHERE rec.name % $1
+          AND ($2::text IS NULL OR ac.name % $2)
+        ORDER BY (similarity(rec.name, $1)
+                  + COALESCE(CASE WHEN $2::text IS NULL THEN 0
+                       ELSE similarity(ac.name, $2) END, 0) * 0.5) DESC,
                  rec.id ASC
-        LIMIT $5
+        LIMIT $3
         ",
     )
     .bind(title)
-    .bind(threshold)
     .bind(artist)
-    .bind((threshold * 0.5).max(0.05))
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
+    drop(conn);
 
     let mut recordings = Vec::with_capacity(rows.len());
     for row in rows {
-        let rec_id: i32 = row.get("id");
-        let gid: Uuid = row.get("gid");
-        let title_score: f64 = row.get("title_score");
-        let ac_id: i32 = row.get("artist_credit");
+        let rec_id: i32 = row.try_get("id")?;
+        let gid: Uuid = row.try_get("gid")?;
+        let title_score: f32 = row.try_get("title_score")?;
+        let ac_id: i32 = row.try_get("artist_credit")?;
 
         let artist_credit = load_artist_credit(pool, ac_id, true).await?;
         // inc=releases+media: full release shapes incl. media/tracks.
@@ -512,7 +535,7 @@ pub async fn search_recordings(
 
         recordings.push(Recording {
             id: gid.to_string(),
-            title: row.get("name"),
+            title: row.try_get("name")?,
             length: row.try_get("length").ok(),
             score: Some(to_score(title_score)),
             artist_credit,
@@ -540,15 +563,15 @@ pub async fn lookup_recording(pool: &PgPool, gid: Uuid) -> Result<Option<Recordi
         return Ok(None);
     };
 
-    let rec_id: i32 = row.get("id");
-    let ac_id: i32 = row.get("artist_credit");
+    let rec_id: i32 = row.try_get("id")?;
+    let ac_id: i32 = row.try_get("artist_credit")?;
     let artist_credit = load_artist_credit(pool, ac_id, true).await?;
     // Lookup does not request media; emit lightweight release shapes.
     let releases = load_recording_releases(pool, rec_id, false).await?;
 
     Ok(Some(Recording {
         id: gid.to_string(),
-        title: row.get("name"),
+        title: row.try_get("name")?,
         length: row.try_get("length").ok(),
         score: None,
         artist_credit,
@@ -580,9 +603,9 @@ async fn load_recording_releases(
     // DISTINCT on r.id already guards against duplicate releases.
     let mut releases = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i32 = row.get("id");
-        let gid: Uuid = row.get("gid");
-        let artist_credit_id: i32 = row.get("artist_credit");
+        let id: i32 = row.try_get("id")?;
+        let gid: Uuid = row.try_get("gid")?;
+        let artist_credit_id: i32 = row.try_get("artist_credit")?;
         let rg_id: Option<i32> = row.try_get("release_group").ok();
 
         let artist_credit = load_artist_credit(pool, artist_credit_id, false).await?;
@@ -599,7 +622,7 @@ async fn load_recording_releases(
 
         releases.push(Release {
             id: gid.to_string(),
-            title: row.get("name"),
+            title: row.try_get("name")?,
             date,
             score: None,
             status,
