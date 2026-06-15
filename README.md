@@ -1,20 +1,19 @@
 # shirabe
 
-A small, fast, self-hosted Rust API that implements the subset of the
-[MusicBrainz ws/2](https://musicbrainz.org/doc/MusicBrainz_API) web service that
-[kusaritoi](https://github.com/DorskFR/kusaritoi) actually uses. It queries a
-**synced MusicBrainz Postgres mirror** directly via `pg_trgm` trigram search,
-replacing the slow official MusicBrainz Docker stack + Apache SOLR.
+A small, fast, self-hosted Rust API that implements a subset of the
+[MusicBrainz ws/2](https://musicbrainz.org/doc/MusicBrainz_API) web service. It
+queries a **synced MusicBrainz Postgres mirror** directly via `pg_trgm` trigram
+search, replacing the slow official MusicBrainz Docker stack + Apache SOLR.
 
 `調べ` (shirabe) — "to look up / investigate".
 
 ## Why
 
-kusaritoi only calls ~5 ws/2 endpoints (3 query shapes). The official MB search
-server is heavy (SOLR + the full ws/2 app). shirabe answers those exact requests
-straight from the replicated `musicbrainz` Postgres schema, emitting
-MusicBrainz-compatible hyphenated-key JSON, so kusaritoi's existing parser and
-confidence re-scoring work unchanged.
+A typical consumer only needs ~5 ws/2 endpoints (3 query shapes). The official
+MB search server is heavy (SOLR + the full ws/2 app). shirabe answers those
+exact requests straight from the replicated `musicbrainz` Postgres schema,
+emitting MusicBrainz-compatible hyphenated-key JSON, so an existing client parser
+and confidence re-scoring work unchanged.
 
 ## Endpoints
 
@@ -33,7 +32,7 @@ All responses are JSON with MB's hyphenated keys (`artist-credit`,
 ### Scoring
 
 `score` (0-100) is synthesized from `pg_trgm` `similarity()` (0.0-1.0 scaled to
-0-100), so kusaritoi's own confidence re-scoring keeps working. Results are
+0-100), so a client's own confidence re-scoring keeps working. Results are
 ordered by similarity descending and capped at `limit`.
 
 ### Query parser
@@ -62,7 +61,7 @@ and runs `SELECT`-only queries — use a read-only DB role.
 Before first use, apply the index migration once (`migrations/0001_*.sql`):
 
 ```sh
-DATABASE_URL=postgres://readonly@musicbrainz.dorsk.dev/musicbrainz_db \
+DATABASE_URL=postgres://readonly@mirror.example.com/musicbrainz_db \
   sqlx migrate run --source migrations
 # or: make db/migrate/up
 ```
@@ -93,30 +92,22 @@ fast with a clear error if it is unset.
 The container `EXPOSE`s and the server listens on **port 8800** (override with
 `SHIRABE_BIND`) — this is the port a Kubernetes `Service`/`HTTPRoute` should
 target. The image is built from `deploy/Dockerfile` (multi-stage,
-`debian:bookworm-slim` runtime) and published via `make image/release`.
+`debian:bookworm-slim` runtime) and published to GitHub Container Registry via
+`make image/release` (or the tag-driven `release` GitHub Actions workflow).
 
-In the homelab, the non-secret `SHIRABE_*` tunables + `RUST_LOG` come from a
-kustomize `configMapGenerator`, while `DATABASE_URL` (the read-only MB-mirror
-DSN) is injected from Vault via the `vault.security.banzaicloud.io/vault-env-*`
-annotations on the Deployment — the same wiring the kusaritoi/cctui overlays
-use. shirabe reads it straight from the environment, no app changes needed.
+shirabe is fully configured through environment variables (see above). Supply
+the `SHIRABE_*` tunables + `RUST_LOG` however your platform prefers (configMap,
+`.env`, plain env) and inject `DATABASE_URL` — the read-only MB-mirror DSN —
+from your secret store. shirabe reads it straight from the environment, no app
+changes needed.
 
-## Pointing kusaritoi at shirabe
+## Pointing a consumer at shirabe
 
-kusaritoi's `MusicBrainzConfig` (`kusaritoi/src/search/providers/musicbrainz.rs`)
-defaults to `base_url: https://musicbrainz.org` with `rate_limit_per_second: 1`.
-shirabe talks to your own DB, so the 1 req/s courtesy limit is unnecessary:
-
-```rust
-MusicBrainzConfig {
-    base_url: "http://shirabe:8800".to_string(), // or wherever shirabe runs
-    rate_limit_per_second: 50,                    // relax — it's your own DB
-    ..Default::default()
-}
-```
-
-shirabe serves the exact same paths (`/ws/2/...`) and JSON shapes kusaritoi
-already parses, so no consumer code changes are needed beyond config.
+shirabe serves the exact same paths (`/ws/2/...`) and JSON shapes a MusicBrainz
+ws/2 client already parses. Point your client's base URL at the shirabe instance
+(e.g. `http://shirabe:8800`) instead of `https://musicbrainz.org`. Since shirabe
+talks to your own DB, the official 1 req/s courtesy rate limit is unnecessary —
+no consumer code changes are needed beyond config.
 
 ## Development
 
@@ -131,8 +122,7 @@ make image/build
 
 `docker-compose.yaml` starts an **empty** local postgres for smoke-testing the
 migration + server boot. Real data requires loading a MusicBrainz Postgres dump
-(see musicbrainz-docker) or pointing `DATABASE_URL` at an existing mirror such as
-`musicbrainz.dorsk.dev`.
+(see musicbrainz-docker) or pointing `DATABASE_URL` at an existing mirror.
 
 ## License
 

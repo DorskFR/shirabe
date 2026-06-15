@@ -15,14 +15,10 @@ permissions:
   packages: write
 
 jobs:
-  # Build + push the shirabe container image to the homelab Harbor registry,
+  # Build + push the shirabe container image to GitHub Container Registry,
   # tag-driven. The build is self-contained: public base images, crates.io deps,
   # runtime-checked sqlx (no MusicBrainz DB at build), no secrets baked in.
-  #
-  # Requires repo/org secrets:
-  #   HARBOR_REGISTRY  e.g. harbor.dorsk.dev
-  #   HARBOR_USERNAME  a Harbor robot/user with push to project "cyberia"
-  #   HARBOR_PASSWORD  its secret/token
+  # Auth uses the built-in GITHUB_TOKEN (no extra secrets needed).
   image:
     runs-on: ubuntu-latest
     steps:
@@ -38,17 +34,21 @@ jobs:
           fi
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/setup-buildx-action@v4
 
-      - name: Log in to Harbor
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
         with:
-          registry: ${{ secrets.HARBOR_REGISTRY }}
-          username: ${{ secrets.HARBOR_USERNAME }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # linux/amd64 only — matches the single-arch deploy the cluster runs;
-      # rust-via-QEMU arm64 is too slow to justify here.
+      # linux/amd64 only — single-arch deploy; rust-via-QEMU arm64 is too slow
+      # to justify here.
       - name: Build + push shirabe image
         uses: docker/build-push-action@v7
         with:
@@ -56,4 +56,4 @@ jobs:
           file: deploy/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:${{ steps.ver.outputs.version }}
+          tags: ${{ steps.img.outputs.name }}:${{ steps.ver.outputs.version }}

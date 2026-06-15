@@ -3,7 +3,7 @@
 A small, fast Rust API serving a subset of the MusicBrainz ws/2 web service
 directly from a synced MusicBrainz Postgres mirror (the `musicbrainz` schema)
 via `pg_trgm`. It replaces the slow official MusicBrainz Docker + SOLR stack for
-the consumer project [kusaritoi](https://github.com/DorskFR/kusaritoi).
+consumer applications that only need a few ws/2 endpoints.
 
 ## Layout
 
@@ -19,8 +19,8 @@ the consumer project [kusaritoi](https://github.com/DorskFR/kusaritoi).
 
 ## Rules
 
-- The JSON contract is defined by kusaritoi's parsing structs in
-  `kusaritoi/src/search/providers/musicbrainz.rs`. Match those shapes exactly.
+- The JSON contract is defined by the consumer's MusicBrainz ws/2 parsing
+  structs. Match the MusicBrainz hyphenated-key shapes exactly.
 - Read-only DB: only `SELECT`. Never write to the mirror.
 - Use sqlx **runtime** queries (`sqlx::query`), not compile-time macros — the
   build must not need a live DB.

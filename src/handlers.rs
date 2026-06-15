@@ -1,4 +1,4 @@
-//! axum handlers implementing the MusicBrainz ws/2 subset kusaritoi consumes.
+//! axum handlers implementing the MusicBrainz ws/2 subset the consumer uses.
 
 use std::sync::Arc;
 

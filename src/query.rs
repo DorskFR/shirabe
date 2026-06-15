@@ -1,7 +1,8 @@
-//! A deliberately small parser for the Lucene-ish query strings kusaritoi sends.
+//! A deliberately small parser for the Lucene-ish query strings the consumer
+//! sends.
 //!
-//! We do **not** implement Lucene. kusaritoi only ever produces a handful of
-//! fixed query shapes (see `kusaritoi/src/search/providers/musicbrainz.rs`):
+//! We do **not** implement Lucene. The consumer only ever produces a handful of
+//! fixed query shapes:
 //!
 //! - artist:    bare string (the whole query is the artist name)
 //! - release:   `release:(title) AND artist:(name)` [`AND date:(YYYY*)`]

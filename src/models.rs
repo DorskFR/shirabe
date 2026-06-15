@@ -1,8 +1,7 @@
 //! Serde response models emitting MusicBrainz-compatible hyphenated-key JSON.
 //!
-//! These mirror the parsing structs in
-//! `kusaritoi/src/search/providers/musicbrainz.rs` (the contract). Only the
-//! fields kusaritoi actually deserializes are emitted.
+//! These mirror the parsing structs the consumer service deserializes (the
+//! contract). Only the fields the consumer actually reads are emitted.
 
 use serde::Serialize;
 

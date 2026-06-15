@@ -2,8 +2,8 @@
 # real data is the full MB Postgres dump (the `musicbrainz` schema), which is
 # large and NOT created here. Two ways to get a usable DB:
 #
-#   1. Point DATABASE_URL at the existing mirror, e.g. musicbrainz.dorsk.dev,
-#      and skip the postgres service below entirely.
+#   1. Point DATABASE_URL at an existing mirror and skip the postgres service
+#      below entirely.
 #   2. Load a MusicBrainz Postgres dump into the `shirabe-postgres` service
 #      (see https://github.com/metabrainz/musicbrainz-docker), then apply the
 #      shirabe index migration:  make db/migrate/up
