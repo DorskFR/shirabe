@@ -16,6 +16,7 @@ use axum::Router;
 use axum::routing::get;
 use clap::Parser;
 use sqlx::PgPool;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -58,5 +59,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ws/2/release/{mbid}", get(handlers::lookup_release))
         .route("/ws/2/recording", get(handlers::search_recording))
         .route("/ws/2/recording/{mbid}", get(handlers::lookup_recording))
+        // Per-request access log (method, path, status, latency). Enable with
+        // `tower_http=debug` in RUST_LOG to see every ws/2 call.
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
