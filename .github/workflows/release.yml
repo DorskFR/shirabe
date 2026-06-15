@@ -56,6 +56,4 @@ jobs:
           file: deploy/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:${{ steps.ver.outputs.version }}
-            ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:latest
+          tags: ${{ secrets.HARBOR_REGISTRY }}/cyberia/shirabe:${{ steps.ver.outputs.version }}

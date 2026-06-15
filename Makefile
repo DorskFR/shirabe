@@ -59,14 +59,12 @@ db/psql:  ## Open psql shell to the local database
 
 # ── Image ──────────────────────────────────────────────────
 
-image/build:  ## Build container image ($(IMAGE):$(IMAGE_VERSION) + :latest)
-	docker build -f deploy/Dockerfile \
-	  -t $(IMAGE):$(IMAGE_VERSION) \
-	  -t $(IMAGE):latest .
+image/build:  ## Build container image tagged with the Cargo.toml version (no :latest)
+	docker build --platform linux/amd64 -f deploy/Dockerfile \
+	  -t $(IMAGE):$(IMAGE_VERSION) .
 
-image/push:  ## Push container image tags
+image/push:  ## Push the versioned image tag
 	docker push $(IMAGE):$(IMAGE_VERSION)
-	docker push $(IMAGE):latest
 
 image/release: image/build image/push  ## Build + push container image
 
