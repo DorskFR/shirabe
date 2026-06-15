@@ -144,13 +144,13 @@ async fn load_artist_credit(
 async fn release_date(pool: &PgPool, release_id: i32) -> Result<String, sqlx::Error> {
     let rows = sqlx::query(
         r"
-        SELECT rc.date_year AS y, rc.date_month AS m, rc.date_day AS d,
+        SELECT rc.date_year::int AS y, rc.date_month::int AS m, rc.date_day::int AS d,
                (iso.code = 'XW') AS is_xw
         FROM musicbrainz.release_country rc
         LEFT JOIN musicbrainz.iso_3166_1 iso ON iso.area = rc.country
         WHERE rc.release = $1
         UNION ALL
-        SELECT date_year, date_month, date_day, false
+        SELECT date_year::int, date_month::int, date_day::int, false
         FROM musicbrainz.release_unknown_country
         WHERE release = $1
         ",
