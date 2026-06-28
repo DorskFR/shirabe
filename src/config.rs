@@ -1,8 +1,31 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-/// Runtime configuration, sourced from environment variables (or CLI flags).
+/// Top-level CLI. With no subcommand, shirabe starts the axum API server
+/// (unchanged behaviour). `shirabe sync <source>` instead runs that source's
+/// `refresh()` once and exits — so bulk ingest runs as a CronJob on the same
+/// image, independent of the API pod.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "shirabe", about = "MusicBrainz ws/2 subset served from a Postgres mirror")]
+pub struct Cli {
+    #[command(flatten)]
+    pub config: Config,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Subcommands. Absence => run the HTTP server.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Run a single source's ingest refresh, then exit (CronJob entrypoint).
+    Sync {
+        /// Source id to refresh (e.g. `musicbrainz`).
+        source: String,
+    },
+}
+
+/// Runtime configuration, sourced from environment variables (or CLI flags).
+#[derive(Debug, Clone, clap::Args)]
 pub struct Config {
     /// Postgres connection string for the MusicBrainz mirror (read-only role recommended).
     #[arg(long, env = "DATABASE_URL")]
