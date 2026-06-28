@@ -1,6 +1,6 @@
 //! Extensible source / plugin model (SHIB-3).
 //!
-//! Every ingest provider — MusicBrainz, IMDb, TMDB, TVDB, Wikidata — is a
+//! Every ingest provider — MusicBrainz, IMDb, TMDB, TVDB — is a
 //! uniform unit of work behind the [`Source`] trait. The [`Registry`] holds the
 //! configured sources; facade routers stay thin and call into sources. Each
 //! source owns one row in the writable `shirabe.source` table (name PK,
@@ -9,13 +9,13 @@
 //! and the `shirabe sync <source>` CronJob can report freshness.
 //!
 //! Adding a provider later (IMDb `BulkDump`, TMDB `EnumerateLazyHydrate`, TVDB
-//! `LazyScrape`, Wikidata `BulkDump`) is just: implement `Source`, register it.
+//! `LazyScrape`) is just: implement `Source`, register it.
 
 pub mod imdb;
 pub mod musicbrainz;
 pub mod tmdb;
 pub mod tvdb;
-pub mod wikidata;
+pub mod xref;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::sources::tvdb::TokenStore;
 /// mirrors a read-only upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestMode {
-    /// Periodic full dump ingest (IMDb TSV, Wikidata).
+    /// Periodic full dump ingest (IMDb TSV).
     BulkDump,
     /// Enumerate the id space (e.g. TMDB daily id export), hydrate detail lazily.
     EnumerateLazyHydrate,
@@ -165,13 +165,11 @@ impl Registry {
         let imdb_pool = pools.imdb.clone();
         let tmdb_pool = pools.tmdb.clone();
         let tvdb_pool = pools.tvdb.clone();
-        let shirabe_pool = pools.shirabe.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
         registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool)));
         registry.register(Arc::new(tmdb::TmdbSource::new(tmdb_pool)));
         registry.register(Arc::new(tvdb::TvdbSource::new(tvdb_pool, tvdb_tokens, config)));
-        registry.register(Arc::new(wikidata::WikidataXrefSource::new(shirabe_pool)));
         registry
     }
 
