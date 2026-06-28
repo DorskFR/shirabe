@@ -11,7 +11,9 @@
 //! Adding a provider later (IMDb `BulkDump`, TMDB `EnumerateLazyHydrate`, TVDB
 //! `LazyScrape`, Wikidata `BulkDump`) is just: implement `Source`, register it.
 
+pub mod imdb;
 pub mod musicbrainz;
+pub mod wikidata;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -151,8 +153,12 @@ impl Registry {
     #[must_use]
     pub fn with_defaults(pools: Pools) -> Self {
         let mb_pool = pools.musicbrainz.clone();
+        let imdb_pool = pools.imdb.clone();
+        let shirabe_pool = pools.shirabe.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
+        registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool)));
+        registry.register(Arc::new(wikidata::WikidataXrefSource::new(shirabe_pool)));
         registry
     }
 
