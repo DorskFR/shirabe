@@ -55,6 +55,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handlers::health))
         .route("/ws/2", get(handlers::health))
         .route("/ws/2/artist", get(handlers::search_artist))
+        .route("/ws/2/artist/{mbid}", get(handlers::lookup_artist))
         .route("/ws/2/release", get(handlers::search_release))
         .route("/ws/2/release/{mbid}", get(handlers::lookup_release))
         .route("/ws/2/recording", get(handlers::search_recording))

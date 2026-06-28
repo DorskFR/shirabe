@@ -17,11 +17,10 @@ use crate::{AppState, query, repo};
 pub struct SearchParams {
     pub query: Option<String>,
     pub limit: Option<i64>,
-    // `fmt` and `inc` are accepted for compatibility but not acted on
-    // structurally — shapes are fixed per endpoint.
+    // `fmt` is accepted for compatibility but not acted on structurally — shapes
+    // are fixed per endpoint. `inc` is honoured by the artist lookup (url-rels).
     #[allow(dead_code)]
     pub fmt: Option<String>,
-    #[allow(dead_code)]
     pub inc: Option<String>,
 }
 
@@ -95,6 +94,24 @@ fn parse_mbid(raw: &str) -> ApiResult<Uuid> {
     Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("invalid mbid: {raw}")))
 }
 
+/// True when an `inc=` param (space/`+`-separated list) contains the given token.
+fn inc_has(inc: Option<&str>, token: &str) -> bool {
+    inc.is_some_and(|s| s.split([' ', '+']).any(|t| t == token))
+}
+
+/// `GET /ws/2/artist/{mbid}`
+pub async fn lookup_artist(
+    State(state): State<Arc<AppState>>,
+    Path(mbid): Path<String>,
+    Query(params): Query<SearchParams>,
+) -> ApiResult<Json<Value>> {
+    let gid = parse_mbid(&mbid)?;
+    let with_url_rels = inc_has(params.inc.as_deref(), "url-rels");
+    let artist =
+        repo::lookup_artist(&state.pool, gid, with_url_rels).await?.ok_or(ApiError::NotFound)?;
+    Ok(Json(serde_json::to_value(artist).expect("artist serializes")))
+}
+
 /// `GET /ws/2/release/{mbid}`
 pub async fn lookup_release(
     State(state): State<Arc<AppState>>,
@@ -119,4 +136,19 @@ pub async fn lookup_recording(
 pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
     repo::ping(&state.pool).await?;
     Ok(Json(json!({ "status": "ok" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inc_has;
+
+    #[test]
+    fn inc_has_matches_tokens() {
+        assert!(inc_has(Some("url-rels"), "url-rels"));
+        assert!(inc_has(Some("aliases+url-rels"), "url-rels"));
+        assert!(inc_has(Some("aliases url-rels"), "url-rels"));
+        assert!(!inc_has(Some("url-rels-extra"), "url-rels"));
+        assert!(!inc_has(Some("aliases"), "url-rels"));
+        assert!(!inc_has(None, "url-rels"));
+    }
 }

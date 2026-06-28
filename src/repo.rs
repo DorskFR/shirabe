@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
 use crate::models::{
-    Alias, Artist, ArtistCredit, ArtistRef, Medium, Recording, RecordingRef, Relation, Release,
-    ReleaseGroup, ReleaseStub, Track,
+    Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Medium, Recording, RecordingRef,
+    Relation, Release, ReleaseGroup, ReleaseStub, Track, UrlRelation, UrlResource,
 };
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
@@ -82,6 +82,79 @@ pub async fn search_artists(
         });
     }
     Ok(artists)
+}
+
+// ── Artist lookup ─────────────────────────────────────────
+
+/// `GET /ws/2/artist/{mbid}[?inc=url-rels]`
+///
+/// Loads the core artist row by MBID; when `with_url_rels` is set, also attaches
+/// the artist's URL relationships (e.g. the `image` link).
+pub async fn lookup_artist(
+    pool: &PgPool,
+    gid: Uuid,
+    with_url_rels: bool,
+) -> Result<Option<ArtistLookup>, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        r"
+        SELECT a.id, a.gid, a.name, a.sort_name, a.comment, at.name AS type_name
+        FROM musicbrainz.artist a
+        LEFT JOIN musicbrainz.artist_type at ON at.id = a.type
+        WHERE a.gid = $1
+        ",
+    )
+    .bind(gid)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let id: i32 = row.try_get("id")?;
+    let comment: String = row.try_get("comment").unwrap_or_default();
+    let relations =
+        if with_url_rels { load_artist_url_relations(pool, id).await? } else { Vec::new() };
+
+    Ok(Some(ArtistLookup {
+        id: gid.to_string(),
+        name: row.try_get("name")?,
+        sort_name: row.try_get("sort_name")?,
+        artist_type: row.try_get("type_name").ok(),
+        disambiguation: if comment.is_empty() { None } else { Some(comment) },
+        relations,
+    }))
+}
+
+/// artist-url relations (`l_artist_url`) for an artist lookup. Maps
+/// `link_type.name` to the ws/2 relation `type` and `url.url` to
+/// `relation.url.resource`. These are always `forward` (artist -> url).
+async fn load_artist_url_relations(
+    pool: &PgPool,
+    artist_id: i32,
+) -> Result<Vec<UrlRelation>, sqlx::Error> {
+    let rows = sqlx::query(
+        r"
+        SELECT lt.name AS rel_type, u.url AS resource
+        FROM musicbrainz.l_artist_url l
+        JOIN musicbrainz.link lk ON lk.id = l.link
+        JOIN musicbrainz.link_type lt ON lt.id = lk.link_type
+        JOIN musicbrainz.url u ON u.id = l.entity1
+        WHERE l.entity0 = $1
+        ORDER BY l.id ASC
+        ",
+    )
+    .bind(artist_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| UrlRelation {
+            rel_type: r.get("rel_type"),
+            direction: "forward".to_string(),
+            url: UrlResource { resource: r.get("resource") },
+        })
+        .collect())
 }
 
 async fn load_artist_aliases(pool: &PgPool, artist_id: i32) -> Result<Vec<Alias>, sqlx::Error> {
