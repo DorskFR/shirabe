@@ -129,33 +129,45 @@ impl TmdbSource {
 /// Flush the id-index upsert buffer once this many rows accumulate.
 const BATCH_ROWS: usize = 1024;
 
-/// Upsert a batch of id-index rows into `tmdb_id_index`. Idempotent via
-/// `ON CONFLICT (id, kind)`. Runtime query; writes only the `tmdb` DB.
+/// Upsert a batch of id-index rows into `tmdb_id_index` as a SINGLE multi-row
+/// statement (one round-trip + one commit/fsync per batch — not one per row,
+/// which is catastrophically slow on networked storage). Idempotent via
+/// `ON CONFLICT (id, kind)`. Runtime query; writes only the `tmdb` DB. TMDB id
+/// exports are unique per id, so a batch never conflicts with itself.
 async fn upsert_id_index(
     pool: &PgPool,
     kind: &str,
     rows: &[ExportRow],
 ) -> Result<u64, sqlx::Error> {
-    let mut affected = 0u64;
-    for row in rows {
-        let res = sqlx::query(
-            "INSERT INTO tmdb_id_index (id, kind, name, popularity, adult)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (id, kind) DO UPDATE SET
-                 name       = EXCLUDED.name,
-                 popularity = EXCLUDED.popularity,
-                 adult      = EXCLUDED.adult",
-        )
-        .bind(row.id)
-        .bind(kind)
-        .bind(row.original_title.as_deref())
-        .bind(row.popularity.map(|p| p as f32))
-        .bind(row.adult)
-        .execute(pool)
-        .await?;
-        affected += res.rows_affected();
+    use std::fmt::Write as _;
+    if rows.is_empty() {
+        return Ok(0);
     }
-    Ok(affected)
+    // Build "($1,$2,$3,$4,$5),($6,...)..." for all rows (5 binds each; well
+    // under Postgres' 65535 param cap at BATCH_ROWS = 1024 → 5120 binds).
+    let mut sql =
+        String::from("INSERT INTO tmdb_id_index (id, kind, name, popularity, adult) VALUES ");
+    for i in 0..rows.len() {
+        if i > 0 {
+            sql.push(',');
+        }
+        let b = i * 5;
+        let _ = write!(sql, "(${},${},${},${},${})", b + 1, b + 2, b + 3, b + 4, b + 5);
+    }
+    sql.push_str(
+        " ON CONFLICT (id, kind) DO UPDATE SET \
+         name = EXCLUDED.name, popularity = EXCLUDED.popularity, adult = EXCLUDED.adult",
+    );
+    let mut q = sqlx::query(&sql);
+    for row in rows {
+        q = q
+            .bind(row.id)
+            .bind(kind)
+            .bind(row.original_title.as_deref())
+            .bind(row.popularity.map(|p| p as f32))
+            .bind(row.adult);
+    }
+    Ok(q.execute(pool).await?.rows_affected())
 }
 
 /// Stream one export gz → gunzip → line-by-line parse → batched upsert. Never
