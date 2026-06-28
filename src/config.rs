@@ -95,6 +95,16 @@ pub struct Config {
     /// cache row older than this is treated as stale and re-fetched from upstream.
     #[arg(long, env = "TVDB_CACHE_TTL_DAYS", default_value_t = 7)]
     pub tvdb_cache_ttl_days: i64,
+
+    /// Externally-reachable base URL of the `caache` image proxy (SHIB-9). TMDB/TVDB
+    /// poster/artwork URLs in the `/3` and `/v4` facade payloads are rewritten to
+    /// route through caache's `/_ia/<host>/<path>` passthrough so the bytes are
+    /// fetched + cached there (Shirabe stays stateless on image bytes). These URLs
+    /// land in the browser/UI, so this is the public host, not the in-cluster svc.
+    /// When unset/empty, rewriting is DISABLED — original upstream URLs are emitted
+    /// unchanged (graceful no-op).
+    #[arg(long, env = "SHIRABE_CAACHE_BASE_URL", default_value = "https://caache.dorsk.dev")]
+    pub caache_base_url: Option<String>,
 }
 
 impl Config {
