@@ -80,37 +80,35 @@ CREATE TABLE IF NOT EXISTS imdb_title_ratings (
     num_votes       integer
 );
 
--- ── title.crew ─────────────────────────────────────────────────────────────
--- directors / writers as comma-separated nconst lists (as IMDb ships them).
-CREATE TABLE IF NOT EXISTS imdb_title_crew (
-    tconst          text PRIMARY KEY,
-    directors       text,
-    writers         text
-);
-
--- ── title.principals ───────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS imdb_title_principals (
-    tconst          text NOT NULL,
-    ordering        integer NOT NULL,
-    nconst          text,
-    category        text,
-    job             text,
-    characters      text,
-    PRIMARY KEY (tconst, ordering)
-);
-
-CREATE INDEX IF NOT EXISTS imdb_title_principals_nconst_idx
-    ON imdb_title_principals (nconst);
-
--- ── name.basics ────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS imdb_name_basics (
-    nconst              text PRIMARY KEY,
-    primary_name        text,
-    birth_year          integer,
-    death_year          integer,
-    primary_profession  text,
-    known_for_titles    text
-);
-
-CREATE INDEX IF NOT EXISTS imdb_name_basics_primary_name_trgm
-    ON imdb_name_basics USING gin (primary_name gin_trgm_ops);
+-- ── People/credits tables — SKIPPED for now (not used for title/akas search) ──
+-- title.crew, title.principals (~4GB) and name.basics are commented out to keep
+-- the imdb DB lean. Re-enable here together with the matching Dataset entries in
+-- src/sources/imdb.rs (and size the imdb PVC up) when people/credits are wired.
+-- CREATE TABLE IF NOT EXISTS imdb_title_crew (
+--     tconst          text PRIMARY KEY,
+--     directors       text,
+--     writers         text
+-- );
+--
+-- CREATE TABLE IF NOT EXISTS imdb_title_principals (
+--     tconst          text NOT NULL,
+--     ordering        integer NOT NULL,
+--     nconst          text,
+--     category        text,
+--     job             text,
+--     characters      text,
+--     PRIMARY KEY (tconst, ordering)
+-- );
+-- CREATE INDEX IF NOT EXISTS imdb_title_principals_nconst_idx
+--     ON imdb_title_principals (nconst);
+--
+-- CREATE TABLE IF NOT EXISTS imdb_name_basics (
+--     nconst              text PRIMARY KEY,
+--     primary_name        text,
+--     birth_year          integer,
+--     death_year          integer,
+--     primary_profession  text,
+--     known_for_titles    text
+-- );
+-- CREATE INDEX IF NOT EXISTS imdb_name_basics_primary_name_trgm
+--     ON imdb_name_basics USING gin (primary_name gin_trgm_ops);
