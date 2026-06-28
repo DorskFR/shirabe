@@ -11,6 +11,39 @@ pub struct ArtistSearchResponse {
     pub artists: Vec<Artist>,
 }
 
+/// `GET /ws/2/artist/{mbid}` lookup payload. Carries the core artist fields and,
+/// when `inc=url-rels` is requested, the artist's URL relationships (notably the
+/// `image` link the consumer reads for artwork fallback).
+#[derive(Debug, Serialize, Default)]
+pub struct ArtistLookup {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "sort-name")]
+    pub sort_name: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub artist_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disambiguation: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<UrlRelation>,
+}
+
+/// A URL relationship in the ws/2 `relations[]` shape: `{ type, direction, url:
+/// { resource } }`. The consumer matches on `type == "image"` and reads
+/// `url.resource`.
+#[derive(Debug, Serialize)]
+pub struct UrlRelation {
+    #[serde(rename = "type")]
+    pub rel_type: String,
+    pub direction: String,
+    pub url: UrlResource,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UrlResource {
+    pub resource: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Artist {
     pub id: String,
