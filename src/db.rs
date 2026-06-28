@@ -1,8 +1,17 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-/// Build a Postgres connection pool against the given URL.
+/// Build a Postgres connection pool against the given URL (eager: opens a
+/// connection now, so an unreachable DB fails fast at startup).
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new().max_connections(max_connections).connect(database_url).await
+}
+
+/// Build a LAZILY-connected pool: returns immediately, opening connections on
+/// first use. Used for the optional writable pools so the API still boots when a
+/// writable DB is briefly unavailable or saturated (e.g. during a bulk sync) —
+/// a busy imdb/tmdb DB must never crash-loop the API; queries just degrade.
+pub fn connect_lazy(database_url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new().max_connections(max_connections).connect_lazy(database_url)
 }
 
 /// The set of database pools shirabe may hold (five-database layout, one Postgres
@@ -43,14 +52,16 @@ impl Pools {
         max_connections: u32,
     ) -> Result<Self, sqlx::Error> {
         let musicbrainz = connect(database_url, max_connections).await?;
-        let connect_opt = async |url: Option<&str>| match url {
-            Some(url) => Ok::<_, sqlx::Error>(Some(connect(url, max_connections).await?)),
+        // Writable pools are LAZY: a saturated/unavailable provider DB must not
+        // crash the API at boot (queries degrade per-request instead).
+        let connect_opt = |url: Option<&str>| match url {
+            Some(url) => Ok::<_, sqlx::Error>(Some(connect_lazy(url, max_connections)?)),
             None => Ok(None),
         };
-        let shirabe = connect_opt(shirabe_database_url).await?;
-        let imdb = connect_opt(imdb_database_url).await?;
-        let tmdb = connect_opt(tmdb_database_url).await?;
-        let tvdb = connect_opt(tvdb_database_url).await?;
+        let shirabe = connect_opt(shirabe_database_url)?;
+        let imdb = connect_opt(imdb_database_url)?;
+        let tmdb = connect_opt(tmdb_database_url)?;
+        let tvdb = connect_opt(tvdb_database_url)?;
         Ok(Self { musicbrainz, shirabe, imdb, tmdb, tvdb })
     }
 }
