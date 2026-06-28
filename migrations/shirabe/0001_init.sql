@@ -1,10 +1,12 @@
--- shirabe writable schema (SHIB-2).
+-- shirabe writable schema — dedicated `shirabe` database (Option A multi-DB).
 --
--- Layered ALONGSIDE the read-only `musicbrainz` mirror, in the SAME database
--- (reuse `musicbrainz-database` with a read-write role). The `musicbrainz`
--- schema is never written; everything shirabe owns lives in the `shirabe`
--- schema created here. Forward-only and idempotent (CREATE … IF NOT EXISTS),
--- same contract as 0001/0002: safe to re-run, never edited once applied.
+-- This migration targets the NEW, dedicated WRITABLE `shirabe` database
+-- (connected via SHIRABE_DATABASE_URL), NOT the read-only `musicbrainz` mirror.
+-- The MB-mirror migrations (../0001, ../0002) target the `musicbrainz` database
+-- and must never run here; likewise this file must never run against the mirror.
+-- We keep the `shirabe.` schema prefix for clarity and to match the code's table
+-- references, even though it now lives in its own database. Forward-only and
+-- idempotent (CREATE … IF NOT EXISTS): safe to re-run, never edited once applied.
 --
 -- This migration creates only the base tables (source registry, cross-ID xref,
 -- TMDB/TVDB caches + the TMDB id index, and the image cache). The bulk

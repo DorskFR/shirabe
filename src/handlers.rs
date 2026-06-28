@@ -38,7 +38,7 @@ pub async fn search_artist(
         .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
     let limit = state.config.resolve_limit(params.limit);
     let artists =
-        repo::search_artists(&state.pool, &name, limit, state.config.similarity_threshold).await?;
+        repo::search_artists(state.pool(), &name, limit, state.config.similarity_threshold).await?;
     Ok(Json(ArtistSearchResponse { artists }))
 }
 
@@ -55,7 +55,7 @@ pub async fn search_release(
         .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
     let limit = state.config.resolve_limit(params.limit);
     let releases = repo::search_releases(
-        &state.pool,
+        state.pool(),
         &title,
         parsed.artist.as_deref(),
         parsed.date_year.as_deref(),
@@ -79,7 +79,7 @@ pub async fn search_recording(
         .ok_or_else(|| ApiError::BadRequest("missing recording title".into()))?;
     let limit = state.config.resolve_limit(params.limit);
     let recordings = repo::search_recordings(
-        &state.pool,
+        state.pool(),
         &title,
         parsed.artist.as_deref(),
         limit,
@@ -108,7 +108,7 @@ pub async fn lookup_artist(
     let gid = parse_mbid(&mbid)?;
     let with_url_rels = inc_has(params.inc.as_deref(), "url-rels");
     let artist =
-        repo::lookup_artist(&state.pool, gid, with_url_rels).await?.ok_or(ApiError::NotFound)?;
+        repo::lookup_artist(state.pool(), gid, with_url_rels).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(artist).expect("artist serializes")))
 }
 
@@ -118,7 +118,7 @@ pub async fn lookup_release(
     Path(mbid): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
-    let release = repo::lookup_release(&state.pool, gid).await?.ok_or(ApiError::NotFound)?;
+    let release = repo::lookup_release(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(release).expect("release serializes")))
 }
 
@@ -128,13 +128,13 @@ pub async fn lookup_recording(
     Path(mbid): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
-    let recording = repo::lookup_recording(&state.pool, gid).await?.ok_or(ApiError::NotFound)?;
+    let recording = repo::lookup_recording(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(recording).expect("recording serializes")))
 }
 
 /// `GET /health` and `GET /ws/2` ping.
 pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    repo::ping(&state.pool).await?;
+    repo::ping(state.pool()).await?;
     Ok(Json(json!({ "status": "ok" })))
 }
 

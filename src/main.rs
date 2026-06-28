@@ -23,13 +23,24 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::{Cli, Command, Config};
+use crate::db::Pools;
 use crate::sources::Registry;
 
 /// Shared application state handed to every handler.
 pub struct AppState {
-    pub pool: PgPool,
+    /// All DB pools. `pools.musicbrainz` is the read-only mirror that the ws/2
+    /// handlers query; the optional shirabe/imdb pools back coordination/ingest.
+    pub pools: Pools,
     pub config: Config,
     pub registry: Registry,
+}
+
+impl AppState {
+    /// The read-only MusicBrainz mirror pool the ws/2 handlers query.
+    #[must_use]
+    pub const fn pool(&self) -> &PgPool {
+        &self.pools.musicbrainz
+    }
 }
 
 #[tokio::main]
@@ -41,14 +52,20 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = cli.config;
-    let pool = db::connect(&config.database_url, config.db_pool_size).await?;
-    let registry = Registry::with_defaults(pool.clone());
+    let pools = Pools::connect(
+        &config.database_url,
+        config.shirabe_database_url.as_deref(),
+        config.imdb_database_url.as_deref(),
+        config.db_pool_size,
+    )
+    .await?;
+    let registry = Registry::with_defaults(pools.clone());
 
     match cli.command {
         // CronJob entrypoint: refresh one source and exit.
         Some(Command::Sync { source }) => run_sync(&registry, &source).await,
         // Default: start the HTTP server exactly as before.
-        None => serve(config, pool, registry).await,
+        None => serve(config, pools, registry).await,
     }
 }
 
@@ -70,10 +87,10 @@ async fn run_sync(registry: &Registry, source: &str) -> anyhow::Result<()> {
 }
 
 /// Start the axum HTTP server (unchanged default behaviour).
-async fn serve(config: Config, pool: PgPool, registry: Registry) -> anyhow::Result<()> {
+async fn serve(config: Config, pools: Pools, registry: Registry) -> anyhow::Result<()> {
     let bind = config.bind.clone();
     tracing::info!(bind = %bind, "starting shirabe");
-    let state = Arc::new(AppState { pool, config, registry });
+    let state = Arc::new(AppState { pools, config, registry });
 
     let app = build_router(state);
 

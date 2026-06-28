@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 
+use crate::db::Pools;
+
 /// How a source gets its data into Shirabe. Drives whether `shirabe sync`
 /// pulls a full dump, enumerates + lazily hydrates, scrapes on demand, or just
 /// mirrors a read-only upstream.
@@ -126,28 +128,31 @@ pub trait Source: Send + Sync {
     async fn health(&self) -> SourceHealth;
 }
 
-/// Context handed to [`Source::refresh`]: the shared DB pool plus anything a
-/// later source needs (HTTP client, dump dir) can be threaded through here.
+/// Context handed to [`Source::refresh`]: the full set of DB pools (MB read pool,
+/// optional writable shirabe + imdb pools) plus anything a later source needs
+/// (HTTP client, dump dir) can be threaded through here. Each source reaches for
+/// the pool(s) it actually needs.
 #[derive(Clone)]
 pub struct RefreshCtx {
-    pub pool: PgPool,
+    pub pools: Pools,
 }
 
 /// Holds the configured sources, keyed by id. Facade routers and the `sync`
 /// subcommand resolve a source through here.
 #[derive(Clone)]
 pub struct Registry {
-    pool: PgPool,
+    pools: Pools,
     sources: BTreeMap<String, Arc<dyn Source>>,
 }
 
 impl Registry {
-    /// Build a registry over the shared pool with the default source set.
+    /// Build a registry over the configured pools with the default source set.
     /// Later waves register IMDb/TMDB/TVDB/Wikidata here.
     #[must_use]
-    pub fn with_defaults(pool: PgPool) -> Self {
-        let mut registry = Self { pool: pool.clone(), sources: BTreeMap::new() };
-        registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(pool)));
+    pub fn with_defaults(pools: Pools) -> Self {
+        let mb_pool = pools.musicbrainz.clone();
+        let mut registry = Self { pools, sources: BTreeMap::new() };
+        registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
         registry
     }
 
@@ -173,10 +178,21 @@ impl Registry {
     /// such source is registered.
     pub async fn run_refresh(&self, id: &str) -> Option<RefreshReport> {
         let source = self.get(id)?.clone();
-        let ctx = RefreshCtx { pool: self.pool.clone() };
+        let ctx = RefreshCtx { pools: self.pools.clone() };
         let report = source.refresh(&ctx).await;
-        if let Err(e) = upsert_refresh(&self.pool, source.as_ref(), &report).await {
-            tracing::error!(source = id, error = %e, "failed to persist refresh status");
+        match self.pools.shirabe.as_ref() {
+            Some(shirabe) => {
+                if let Err(e) = upsert_refresh(shirabe, source.as_ref(), &report).await {
+                    tracing::error!(source = id, error = %e, "failed to persist refresh status");
+                }
+            }
+            None => {
+                tracing::error!(
+                    source = id,
+                    "SHIRABE_DATABASE_URL is not set; cannot persist refresh status to \
+                     the shirabe.source registry"
+                );
+            }
         }
         Some(report)
     }

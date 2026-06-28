@@ -31,6 +31,18 @@ pub struct Config {
     #[arg(long, env = "DATABASE_URL")]
     pub database_url: String,
 
+    /// Postgres connection string for the writable `shirabe` coordination database
+    /// (source registry, xref, image_cache, TMDB/TVDB caches). Optional so the API
+    /// pod still boots when unset; `shirabe sync <source>` errors if a source needs
+    /// it and it is missing.
+    #[arg(long, env = "SHIRABE_DATABASE_URL")]
+    pub shirabe_database_url: Option<String>,
+
+    /// Postgres connection string for the writable `imdb` bulk-mirror database
+    /// (IMDb TSV tables, added in SHIB-5). Optional; only the IMDb source needs it.
+    #[arg(long, env = "IMDB_DATABASE_URL")]
+    pub imdb_database_url: Option<String>,
+
     /// Address:port to bind the HTTP server to.
     #[arg(long, env = "SHIRABE_BIND", default_value = "0.0.0.0:8800")]
     pub bind: String,
