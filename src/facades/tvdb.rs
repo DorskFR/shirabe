@@ -16,7 +16,7 @@
 //! default 7d) when present, otherwise calls the v4 API once with the in-memory
 //! server bearer, stores the payload, and self-links any returned `remoteIds` into
 //! `shirabe.xref` via
-//! [`wikidata::upsert_xref`]. A second identical call is served from cache and never
+//! [`xref::upsert_xref`]. A second identical call is served from cache and never
 //! hits upstream.
 //!
 //! `name`, `aliases`, and `translations` are preserved verbatim in the cached
@@ -38,7 +38,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use crate::sources::tvdb::API_BASE;
-use crate::sources::wikidata;
+use crate::sources::xref;
 use crate::{AppState, images, search};
 
 /// TheTVDB JSON keys whose values are ABSOLUTE image URLs (e.g. on
@@ -202,7 +202,7 @@ async fn self_link_remote_ids(state: &AppState, tvdb_id: i64, payload: &Value) {
         return;
     };
     let mut rows: Vec<(Option<String>, String, String)> = Vec::new();
-    // The TVDB id itself → `tvdb` source tag (matches wikidata.rs).
+    // The TVDB id itself → `tvdb` source tag (matches xref.rs).
     rows.push((None, "tvdb".to_string(), tvdb_id.to_string()));
 
     // `remoteIds` may sit at the payload top level or under `data`.
@@ -231,7 +231,7 @@ async fn self_link_remote_ids(state: &AppState, tvdb_id: i64, payload: &Value) {
         }
     }
 
-    if let Err(e) = wikidata::upsert_xref(pool, &rows).await {
+    if let Err(e) = xref::upsert_xref(pool, &rows).await {
         tracing::warn!(error = %e, "tvdb remote-id self-link failed");
     }
 }

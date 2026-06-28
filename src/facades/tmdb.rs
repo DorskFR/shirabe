@@ -15,7 +15,7 @@
 //! dedicated `tmdb` DB; TTL = `TMDB_CACHE_TTL_DAYS`, default 7d) when present,
 //! otherwise calls the TMDB v3 API once with the held key, stores the payload,
 //! and self-links any returned `external_ids` (imdb_id, …) into `shirabe.xref` via
-//! [`wikidata::upsert_xref`]. A second identical call is served from cache and
+//! [`xref::upsert_xref`]. A second identical call is served from cache and
 //! never hits upstream.
 //!
 //! Detail lookups honour `append_to_response=external_ids` so `imdb_id` is
@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use crate::search::{self, ScoredHit};
-use crate::sources::wikidata;
+use crate::sources::xref;
 use crate::{AppState, images};
 
 /// TMDB JSON keys whose values are RELATIVE image paths (e.g. `/abc.jpg`). When a
@@ -186,7 +186,7 @@ async fn self_link_external_ids(state: &AppState, tmdb_kind: &str, tmdb_id: i64,
     };
     let mut rows: Vec<(Option<String>, String, String)> = Vec::new();
 
-    // The TMDB id itself → tmdb_movie / tmdb_tv source tag (matches wikidata.rs).
+    // The TMDB id itself → tmdb_movie / tmdb_tv source tag (matches xref.rs).
     let self_source = match tmdb_kind {
         "movie" => "tmdb_movie",
         _ => "tmdb_tv",
@@ -203,7 +203,7 @@ async fn self_link_external_ids(state: &AppState, tmdb_kind: &str, tmdb_id: i64,
         rows.push((None, "imdb".to_string(), imdb_id));
     }
 
-    if let Err(e) = wikidata::upsert_xref(pool, &rows).await {
+    if let Err(e) = xref::upsert_xref(pool, &rows).await {
         tracing::warn!(error = %e, "tmdb external-id self-link failed");
     }
 }
