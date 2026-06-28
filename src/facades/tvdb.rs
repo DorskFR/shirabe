@@ -12,9 +12,10 @@
 //!
 //! Mounts the exact `/v4/*` endpoints Kusaritoi's TVDB provider calls, mirroring
 //! the upstream v4 JSON shapes. Each data handler is cache-first: it serves a fresh
-//! row from `shirabe.tvdb_cache` (TTL = `TVDB_CACHE_TTL_DAYS`, default 7d) when
-//! present, otherwise calls the v4 API once with the in-memory server bearer, stores
-//! the payload, and self-links any returned `remoteIds` into `shirabe.xref` via
+//! row from `tvdb_cache` (in the dedicated `tvdb` DB; TTL = `TVDB_CACHE_TTL_DAYS`,
+//! default 7d) when present, otherwise calls the v4 API once with the in-memory
+//! server bearer, stores the payload, and self-links any returned `remoteIds` into
+//! `shirabe.xref` via
 //! [`wikidata::upsert_xref`]. A second identical call is served from cache and never
 //! hits upstream.
 //!
@@ -115,7 +116,13 @@ fn not_configured() -> Response {
     tvdb_failure(StatusCode::SERVICE_UNAVAILABLE, "TheTVDB source not configured")
 }
 
-/// The writable `shirabe` pool, or `None` when `SHIRABE_DATABASE_URL` is unset.
+/// The writable `tvdb` cache pool, or `None` when `TVDB_DATABASE_URL` is unset.
+const fn tvdb_pool(state: &AppState) -> Option<&PgPool> {
+    state.pools.tvdb.as_ref()
+}
+
+/// The writable `shirabe` coordination pool (for `shirabe.xref` self-linking), or
+/// `None` when `SHIRABE_DATABASE_URL` is unset.
 const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
     state.pools.shirabe.as_ref()
 }
@@ -124,13 +131,13 @@ const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
 /// The freshness test is done in SQL (`fetched_at` vs `now()`). Returns `None` on
 /// miss / stale / no pool.
 async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
-    let pool = shirabe_pool(state)?;
+    let pool = tvdb_pool(state)?;
     let ttl_days = state.config.tvdb_cache_ttl_days;
     if ttl_days <= 0 {
         return None;
     }
     let row = sqlx::query(
-        "SELECT payload FROM shirabe.tvdb_cache
+        "SELECT payload FROM tvdb_cache
          WHERE id = $1 AND kind = $2
            AND fetched_at >= now() - ($3 || ' days')::interval",
     )
@@ -143,14 +150,14 @@ async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
     row.try_get::<Value, _>("payload").ok()
 }
 
-/// Store (upsert) a payload into `shirabe.tvdb_cache` with `fetched_at = now()`.
+/// Store (upsert) a payload into `tvdb_cache` with `fetched_at = now()`.
 /// Best-effort: a cache write failure is logged but does not fail the request.
 async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
-    let Some(pool) = shirabe_pool(state) else {
+    let Some(pool) = tvdb_pool(state) else {
         return;
     };
     let res = sqlx::query(
-        "INSERT INTO shirabe.tvdb_cache (id, kind, payload, fetched_at)
+        "INSERT INTO tvdb_cache (id, kind, payload, fetched_at)
          VALUES ($1, $2, $3, now())
          ON CONFLICT (id, kind) DO UPDATE SET
              payload    = EXCLUDED.payload,
@@ -339,7 +346,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>)
     // result means a confident match exists in the deployed index.
     let local_hits = search::local_tmdb_search(
         state.pools.imdb.as_ref(),
-        shirabe_pool(&state),
+        state.pools.tmdb.as_ref(),
         query,
         imdb_kind(&search_type),
         SEARCH_LIMIT,

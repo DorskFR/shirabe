@@ -8,6 +8,7 @@ mod error;
 mod facades;
 mod handlers;
 mod images;
+mod migrate;
 mod models;
 mod query;
 mod repo;
@@ -32,7 +33,8 @@ use crate::sources::tvdb::TokenStore;
 /// Shared application state handed to every handler.
 pub struct AppState {
     /// All DB pools. `pools.musicbrainz` is the read-only mirror that the ws/2
-    /// handlers query; the optional shirabe/imdb pools back coordination/ingest.
+    /// handlers query; the optional shirabe/imdb/tmdb/tvdb pools back
+    /// coordination/ingest and the provider caches.
     pub pools: Pools,
     pub config: Config,
     pub registry: Registry,
@@ -58,10 +60,20 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = cli.config;
+
+    // `migrate` short-circuits before the full pool bundle is built: it connects
+    // only the one target DB itself (not the read-only mirror or the others), so an
+    // empty fresh cluster can be bootstrapped without every URL being set.
+    if let Some(Command::Migrate { db }) = &cli.command {
+        return migrate::run(&config, db).await;
+    }
+
     let pools = Pools::connect(
         &config.database_url,
         config.shirabe_database_url.as_deref(),
         config.imdb_database_url.as_deref(),
+        config.tmdb_database_url.as_deref(),
+        config.tvdb_database_url.as_deref(),
         config.db_pool_size,
     )
     .await?;
@@ -71,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         // CronJob entrypoint: refresh one source and exit.
         Some(Command::Sync { source }) => run_sync(&registry, &source).await,
+        Some(Command::Migrate { .. }) => unreachable!("handled above"),
         // Default: start the HTTP server exactly as before.
         None => serve(config, pools, registry, tvdb_tokens).await,
     }

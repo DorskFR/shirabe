@@ -4,13 +4,13 @@
 //! index FIRST, falling through to the live upstream API only on a thin or empty
 //! local result, then MERGE both (dedupe by id). The local index is assembled,
 //! per-pool, in Rust — the IMDb tables live in the `imdb` database and the
-//! `shirabe.tmdb_id_index` / caches live in the `shirabe` database, which are two
-//! SEPARATE Postgres databases (Option A), so they cannot be SQL-joined. Each
-//! pool is queried independently and the hits are merged / ranked here.
+//! `tmdb_id_index` / cache live in the dedicated `tmdb` database, which are
+//! SEPARATE Postgres databases (five-DB layout), so they cannot be SQL-joined.
+//! Each pool is queried independently and the hits are merged / ranked here.
 //!
 //! Non-latin resolution (e.g. 銀魂 → Gintama) rides the pg_trgm GIN index on
 //! `imdb_title_akas.title` plus `imdb_title_basics.primary_title/original_title`
-//! and the `shirabe.tmdb_id_index.name` — the same fields Kusaritoi re-scores
+//! and the `tmdb_id_index.name` — the same fields Kusaritoi re-scores
 //! against. Scores are synthesised from pg_trgm similarity into the same 0-100
 //! range MusicBrainz search emits (see [`crate::repo`]), so Kusaritoi's
 //! confidence filter is unchanged; TMDB popularity breaks ties.
@@ -124,7 +124,7 @@ async fn set_similarity_limit(
     Ok(())
 }
 
-/// Trigram-search the `shirabe.tmdb_id_index` for one `kind` (`movie`/`tv`),
+/// Trigram-search the `tmdb_id_index` for one `kind` (`movie`/`tv`),
 /// scoring on `name` and carrying `popularity`/`adult` for ranking + native shape.
 /// Returns an empty vec (not an error) is reserved for genuine emptiness; DB
 /// errors propagate so the caller can decide to fall through.
@@ -141,7 +141,7 @@ async fn search_tmdb_id_index(
         r"
         SELECT id, name, popularity, adult,
                similarity(name, $1) AS score
-        FROM shirabe.tmdb_id_index
+        FROM tmdb_id_index
         WHERE kind = $2 AND name % $1
         ORDER BY score DESC, popularity DESC NULLS LAST, id ASC
         LIMIT $3
@@ -256,21 +256,21 @@ fn imdb_title_types(kind: &str) -> &'static [&'static str] {
 
 /// Run the LOCAL TMDB-kind search across both writable pools and merge.
 ///
-/// Queries `shirabe.tmdb_id_index` (via `shirabe_pool`) and the IMDb mirror (via
-/// `imdb_pool`) independently — they are separate databases — then merges /
-/// dedupes / ranks in Rust. Absent pools simply contribute nothing. DB errors on
-/// either pool are swallowed to an empty contribution so a half-provisioned
-/// deployment degrades to the live API rather than 500-ing.
+/// Queries `tmdb_id_index` (via `tmdb_pool`, the dedicated `tmdb` DB) and the
+/// IMDb mirror (via `imdb_pool`) independently — they are separate databases —
+/// then merges / dedupes / ranks in Rust. Absent pools simply contribute nothing.
+/// DB errors on either pool are swallowed to an empty contribution so a
+/// half-provisioned deployment degrades to the live API rather than 500-ing.
 pub async fn local_tmdb_search(
     imdb_pool: Option<&PgPool>,
-    shirabe_pool: Option<&PgPool>,
+    tmdb_pool: Option<&PgPool>,
     query: &str,
     kind: &str,
     limit: i64,
 ) -> Vec<ScoredHit> {
     let mut sources: Vec<Vec<ScoredHit>> = Vec::new();
 
-    if let Some(pool) = shirabe_pool {
+    if let Some(pool) = tmdb_pool {
         match search_tmdb_id_index(pool, query, kind, limit, LOCAL_SIMILARITY_THRESHOLD).await {
             Ok(hits) => sources.push(hits),
             Err(e) => tracing::warn!(error = %e, kind, "local tmdb_id_index search failed"),

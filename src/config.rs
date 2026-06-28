@@ -22,6 +22,16 @@ pub enum Command {
         /// Source id to refresh (e.g. `musicbrainz`).
         source: String,
     },
+    /// Apply a writable database's embedded migration SQL, then exit. Used to
+    /// schema-bootstrap the dedicated per-provider databases in-cluster (they come
+    /// up empty and there is no external migration runner). Idempotent.
+    ///
+    /// `db` is one of `shirabe`, `imdb`, `tmdb`, `tvdb`, or `all` (every DB whose
+    /// URL is configured). The read-only `musicbrainz` mirror is NOT migrated here.
+    Migrate {
+        /// Database to migrate: `shirabe` | `imdb` | `tmdb` | `tvdb` | `all`.
+        db: String,
+    },
 }
 
 /// Runtime configuration, sourced from environment variables (or CLI flags).
@@ -42,6 +52,18 @@ pub struct Config {
     /// (IMDb TSV tables, added in SHIB-5). Optional; only the IMDb source needs it.
     #[arg(long, env = "IMDB_DATABASE_URL")]
     pub imdb_database_url: Option<String>,
+
+    /// Postgres connection string for the writable `tmdb` cache/index database
+    /// (`tmdb_cache` + `tmdb_id_index`). Optional so the API pod still boots when
+    /// unset; only the TMDB source/facade needs it.
+    #[arg(long, env = "TMDB_DATABASE_URL")]
+    pub tmdb_database_url: Option<String>,
+
+    /// Postgres connection string for the writable `tvdb` cache database
+    /// (`tvdb_cache`). Optional so the API pod still boots when unset; only the
+    /// TVDB source/facade needs it.
+    #[arg(long, env = "TVDB_DATABASE_URL")]
+    pub tvdb_database_url: Option<String>,
 
     /// Address:port to bind the HTTP server to.
     #[arg(long, env = "SHIRABE_BIND", default_value = "0.0.0.0:8800")]
@@ -71,7 +93,7 @@ pub struct Config {
     #[arg(long, env = "TMDB_API_KEY")]
     pub tmdb_api_key: Option<String>,
 
-    /// TTL (in days) for cached TMDB v3 payloads in `shirabe.tmdb_cache`. A cache
+    /// TTL (in days) for cached TMDB v3 payloads in the `tmdb_cache` table. A cache
     /// row older than this is treated as stale and re-fetched from upstream.
     #[arg(long, env = "TMDB_CACHE_TTL_DAYS", default_value_t = 7)]
     pub tmdb_cache_ttl_days: i64,
@@ -91,7 +113,7 @@ pub struct Config {
     #[arg(long, env = "TVDB_PIN")]
     pub tvdb_pin: Option<String>,
 
-    /// TTL (in days) for cached TheTVDB v4 payloads in `shirabe.tvdb_cache`. A
+    /// TTL (in days) for cached TheTVDB v4 payloads in the `tvdb_cache` table. A
     /// cache row older than this is treated as stale and re-fetched from upstream.
     #[arg(long, env = "TVDB_CACHE_TTL_DAYS", default_value_t = 7)]
     pub tvdb_cache_ttl_days: i64,

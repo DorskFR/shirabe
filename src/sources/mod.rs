@@ -157,20 +157,20 @@ impl Registry {
     /// `config` + `tvdb_tokens` are threaded into the TheTVDB lazy-scrape source
     /// (server-side key/PIN + the shared in-memory bearer token, which the `/v4`
     /// facade reuses via `AppState`).
+    // `tmdb_pool`/`tvdb_pool` differ by one char (fixed provider names).
+    #[allow(clippy::similar_names)]
     #[must_use]
     pub fn with_defaults(pools: Pools, config: Config, tvdb_tokens: TokenStore) -> Self {
         let mb_pool = pools.musicbrainz.clone();
         let imdb_pool = pools.imdb.clone();
+        let tmdb_pool = pools.tmdb.clone();
+        let tvdb_pool = pools.tvdb.clone();
         let shirabe_pool = pools.shirabe.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
         registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool)));
-        registry.register(Arc::new(tmdb::TmdbSource::new(shirabe_pool.clone())));
-        registry.register(Arc::new(tvdb::TvdbSource::new(
-            shirabe_pool.clone(),
-            tvdb_tokens,
-            config,
-        )));
+        registry.register(Arc::new(tmdb::TmdbSource::new(tmdb_pool)));
+        registry.register(Arc::new(tvdb::TvdbSource::new(tvdb_pool, tvdb_tokens, config)));
         registry.register(Arc::new(wikidata::WikidataXrefSource::new(shirabe_pool)));
         registry
     }

@@ -18,13 +18,13 @@
 //!
 //! This is an [`IngestMode::EnumerateLazyHydrate`] source: `refresh()` streams
 //! those gz exports (same streaming gunzip pattern as the IMDb source) into
-//! `shirabe.tmdb_id_index` (id, kind movie/tv, name, popularity, adult). The
-//! id index tells us *what exists* and carries popularity for ranking ties; the
-//! hydrated per-title detail is fetched on demand by the `/3` facade and cached in
-//! `shirabe.tmdb_cache`.
+//! `tmdb_id_index` (id, kind movie/tv, name, popularity, adult). The id index
+//! tells us *what exists* and carries popularity for ranking ties; the hydrated
+//! per-title detail is fetched on demand by the `/3` facade and cached in
+//! `tmdb_cache`.
 //!
-//! Writes only the `shirabe` coordination DB (`ctx.pools.shirabe`); errors clearly
-//! when `SHIRABE_DATABASE_URL` is unset.
+//! Writes only the dedicated `tmdb` DB (`ctx.pools.tmdb`); errors clearly when
+//! `TMDB_DATABASE_URL` is unset.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,7 +41,7 @@ use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
 /// Base URL for the daily TMDB id exports.
 const EXPORTS_BASE: &str = "https://files.tmdb.org/p/exports";
 
-/// One TMDB id-export file → the `kind` it populates in `shirabe.tmdb_id_index`.
+/// One TMDB id-export file → the `kind` it populates in `tmdb_id_index`.
 struct Export {
     /// Filename prefix, e.g. `movie_ids` or `tv_series_ids`.
     prefix: &'static str,
@@ -108,8 +108,8 @@ fn parse_export_line(line: &str) -> Option<ExportRow> {
     serde_json::from_str::<ExportRow>(trimmed).ok()
 }
 
-/// The TMDB enumeration source. Holds the optional writable `shirabe` pool so
-/// `health()` can report the id-index row count; `None` when `SHIRABE_DATABASE_URL`
+/// The TMDB enumeration source. Holds the optional writable `tmdb` pool so
+/// `health()` can report the id-index row count; `None` when `TMDB_DATABASE_URL`
 /// is unset (the API pod still boots and the source registers, but ingest and the
 /// count are unavailable).
 pub struct TmdbSource {
@@ -129,8 +129,8 @@ impl TmdbSource {
 /// Flush the id-index upsert buffer once this many rows accumulate.
 const BATCH_ROWS: usize = 1024;
 
-/// Upsert a batch of id-index rows into `shirabe.tmdb_id_index`. Idempotent via
-/// `ON CONFLICT (id, kind)`. Runtime query; writes only the `shirabe` schema.
+/// Upsert a batch of id-index rows into `tmdb_id_index`. Idempotent via
+/// `ON CONFLICT (id, kind)`. Runtime query; writes only the `tmdb` DB.
 async fn upsert_id_index(
     pool: &PgPool,
     kind: &str,
@@ -139,7 +139,7 @@ async fn upsert_id_index(
     let mut affected = 0u64;
     for row in rows {
         let res = sqlx::query(
-            "INSERT INTO shirabe.tmdb_id_index (id, kind, name, popularity, adult)
+            "INSERT INTO tmdb_id_index (id, kind, name, popularity, adult)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (id, kind) DO UPDATE SET
                  name       = EXCLUDED.name,
@@ -212,10 +212,10 @@ impl Source for TmdbSource {
     }
 
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
-        let Some(pool) = ctx.pools.shirabe.as_ref() else {
+        let Some(pool) = ctx.pools.tmdb.as_ref() else {
             return RefreshReport::failed(
-                "SHIRABE_DATABASE_URL is not set; the tmdb source requires the writable \
-                 shirabe coordination database",
+                "TMDB_DATABASE_URL is not set; the tmdb source requires the writable \
+                 tmdb database",
             );
         };
         let client = match reqwest::Client::builder()
@@ -259,22 +259,22 @@ impl Source for TmdbSource {
             return SourceHealth {
                 source: self.id().to_string(),
                 reachable: false,
-                detail: "SHIRABE_DATABASE_URL is not set; tmdb id index unavailable".to_string(),
+                detail: "TMDB_DATABASE_URL is not set; tmdb id index unavailable".to_string(),
             };
         };
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM shirabe.tmdb_id_index")
+        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tmdb_id_index")
             .fetch_one(pool)
             .await
         {
             Ok(n) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!("shirabe.tmdb_id_index reachable; {n} enumerated ids"),
+                detail: format!("tmdb_id_index reachable; {n} enumerated ids"),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: false,
-                detail: format!("shirabe.tmdb_id_index unreachable: {e}"),
+                detail: format!("tmdb_id_index unreachable: {e}"),
             },
         }
     }
