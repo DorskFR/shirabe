@@ -96,12 +96,30 @@ surfaced inside the native shapes above (TMDB `external_ids.imdb_id`, TVDB
 `remoteIds`). An optional internal `GET /xref?source=&id=` may be added later;
 it is not part of the Kusaritoi-facing contract.
 
-## 6. Storage model (`shirabe` schema)
+## 6. Storage model — three databases (Option A)
 
-The writable `shirabe` schema lives in the **same database** as the read-only
-`musicbrainz` mirror (reuse `musicbrainz-database` with a RW role). The mirror's
-`musicbrainz` schema is never written. Base tables (migration
-`0003_shirabe_schema.sql`):
+Shirabe uses **separate databases per bulk provider**, not one shared database
+with multiple schemas:
+
+| Database      | Env var                | Mode      | Holds |
+|---------------|------------------------|-----------|-------|
+| `musicbrainz` | `DATABASE_URL`         | read-only | the synced MB mirror (`musicbrainz` schema); never written |
+| `shirabe`     | `SHIRABE_DATABASE_URL` | writable  | shirabe's own coordination data (`shirabe.*` tables below) |
+| `imdb`        | `IMDB_DATABASE_URL`    | writable  | the bulk IMDb TSV mirror (tables added in SHIB-5) |
+
+Only the `shirabe` and `imdb` databases are ever written; `musicbrainz` stays
+strictly read-only. The API pod boots with only `DATABASE_URL` set; the writable
+URLs are optional (prod provisions them in SHIB-11), and `shirabe sync <source>`
+errors clearly when a source needs a pool whose URL is missing.
+
+Migrations are per-database:
+
+- `migrations/0001…`, `migrations/0002…` → the `musicbrainz` mirror.
+- `migrations/shirabe/0001_init.sql` → the `shirabe` database (base tables below).
+- `migrations/imdb/` → the `imdb` database (placeholder until SHIB-5).
+
+Base tables in the `shirabe` database (migration `migrations/shirabe/0001_init.sql`;
+the `shirabe.` schema prefix is kept for clarity, matching the code's references):
 
 - `shirabe.source(name PK, ingest_mode, last_refresh_at, status, detail jsonb)` —
   per-source registry/health.
@@ -120,8 +138,10 @@ and idempotent.
 
 ## 7. Decisions carried into this contract (spec §7)
 
-- **DB topology:** reuse the existing `musicbrainz-database` Postgres with a new
-  `shirabe` schema + RW role (orchestrator decision), not a dedicated DB.
+- **DB topology (Option A):** separate databases per bulk provider — the
+  read-only `musicbrainz` mirror (`DATABASE_URL`), a dedicated writable `shirabe`
+  coordination DB (`SHIRABE_DATABASE_URL`), and a dedicated writable `imdb`
+  bulk-mirror DB (`IMDB_DATABASE_URL`) — not one shared DB with schemas.
 - **Facade strictness:** implement the subset Kusaritoi parses today; pass extra
   upstream fields through from cached payloads where cheap.
 - **One host, native prefixes** (`/ws/2`, `/v4`, `/3`) — matches how Kusaritoi
