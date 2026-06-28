@@ -11,10 +11,10 @@
 //! the upstream v3 JSON shapes. The inbound `api_key` query param is **accepted
 //! and ignored** — Shirabe holds the real key server-side (`TMDB_API_KEY`).
 //!
-//! Each handler is cache-first: it serves a fresh row from `shirabe.tmdb_cache`
-//! (TTL = `TMDB_CACHE_TTL_DAYS`, default 7d) when present, otherwise calls the
-//! TMDB v3 API once with the held key, stores the payload, and self-links any
-//! returned `external_ids` (imdb_id, …) into `shirabe.xref` via
+//! Each handler is cache-first: it serves a fresh row from `tmdb_cache` (in the
+//! dedicated `tmdb` DB; TTL = `TMDB_CACHE_TTL_DAYS`, default 7d) when present,
+//! otherwise calls the TMDB v3 API once with the held key, stores the payload,
+//! and self-links any returned `external_ids` (imdb_id, …) into `shirabe.xref` via
 //! [`wikidata::upsert_xref`]. A second identical call is served from cache and
 //! never hits upstream.
 //!
@@ -119,7 +119,13 @@ fn not_configured() -> Response {
     tmdb_error(StatusCode::SERVICE_UNAVAILABLE, 7, "TMDB source not configured")
 }
 
-/// The writable `shirabe` pool, or `None` when `SHIRABE_DATABASE_URL` is unset.
+/// The writable `tmdb` cache/index pool, or `None` when `TMDB_DATABASE_URL` is unset.
+const fn tmdb_pool(state: &AppState) -> Option<&PgPool> {
+    state.pools.tmdb.as_ref()
+}
+
+/// The writable `shirabe` coordination pool (for `shirabe.xref` self-linking), or
+/// `None` when `SHIRABE_DATABASE_URL` is unset.
 const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
     state.pools.shirabe.as_ref()
 }
@@ -128,14 +134,14 @@ const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
 /// The freshness test is done in SQL (`fetched_at` vs `now()`), so no timestamp
 /// type needs decoding client-side. Returns `None` on miss / stale / no pool.
 async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
-    let pool = shirabe_pool(state)?;
+    let pool = tmdb_pool(state)?;
     let ttl_days = state.config.tmdb_cache_ttl_days;
     if ttl_days <= 0 {
         return None;
     }
     // `$3` days TTL; only return the row when still within the window.
     let row = sqlx::query(
-        "SELECT payload FROM shirabe.tmdb_cache
+        "SELECT payload FROM tmdb_cache
          WHERE id = $1 AND kind = $2
            AND fetched_at >= now() - ($3 || ' days')::interval",
     )
@@ -148,14 +154,14 @@ async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
     row.try_get::<Value, _>("payload").ok()
 }
 
-/// Store (upsert) a payload into `shirabe.tmdb_cache` with `fetched_at = now()`.
+/// Store (upsert) a payload into `tmdb_cache` with `fetched_at = now()`.
 /// Best-effort: a cache write failure is logged but does not fail the request.
 async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
-    let Some(pool) = shirabe_pool(state) else {
+    let Some(pool) = tmdb_pool(state) else {
         return;
     };
     let res = sqlx::query(
-        "INSERT INTO shirabe.tmdb_cache (id, kind, payload, fetched_at)
+        "INSERT INTO tmdb_cache (id, kind, payload, fetched_at)
          VALUES ($1, $2, $3, now())
          ON CONFLICT (id, kind) DO UPDATE SET
              payload    = EXCLUDED.payload,
@@ -257,7 +263,7 @@ fn search_cache_id(query: &str) -> i64 {
 /// Max local hits to consider per search.
 const SEARCH_LIMIT: i64 = 20;
 
-/// Render a local [`ScoredHit`] (sourced from `shirabe.tmdb_id_index`, so its id
+/// Render a local [`ScoredHit`] (sourced from `tmdb_id_index`, so its id
 /// is a TMDB numeric id) into a TMDB v3 search result object. `kind` selects the
 /// `name` (tv) vs `title` (movie) display field.
 fn local_hit_to_result(hit: &ScoredHit, kind: &str) -> Option<Value> {
@@ -302,7 +308,7 @@ fn merge_live_results(results: &mut Vec<Value>, live: &Value) {
 
 /// Shared search handler for `tv` / `movie`.
 ///
-/// Local-first: search the deployed index (`shirabe.tmdb_id_index` + IMDb akas)
+/// Local-first: search the deployed index (`tmdb_id_index` + IMDb akas)
 /// FIRST; on a thin or empty local result, fall through to the live API and MERGE
 /// (dedupe by id). Cache holds the merged payload so the second identical call is
 /// served without re-hitting upstream.
@@ -321,7 +327,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     // 1) Local index first (graceful: absent pools contribute nothing).
     let local_hits = search::local_tmdb_search(
         state.pools.imdb.as_ref(),
-        shirabe_pool(state),
+        tmdb_pool(state),
         &query,
         kind,
         SEARCH_LIMIT,
@@ -350,7 +356,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
         // graceful-degrade path.
         if payload.get("results").and_then(Value::as_array).is_none_or(Vec::is_empty)
             && state.config.tmdb_api_key.is_none()
-            && shirabe_pool(state).is_none()
+            && tmdb_pool(state).is_none()
         {
             return not_configured();
         }

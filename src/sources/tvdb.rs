@@ -14,7 +14,7 @@
 //! access path, and it is licensed. This is therefore an [`IngestMode::LazyScrape`]
 //! source: nothing is enumerated up front. The `/v4` facade fetches a record from
 //! the upstream v4 API on demand (with the in-memory bearer token obtained from the
-//! server-side key) and caches the payload in `shirabe.tvdb_cache`.
+//! server-side key) and caches the payload in `tvdb_cache` (dedicated `tvdb` DB).
 //!
 //! Auth: the v4 API uses a bearer token obtained from `POST {base}/login
 //! {apikey, pin}`. The token is long-lived (~1 month). We hold it in memory
@@ -23,7 +23,7 @@
 //!
 //! `refresh()` for a LazyScrape source performs no bulk ingest; it simply verifies
 //! that a login can be obtained (a cheap liveness probe) and records the result.
-//! `health()` reports token validity + the `shirabe.tvdb_cache` row count.
+//! `health()` reports token validity + the `tvdb_cache` row count.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -181,7 +181,7 @@ async fn login(base: &str, apikey: &str, pin: Option<&str>) -> Result<String, St
     Ok(parsed.data.token)
 }
 
-/// The TheTVDB lazy-scrape source. Holds the optional writable `shirabe` pool (for
+/// The TheTVDB lazy-scrape source. Holds the optional writable `tvdb` pool (for
 /// the `health()` cache row count), the shared in-memory [`TokenStore`], and a
 /// clone of the runtime config (for the key/PIN on a liveness login).
 pub struct TvdbSource {
@@ -246,24 +246,20 @@ impl Source for TvdbSource {
             return SourceHealth {
                 source: self.id().to_string(),
                 reachable: false,
-                detail: "SHIRABE_DATABASE_URL is not set; tvdb cache unavailable".to_string(),
+                detail: "TVDB_DATABASE_URL is not set; tvdb cache unavailable".to_string(),
             };
         };
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM shirabe.tvdb_cache")
-            .fetch_one(pool)
-            .await
+        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tvdb_cache").fetch_one(pool).await
         {
             Ok(n) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!(
-                    "shirabe.tvdb_cache reachable; {n} cached rows; token_valid={token_valid}"
-                ),
+                detail: format!("tvdb_cache reachable; {n} cached rows; token_valid={token_valid}"),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: false,
-                detail: format!("shirabe.tvdb_cache unreachable: {e}"),
+                detail: format!("tvdb_cache unreachable: {e}"),
             },
         }
     }

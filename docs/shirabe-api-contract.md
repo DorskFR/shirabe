@@ -96,52 +96,74 @@ surfaced inside the native shapes above (TMDB `external_ids.imdb_id`, TVDB
 `remoteIds`). An optional internal `GET /xref?source=&id=` may be added later;
 it is not part of the Kusaritoi-facing contract.
 
-## 6. Storage model — three databases (Option A)
+## 6. Storage model — five databases (one Postgres per provider)
 
-Shirabe uses **separate databases per bulk provider**, not one shared database
-with multiple schemas:
+Shirabe uses **separate databases per provider**, not one shared database with
+multiple schemas:
 
 | Database      | Env var                | Mode      | Holds |
 |---------------|------------------------|-----------|-------|
 | `musicbrainz` | `DATABASE_URL`         | read-only | the synced MB mirror (`musicbrainz` schema); never written |
-| `shirabe`     | `SHIRABE_DATABASE_URL` | writable  | shirabe's own coordination data (`shirabe.*` tables below) |
-| `imdb`        | `IMDB_DATABASE_URL`    | writable  | the bulk IMDb TSV mirror (tables added in SHIB-5) |
+| `shirabe`     | `SHIRABE_DATABASE_URL` | writable  | coordination data: `shirabe.source`, `shirabe.xref`, `shirabe.image_cache` |
+| `imdb`        | `IMDB_DATABASE_URL`    | writable  | the bulk IMDb TSV mirror (`imdb_*` tables) |
+| `tmdb`        | `TMDB_DATABASE_URL`    | writable  | `tmdb_cache` + `tmdb_id_index` |
+| `tvdb`        | `TVDB_DATABASE_URL`    | writable  | `tvdb_cache` |
 
-Only the `shirabe` and `imdb` databases are ever written; `musicbrainz` stays
+Only `shirabe`, `imdb`, `tmdb`, and `tvdb` are ever written; `musicbrainz` stays
 strictly read-only. The API pod boots with only `DATABASE_URL` set; the writable
-URLs are optional (prod provisions them in SHIB-11), and `shirabe sync <source>`
-errors clearly when a source needs a pool whose URL is missing.
+URLs are optional, and `shirabe sync <source>` errors clearly when a source needs
+a pool whose URL is missing. Because each provider lives in its own Postgres, the
+local-first search (`tmdb_id_index` + IMDb akas) is assembled per-pool in Rust and
+merged — the databases cannot be SQL-joined.
 
-Migrations are per-database:
+Migrations are per-database, and the four writable DBs are bootstrapped in-cluster
+by `shirabe migrate <db>` (the SQL is embedded in the binary via `include_str!`,
+so no migration files need to ship to the cluster). The read-only `musicbrainz`
+mirror migrations are applied to the mirror out of band and are NOT part of
+`shirabe migrate`:
 
-- `migrations/0001…`, `migrations/0002…` → the `musicbrainz` mirror.
-- `migrations/shirabe/0001_init.sql` → the `shirabe` database (base tables below).
-- `migrations/imdb/` → the `imdb` database (placeholder until SHIB-5).
+- `migrations/0001…`, `migrations/0002…` → the `musicbrainz` mirror (out of band).
+- `migrations/shirabe/0001_init.sql` → the `shirabe` database (`shirabe migrate shirabe`).
+- `migrations/imdb/0001_imdb_tables.sql` → the `imdb` database (`shirabe migrate imdb`).
+- `migrations/tmdb/0001_tmdb_tables.sql` → the `tmdb` database (`shirabe migrate tmdb`).
+- `migrations/tvdb/0001_tvdb_tables.sql` → the `tvdb` database (`shirabe migrate tvdb`).
 
-Base tables in the `shirabe` database (migration `migrations/shirabe/0001_init.sql`;
-the `shirabe.` schema prefix is kept for clarity, matching the code's references):
+`shirabe migrate all` applies every writable DB whose URL is configured (absent
+ones are skipped). All migrations are forward-only and idempotent
+(`CREATE … IF NOT EXISTS`).
+
+Base tables in the `shirabe` database (`migrations/shirabe/0001_init.sql`; the
+`shirabe.` schema prefix is kept, matching the code's references):
 
 - `shirabe.source(name PK, ingest_mode, last_refresh_at, status, detail jsonb)` —
   per-source registry/health.
 - `shirabe.xref(wikidata_qid, source, external_id, PK(source, external_id))` +
   index on `wikidata_qid`.
-- `shirabe.tmdb_cache(id, kind, payload jsonb, fetched_at)` — lazy-hydrate cache.
-- `shirabe.tvdb_cache(id, kind, payload jsonb, fetched_at)` — lazy-fetch cache.
-- `shirabe.tmdb_id_index(id, kind, name, popularity, adult)` — daily ID-export
-  enumeration.
 - `shirabe.image_cache(source, external_id, kind, remote_url, caache_url,
   fetched_at)` — artwork → caache URL mapping.
 
-Per-source bulk dump tables (IMDb `title.*`/`name.basics`, etc.) land in later
-migrations alongside their source implementations. Migrations are forward-only
-and idempotent.
+Tables in the dedicated `tmdb` database (`migrations/tmdb/0001_tmdb_tables.sql`;
+no schema prefix — the database itself scopes them):
+
+- `tmdb_cache(id, kind, payload jsonb, fetched_at)` — lazy-hydrate cache.
+- `tmdb_id_index(id, kind, name, popularity, adult)` — daily ID-export
+  enumeration, with a pg_trgm GIN index on `name` for local search.
+
+Tables in the dedicated `tvdb` database (`migrations/tvdb/0001_tvdb_tables.sql`):
+
+- `tvdb_cache(id, kind, payload jsonb, fetched_at)` — lazy-fetch cache.
+
+The IMDb bulk dump tables (`imdb_title_*`, `imdb_name_basics`, …) live in the
+`imdb` database. Migrations are forward-only and idempotent.
 
 ## 7. Decisions carried into this contract (spec §7)
 
-- **DB topology (Option A):** separate databases per bulk provider — the
-  read-only `musicbrainz` mirror (`DATABASE_URL`), a dedicated writable `shirabe`
-  coordination DB (`SHIRABE_DATABASE_URL`), and a dedicated writable `imdb`
-  bulk-mirror DB (`IMDB_DATABASE_URL`) — not one shared DB with schemas.
+- **DB topology (five databases, one per provider):** separate databases — the
+  read-only `musicbrainz` mirror (`DATABASE_URL`), a writable `shirabe`
+  coordination DB (`SHIRABE_DATABASE_URL`), a writable `imdb` bulk-mirror DB
+  (`IMDB_DATABASE_URL`), a writable `tmdb` cache/index DB (`TMDB_DATABASE_URL`),
+  and a writable `tvdb` cache DB (`TVDB_DATABASE_URL`) — not one shared DB with
+  schemas.
 - **Facade strictness:** implement the subset Kusaritoi parses today; pass extra
   upstream fields through from cached payloads where cheap.
 - **One host, native prefixes** (`/ws/2`, `/v4`, `/3`) — matches how Kusaritoi

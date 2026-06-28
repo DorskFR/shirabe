@@ -5,40 +5,52 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool,
     PgPoolOptions::new().max_connections(max_connections).connect(database_url).await
 }
 
-/// The set of database pools shirabe may hold (Option A multi-database layout):
+/// The set of database pools shirabe may hold (five-database layout, one Postgres
+/// per provider):
 ///
 /// - `musicbrainz` — the required, READ-ONLY MusicBrainz mirror (`DATABASE_URL`).
 /// - `shirabe` — the optional WRITABLE coordination DB (`SHIRABE_DATABASE_URL`):
-///   the `shirabe.source` registry, `xref`, `image_cache`, TMDB/TVDB caches.
+///   the `shirabe.source` registry, `xref`, `image_cache`.
 /// - `imdb` — the optional WRITABLE IMDb bulk-mirror DB (`IMDB_DATABASE_URL`).
+/// - `tmdb` — the optional WRITABLE TMDB cache/index DB (`TMDB_DATABASE_URL`):
+///   `tmdb_cache` + `tmdb_id_index`.
+/// - `tvdb` — the optional WRITABLE TheTVDB cache DB (`TVDB_DATABASE_URL`):
+///   `tvdb_cache`.
 ///
-/// Only the `shirabe` and `imdb` pools are ever written to; `musicbrainz` stays
-/// strictly read-only.
+/// Only the `shirabe`, `imdb`, `tmdb`, and `tvdb` pools are ever written to;
+/// `musicbrainz` stays strictly read-only.
 #[derive(Clone)]
 pub struct Pools {
     pub musicbrainz: PgPool,
     pub shirabe: Option<PgPool>,
     pub imdb: Option<PgPool>,
+    pub tmdb: Option<PgPool>,
+    pub tvdb: Option<PgPool>,
 }
 
 impl Pools {
     /// Connect the required MB pool and, when their URLs are set, the optional
-    /// writable shirabe + imdb pools. The API pod boots with only the MB pool.
+    /// writable shirabe + imdb + tmdb + tvdb pools. The API pod boots with only
+    /// the MB pool.
+    // `tmdb`/`tvdb` differ by one char (fixed provider names) → similar_names noise.
+    #[allow(clippy::similar_names)]
     pub async fn connect(
         database_url: &str,
         shirabe_database_url: Option<&str>,
         imdb_database_url: Option<&str>,
+        tmdb_database_url: Option<&str>,
+        tvdb_database_url: Option<&str>,
         max_connections: u32,
     ) -> Result<Self, sqlx::Error> {
         let musicbrainz = connect(database_url, max_connections).await?;
-        let shirabe = match shirabe_database_url {
-            Some(url) => Some(connect(url, max_connections).await?),
-            None => None,
+        let connect_opt = async |url: Option<&str>| match url {
+            Some(url) => Ok::<_, sqlx::Error>(Some(connect(url, max_connections).await?)),
+            None => Ok(None),
         };
-        let imdb = match imdb_database_url {
-            Some(url) => Some(connect(url, max_connections).await?),
-            None => None,
-        };
-        Ok(Self { musicbrainz, shirabe, imdb })
+        let shirabe = connect_opt(shirabe_database_url).await?;
+        let imdb = connect_opt(imdb_database_url).await?;
+        let tmdb = connect_opt(tmdb_database_url).await?;
+        let tvdb = connect_opt(tvdb_database_url).await?;
+        Ok(Self { musicbrainz, shirabe, imdb, tmdb, tvdb })
     }
 }

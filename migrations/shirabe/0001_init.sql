@@ -9,7 +9,8 @@
 -- idempotent (CREATE … IF NOT EXISTS): safe to re-run, never edited once applied.
 --
 -- This migration creates only the base tables (source registry, cross-ID xref,
--- TMDB/TVDB caches + the TMDB id index, and the image cache). The bulk
+-- and the image cache). The TMDB/TVDB caches + the TMDB id index now live in
+-- their own dedicated databases (migrations/tmdb/, migrations/tvdb/); the bulk
 -- per-source dump tables (IMDb, etc.) land in their own later migrations
 -- (SHIB-3..) alongside the source implementations.
 
@@ -40,40 +41,6 @@ CREATE TABLE IF NOT EXISTS shirabe.xref (
 
 CREATE INDEX IF NOT EXISTS shirabe_xref_wikidata_qid_idx
     ON shirabe.xref (wikidata_qid);
-
--- ── TMDB lazy-hydrate cache ─────────────────────────────────
--- Raw upstream TMDB API payloads keyed by (id, kind). `kind` distinguishes the
--- endpoint family (e.g. 'movie', 'tv', 'tv_season', 'search_*'). fetched_at
--- drives TTL/LRU prune.
-CREATE TABLE IF NOT EXISTS shirabe.tmdb_cache (
-    id          bigint NOT NULL,
-    kind        text NOT NULL,
-    payload     jsonb NOT NULL,
-    fetched_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (id, kind)
-);
-
--- ── TheTVDB lazy-fetch cache ────────────────────────────────
--- Same shape as the TMDB cache for the v4 facade.
-CREATE TABLE IF NOT EXISTS shirabe.tvdb_cache (
-    id          bigint NOT NULL,
-    kind        text NOT NULL,
-    payload     jsonb NOT NULL,
-    fetched_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (id, kind)
-);
-
--- ── TMDB ID-export enumeration index ───────────────────────
--- Populated from TMDB's daily id exports (no full dump exists). Tells us what
--- exists + popularity for ranking ties; the cache holds the hydrated detail.
-CREATE TABLE IF NOT EXISTS shirabe.tmdb_id_index (
-    id          bigint NOT NULL,
-    kind        text NOT NULL,
-    name        text,
-    popularity  real,
-    adult       boolean,
-    PRIMARY KEY (id, kind)
-);
 
 -- ── Image cache (URLs rewritten to caache) ─────────────────
 -- Maps a provider artwork to its caache-proxied URL. Mostly Shirabe just
