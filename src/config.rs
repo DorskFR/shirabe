@@ -62,6 +62,39 @@ pub struct Config {
     /// pg_trgm similarity threshold (0.0-1.0). Rows below this are discarded.
     #[arg(long, env = "SHIRABE_SIMILARITY_THRESHOLD", default_value_t = 0.2)]
     pub similarity_threshold: f64,
+
+    /// Server-side TMDB v3 API key. Optional: when unset, the `/3` facade and the
+    /// `tmdb` source degrade gracefully (503-style error / cache-only) rather than
+    /// panicking, and the API server still boots and serves `/ws/2` + other
+    /// facades. The inbound client `api_key` query param is always ignored;
+    /// Shirabe holds the real key here.
+    #[arg(long, env = "TMDB_API_KEY")]
+    pub tmdb_api_key: Option<String>,
+
+    /// TTL (in days) for cached TMDB v3 payloads in `shirabe.tmdb_cache`. A cache
+    /// row older than this is treated as stale and re-fetched from upstream.
+    #[arg(long, env = "TMDB_CACHE_TTL_DAYS", default_value_t = 7)]
+    pub tmdb_cache_ttl_days: i64,
+
+    /// Server-side TheTVDB v4 project API key. Optional: when unset, the `/v4`
+    /// facade and the `tvdb` source degrade gracefully (failure-shaped error /
+    /// cache-only) rather than panicking, and the API server still boots and
+    /// serves `/ws/2` + other facades. Clients send their own apikey/pin to
+    /// `/v4/login`; those are accepted and ignored — Shirabe holds the real key
+    /// here and mints its own token.
+    #[arg(long, env = "TVDB_API_KEY")]
+    pub tvdb_api_key: Option<String>,
+
+    /// Optional operator PIN paired with `TVDB_API_KEY` for TheTVDB's
+    /// user-supported (licensed) keys. Held server-side; never re-exposed to
+    /// clients.
+    #[arg(long, env = "TVDB_PIN")]
+    pub tvdb_pin: Option<String>,
+
+    /// TTL (in days) for cached TheTVDB v4 payloads in `shirabe.tvdb_cache`. A
+    /// cache row older than this is treated as stale and re-fetched from upstream.
+    #[arg(long, env = "TVDB_CACHE_TTL_DAYS", default_value_t = 7)]
+    pub tvdb_cache_ttl_days: i64,
 }
 
 impl Config {

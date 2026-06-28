@@ -13,6 +13,8 @@
 
 pub mod imdb;
 pub mod musicbrainz;
+pub mod tmdb;
+pub mod tvdb;
 pub mod wikidata;
 
 use std::collections::BTreeMap;
@@ -22,7 +24,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::PgPool;
 
+use crate::config::Config;
 use crate::db::Pools;
+use crate::sources::tvdb::TokenStore;
 
 /// How a source gets its data into Shirabe. Drives whether `shirabe sync`
 /// pulls a full dump, enumerates + lazily hydrates, scrapes on demand, or just
@@ -149,15 +153,23 @@ pub struct Registry {
 
 impl Registry {
     /// Build a registry over the configured pools with the default source set.
-    /// Later waves register IMDb/TMDB/TVDB/Wikidata here.
+    /// `config` + `tvdb_tokens` are threaded into the TheTVDB lazy-scrape source
+    /// (server-side key/PIN + the shared in-memory bearer token, which the `/v4`
+    /// facade reuses via `AppState`).
     #[must_use]
-    pub fn with_defaults(pools: Pools) -> Self {
+    pub fn with_defaults(pools: Pools, config: Config, tvdb_tokens: TokenStore) -> Self {
         let mb_pool = pools.musicbrainz.clone();
         let imdb_pool = pools.imdb.clone();
         let shirabe_pool = pools.shirabe.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
         registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool)));
+        registry.register(Arc::new(tmdb::TmdbSource::new(shirabe_pool.clone())));
+        registry.register(Arc::new(tvdb::TvdbSource::new(
+            shirabe_pool.clone(),
+            tvdb_tokens,
+            config,
+        )));
         registry.register(Arc::new(wikidata::WikidataXrefSource::new(shirabe_pool)));
         registry
     }
