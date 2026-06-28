@@ -1,6 +1,6 @@
 [package]
 name = "shirabe"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 license = "WTFPL"
 authors = ["DorskFR"]
@@ -36,3 +36,8 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "charset"] }
+flate2 = "1"
+csv = "1"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
