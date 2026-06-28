@@ -115,6 +115,7 @@ async fn serve(
 fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handlers::health))
+        .route("/health/sources", get(handlers::health_sources))
         .route("/ws/2", get(handlers::health))
         .route("/ws/2/artist", get(handlers::search_artist))
         .route("/ws/2/artist/{mbid}", get(handlers::lookup_artist))
