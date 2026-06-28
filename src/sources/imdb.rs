@@ -103,7 +103,11 @@ fn copy_line(fields: &[CopyField]) -> String {
     parts.join("\t")
 }
 
-/// The seven datasets IMDb publishes daily, in load order.
+/// The IMDb datasets we ingest, in load order. We load the title/akas search
+/// backbone (basics, episode, akas, ratings) and intentionally SKIP the heavy
+/// people/credits files (title.crew, title.principals ~4GB, name.basics) which
+/// are not used for title/akas matching — see the commented block below to
+/// re-enable them once people/credits are wired.
 #[allow(clippy::too_many_lines)] // declarative dataset table; splitting hurts readability
 fn datasets() -> Vec<Dataset> {
     vec![
@@ -197,6 +201,13 @@ fn datasets() -> Vec<Dataset> {
             indexes: &[],
             to_copy_fields: |r| vec![field(&r[0]), field(&r[1]), field(&r[2])],
         },
+        // ── People/credits datasets — SKIPPED for now ────────────────────────────
+        // title.crew (~79MB gz), title.principals (~736MB gz / ~4GB), and
+        // name.basics (~292MB gz) are cast/crew/people data, NOT used for the
+        // title/akas search backbone. Kept here (commented) to re-enable when
+        // people/credits are wired; also uncomment their tables in
+        // migrations/imdb/0001_imdb_tables.sql and size the imdb PVC accordingly.
+        /*
         Dataset {
             file: "title.crew.tsv.gz",
             table: "imdb_title_crew",
@@ -253,6 +264,7 @@ fn datasets() -> Vec<Dataset> {
                 ]
             },
         },
+        */
     ]
 }
 
@@ -485,15 +497,10 @@ impl Source for ImdbSource {
 async fn table_counts(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // Reachability probe so a dead pool errors rather than reporting all -1.
     sqlx::query("SELECT 1").execute(pool).await?;
-    let tables = [
-        "imdb_title_basics",
-        "imdb_title_episode",
-        "imdb_title_akas",
-        "imdb_title_ratings",
-        "imdb_title_crew",
-        "imdb_title_principals",
-        "imdb_name_basics",
-    ];
+    // Only the loaded search-backbone tables; the people/credits tables
+    // (crew/principals/name_basics) are skipped — see datasets().
+    let tables =
+        ["imdb_title_basics", "imdb_title_episode", "imdb_title_akas", "imdb_title_ratings"];
     let mut map = serde_json::Map::new();
     for t in tables {
         map.insert(t.to_string(), json!(count_rows(pool, t).await));
