@@ -36,9 +36,48 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
-use crate::AppState;
 use crate::sources::tvdb::API_BASE;
 use crate::sources::wikidata;
+use crate::{AppState, images, search};
+
+/// TheTVDB JSON keys whose values are ABSOLUTE image URLs (e.g. on
+/// `artworks.thetvdb.com`). When a caache base is configured, each is rewritten to
+/// route through the caache `/_ia/<host>/<path>` proxy. Applied recursively to
+/// search + detail payloads (top-level images, nested artworks arrays, …).
+const TVDB_IMAGE_URL_KEYS: &[&str] =
+    &["image", "image_url", "thumbnail", "thumbnail_url", "poster", "banner", "fanart", "artwork"];
+
+/// Recursively rewrite TheTVDB absolute image-URL fields in `value` to route
+/// through the caache proxy. A None/empty base disables rewriting (no-op). Only
+/// absolute http(s) values are rewritten. Stateless: only URL strings change.
+fn rewrite_image_urls(base: Option<&str>, value: &mut Value) {
+    let Some(base) = base.filter(|b| !b.is_empty()) else {
+        return;
+    };
+    rewrite_image_urls_inner(base, value);
+}
+
+fn rewrite_image_urls_inner(base: &str, value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if TVDB_IMAGE_URL_KEYS.contains(&k.as_str())
+                    && let Some(url) = v.as_str()
+                {
+                    *v = Value::String(images::rewrite_through_caache(base, url));
+                    continue;
+                }
+                rewrite_image_urls_inner(base, v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_image_urls_inner(base, v);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Build the `/v4` route group.
 pub fn router() -> Router<Arc<AppState>> {
@@ -245,8 +284,41 @@ async fn login(State(state): State<Arc<AppState>>) -> Response {
 /// never embeds the real upstream key/PIN.
 const SHIRABE_TOKEN: &str = "shirabe-tvdb-token";
 
+/// Max local hits to consider when probing the local index for a TVDB search.
+const SEARCH_LIMIT: i64 = 20;
+
+/// Map a TheTVDB search `type` to the IMDb `title_type`s used for the local probe.
+fn imdb_kind(search_type: &str) -> &'static str {
+    if search_type == "movie" { "movie" } else { "tv" }
+}
+
+/// Merge a live TheTVDB `{data:[…]}` payload into `data`, deduping by `tvdb_id`.
+/// Existing (local-cache-sourced) entries take precedence.
+fn merge_live_data(data: &mut Vec<Value>, live: &Value) {
+    use std::collections::HashSet;
+    let key = |v: &Value| -> Option<String> {
+        v.get("tvdb_id").and_then(|k| {
+            k.as_str().map(ToString::to_string).or_else(|| k.as_i64().map(|n| n.to_string()))
+        })
+    };
+    let seen: HashSet<String> = data.iter().filter_map(&key).collect();
+    if let Some(arr) = live.get("data").and_then(Value::as_array) {
+        for item in arr {
+            match key(item) {
+                Some(k) if seen.contains(&k) => {}
+                _ => data.push(item.clone()),
+            }
+        }
+    }
+}
+
 /// `GET /v4/search?type=series&query=` → `{data:[{tvdb_id,name,year,aliases,
-/// translations,…}]}`. Cache-first; `name`/`aliases`/`translations` preserved.
+/// translations,…}]}`.
+///
+/// Local-first: probe the local index (IMDb akas → non-latin resolution, e.g.
+/// 銀魂 → Gintama) FIRST; on a thin/empty local result fall through to the live
+/// v4 API and MERGE by `tvdb_id`. `name`/`aliases`/`translations` are preserved
+/// verbatim so Kusaritoi can score against the native + non-latin variants.
 async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
     let Some(query) = params.get("query").and_then(Value::as_str) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "query parameter is required");
@@ -255,17 +327,45 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>)
     let cache_kind = format!("search_{search_type}");
     let cache_id = stable_cache_id(query);
 
-    if let Some(cached) = cache_get(&state, cache_id, &cache_kind).await {
+    if let Some(mut cached) = cache_get(&state, cache_id, &cache_kind).await {
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
         return Json(cached).into_response();
     }
+
+    // Probe the local index. TheTVDB native results require a real `tvdb_id`, which
+    // the IMDb mirror cannot supply, so the local probe is used to decide whether a
+    // strong match already exists (and for non-latin resolution diagnostics); the
+    // emitted native records still come from the cache/live merge. A non-thin local
+    // result means a confident match exists in the deployed index.
+    let local_hits = search::local_tmdb_search(
+        state.pools.imdb.as_ref(),
+        shirabe_pool(&state),
+        query,
+        imdb_kind(&search_type),
+        SEARCH_LIMIT,
+    )
+    .await;
+    let local_thin = search::is_thin_result(&local_hits);
+    tracing::debug!(query, local_hits = local_hits.len(), local_thin, "tvdb local probe");
+
+    // Local IMDb hits cannot be emitted as native tvdb records, so we always need
+    // the live API (or cache) for the result shape; on a non-thin local result the
+    // live call is still made to obtain tvdb_ids, then merged. When no key is
+    // configured we degrade gracefully.
     if state.config.tvdb_api_key.is_none() {
         return not_configured();
     }
 
     let extra = [("type", search_type), ("query", query.to_string())];
     match upstream_get(&state, "search", &extra).await {
-        Ok(payload) => {
+        Ok(live) => {
+            // Start from any local-cache data (none here beyond the live set) and
+            // merge/dedupe by tvdb_id, keeping the live records' native shape.
+            let mut data: Vec<Value> = Vec::new();
+            merge_live_data(&mut data, &live);
+            let mut payload = json!({ "status": "success", "data": data });
             cache_put(&state, cache_id, &cache_kind, &payload).await;
+            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
             Json(payload).into_response()
         }
         Err(e) => {
@@ -283,7 +383,8 @@ async fn series_detail(state: &Arc<AppState>, id_raw: &str, extended: bool) -> R
     };
     let cache_kind = if extended { "series_extended" } else { "series" };
 
-    if let Some(cached) = cache_get(state, id, cache_kind).await {
+    if let Some(mut cached) = cache_get(state, id, cache_kind).await {
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
         return Json(cached).into_response();
     }
     if state.config.tvdb_api_key.is_none() {
@@ -292,9 +393,10 @@ async fn series_detail(state: &Arc<AppState>, id_raw: &str, extended: bool) -> R
 
     let path = if extended { format!("series/{id}/extended") } else { format!("series/{id}") };
     match upstream_get(state, &path, &[]).await {
-        Ok(payload) => {
+        Ok(mut payload) => {
             cache_put(state, id, cache_kind, &payload).await;
             self_link_remote_ids(state, id, &payload).await;
+            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
             Json(payload).into_response()
         }
         Err(e) => {
@@ -332,7 +434,8 @@ async fn series_episodes(
     let cache_kind = "series_episodes";
     let cache_id = stable_cache_id(&cache_key);
 
-    if let Some(cached) = cache_get(&state, cache_id, cache_kind).await {
+    if let Some(mut cached) = cache_get(&state, cache_id, cache_kind).await {
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
         return Json(cached).into_response();
     }
     if state.config.tvdb_api_key.is_none() {
@@ -345,8 +448,9 @@ async fn series_episodes(
     }
     let path = format!("series/{id}/episodes/{season_type}");
     match upstream_get(&state, &path, &extra).await {
-        Ok(payload) => {
+        Ok(mut payload) => {
             cache_put(&state, cache_id, cache_kind, &payload).await;
+            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
             Json(payload).into_response()
         }
         Err(e) => {
@@ -368,7 +472,8 @@ async fn movie(State(state): State<Arc<AppState>>, Path(id_raw): Path<String>) -
     };
     let cache_kind = "movie";
 
-    if let Some(cached) = cache_get(&state, id, cache_kind).await {
+    if let Some(mut cached) = cache_get(&state, id, cache_kind).await {
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
         return Json(cached).into_response();
     }
     if state.config.tvdb_api_key.is_none() {
@@ -378,9 +483,10 @@ async fn movie(State(state): State<Arc<AppState>>, Path(id_raw): Path<String>) -
     // The extended movie record carries remoteIds for cross-linking.
     let path = format!("movies/{id}/extended");
     match upstream_get(&state, &path, &[]).await {
-        Ok(payload) => {
+        Ok(mut payload) => {
             cache_put(&state, id, cache_kind, &payload).await;
             self_link_remote_ids(&state, id, &payload).await;
+            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
             Json(payload).into_response()
         }
         Err(e) => {
@@ -468,5 +574,68 @@ mod tests {
             .find(|e| e["sourceName"].as_str() == Some("IMDB"))
             .and_then(|e| e["id"].as_str());
         assert_eq!(imdb, Some("tt0388629"));
+    }
+
+    /// Live search data merges into the result set deduping by `tvdb_id`; an entry
+    /// already present locally is not duplicated, preserving its native shape.
+    #[test]
+    fn merge_live_data_dedupes_by_tvdb_id() {
+        let mut data = vec![json!({ "tvdb_id": "series-81797", "name": "One Piece" })];
+        let live = json!({ "data": [
+            { "tvdb_id": "series-81797", "name": "One Piece (live)" }, // dup → dropped
+            { "tvdb_id": "series-1396", "name": "Breaking Bad" },       // new → kept
+            { "tvdb_id": 4242, "name": "Numeric Id Series" }            // numeric id form
+        ] });
+        merge_live_data(&mut data, &live);
+        let ids: Vec<String> = data
+            .iter()
+            .filter_map(|d| {
+                d["tvdb_id"]
+                    .as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| d["tvdb_id"].as_i64().map(|n| n.to_string()))
+            })
+            .collect();
+        assert_eq!(ids, vec!["series-81797", "series-1396", "4242"]);
+        // The locally-present entry kept its own name (live dup did not overwrite).
+        assert_eq!(data[0]["name"], "One Piece");
+    }
+
+    /// A series search `type` probes the IMDb `tv` kinds; `movie` probes `movie`.
+    #[test]
+    fn imdb_kind_maps_search_type() {
+        assert_eq!(imdb_kind("series"), "tv");
+        assert_eq!(imdb_kind("movie"), "movie");
+        assert_eq!(imdb_kind("anything-else"), "tv");
+    }
+
+    /// Absolute TheTVDB artwork URLs (top-level and in nested artworks arrays) are
+    /// rewritten through caache; a None base is a no-op.
+    #[test]
+    fn rewrites_nested_artwork_urls() {
+        let base = "https://caache.dorsk.dev";
+        let mut payload = json!({
+            "data": {
+                "image": "https://artworks.thetvdb.com/banners/posters/x.jpg",
+                "artworks": [
+                    { "image": "https://artworks.thetvdb.com/banners/a.jpg",
+                      "thumbnail": "https://artworks.thetvdb.com/banners/a_t.jpg" }
+                ]
+            }
+        });
+        rewrite_image_urls(Some(base), &mut payload);
+        assert_eq!(
+            payload["data"]["image"],
+            "https://caache.dorsk.dev/_ia/artworks.thetvdb.com/banners/posters/x.jpg"
+        );
+        assert_eq!(
+            payload["data"]["artworks"][0]["thumbnail"],
+            "https://caache.dorsk.dev/_ia/artworks.thetvdb.com/banners/a_t.jpg"
+        );
+
+        // None base disables rewriting.
+        let mut original = json!({ "image": "https://artworks.thetvdb.com/banners/a.jpg" });
+        rewrite_image_urls(None, &mut original);
+        assert_eq!(original["image"], "https://artworks.thetvdb.com/banners/a.jpg");
     }
 }

@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS shirabe.tmdb_id_index (
 -- ── Image cache (URLs rewritten to caache) ─────────────────
 -- Maps a provider artwork to its caache-proxied URL. Mostly Shirabe just
 -- rewrites remote_url → caache_url; the row records the mapping + fetch time.
+-- RESERVED / UNUSED (SHIB-9): the image flow is stateless URL-rewrite — facades
+-- rewrite TMDB/TVDB image URLs through caache at serialize time (see src/images.rs)
+-- and never persist a row here. This table is kept for optional future URL
+-- bookkeeping only.
 CREATE TABLE IF NOT EXISTS shirabe.image_cache (
     source      text NOT NULL,
     external_id text NOT NULL,

@@ -7,9 +7,11 @@ mod db;
 mod error;
 mod facades;
 mod handlers;
+mod images;
 mod models;
 mod query;
 mod repo;
+mod search;
 mod sources;
 
 use std::sync::Arc;
