@@ -25,6 +25,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use crate::config::{Cli, Command, Config};
 use crate::db::Pools;
 use crate::sources::Registry;
+use crate::sources::tvdb::TokenStore;
 
 /// Shared application state handed to every handler.
 pub struct AppState {
@@ -33,6 +34,9 @@ pub struct AppState {
     pub pools: Pools,
     pub config: Config,
     pub registry: Registry,
+    /// Shared in-memory TheTVDB bearer token, minted from the server-side key and
+    /// reused by the `/v4` facade and the `tvdb` source.
+    pub tvdb_tokens: TokenStore,
 }
 
 impl AppState {
@@ -59,13 +63,14 @@ async fn main() -> anyhow::Result<()> {
         config.db_pool_size,
     )
     .await?;
-    let registry = Registry::with_defaults(pools.clone());
+    let tvdb_tokens = TokenStore::new();
+    let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
 
     match cli.command {
         // CronJob entrypoint: refresh one source and exit.
         Some(Command::Sync { source }) => run_sync(&registry, &source).await,
         // Default: start the HTTP server exactly as before.
-        None => serve(config, pools, registry).await,
+        None => serve(config, pools, registry, tvdb_tokens).await,
     }
 }
 
@@ -87,10 +92,15 @@ async fn run_sync(registry: &Registry, source: &str) -> anyhow::Result<()> {
 }
 
 /// Start the axum HTTP server (unchanged default behaviour).
-async fn serve(config: Config, pools: Pools, registry: Registry) -> anyhow::Result<()> {
+async fn serve(
+    config: Config,
+    pools: Pools,
+    registry: Registry,
+    tvdb_tokens: TokenStore,
+) -> anyhow::Result<()> {
     let bind = config.bind.clone();
     tracing::info!(bind = %bind, "starting shirabe");
-    let state = Arc::new(AppState { pools, config, registry });
+    let state = Arc::new(AppState { pools, config, registry, tvdb_tokens });
 
     let app = build_router(state);
 
