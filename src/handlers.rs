@@ -138,6 +138,19 @@ pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// `GET /health/sources` — per-source observability.
+///
+/// For every registered source, merges the live `Source::health()` probe with the
+/// persisted `shirabe.source` row (last_refresh_at/status/detail written by
+/// `shirabe sync <source>` CronJob runs), so a stale or errored source is obvious
+/// at a glance via the `healthy` rollup. Degrades gracefully when the writable
+/// shirabe pool is absent (reports only what live `health()` can determine).
+pub async fn health_sources(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::sources::SourcesHealthReport> {
+    Json(state.registry.health_report().await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::inc_has;

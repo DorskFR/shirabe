@@ -21,8 +21,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use crate::config::Config;
 use crate::db::Pools;
@@ -224,6 +225,134 @@ impl Registry {
         }
         out
     }
+
+    /// Gather the `/health/sources` report: for every registered source, merge the
+    /// live [`Source::health`] probe with the persisted `shirabe.source` row
+    /// (last_refresh_at/status/detail written by `shirabe sync` CronJob runs).
+    ///
+    /// Degrades gracefully when the writable `shirabe` pool is absent (the API pod
+    /// may boot with only the read-only mirror): the persisted fields are left
+    /// `None` and the report reflects only what live `health()` can determine.
+    pub async fn health_report(&self) -> SourcesHealthReport {
+        // Read the persisted registry rows once (best-effort); key by source name.
+        let persisted = match self.pools.shirabe.as_ref() {
+            Some(shirabe) => match fetch_source_rows(shirabe).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read shirabe.source for /health/sources");
+                    BTreeMap::new()
+                }
+            },
+            None => BTreeMap::new(),
+        };
+
+        let mut sources = Vec::with_capacity(self.sources.len());
+        for source in self.sources.values() {
+            let live = source.health().await;
+            let row = persisted.get(source.id());
+            sources.push(merge_source_health(source.as_ref(), &live, row));
+        }
+        SourcesHealthReport { sources }
+    }
+}
+
+/// A persisted `shirabe.source` row, as read back for `/health/sources`.
+#[derive(Debug, Clone)]
+struct SourceRow {
+    ingest_mode: String,
+    last_refresh_at: Option<String>,
+    status: Option<String>,
+    detail: Option<Value>,
+}
+
+/// One source's entry in the `/health/sources` response: the persisted registry
+/// state merged with the live `health()` probe, plus a single `healthy` rollup
+/// so a human/monitor can see at a glance which source is stale or errored.
+// `PartialEq` is for the unit tests; `Value` precludes `Eq`, hence the allow.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SourceStatus {
+    /// Source id / `shirabe.source.name`.
+    pub id: String,
+    /// How this source ingests data (`bulk_dump`, `lazy_scrape`, …).
+    pub ingest_mode: String,
+    /// Persisted status of the last `sync` run (`ok`/`error`), or `null` if the
+    /// source has never run a CronJob `sync` (no `shirabe.source` row).
+    pub status: Option<String>,
+    /// Wall-clock time of the last persisted refresh, RFC3339, or `null`.
+    pub last_refresh_at: Option<String>,
+    /// Structured detail from the last persisted refresh (row counts, error
+    /// summary, token expiry, …), or `null`.
+    pub detail: Option<Value>,
+    /// Whether the source's backing store/upstream is reachable right now.
+    pub reachable: bool,
+    /// One-line live `health()` detail (row/cache counts, token validity, …).
+    pub live_detail: String,
+    /// Single rollup: `true` only when the live probe is reachable AND the last
+    /// persisted `sync` did not record an error. A stale or errored source is
+    /// immediately visible as `healthy: false`.
+    pub healthy: bool,
+}
+
+/// The `/health/sources` response: one [`SourceStatus`] per registered source.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SourcesHealthReport {
+    pub sources: Vec<SourceStatus>,
+}
+
+/// Merge a source's live [`SourceHealth`] with its (optional) persisted
+/// `shirabe.source` row into the response model. Pure — unit-tested without a DB.
+fn merge_source_health(
+    source: &dyn Source,
+    live: &SourceHealth,
+    row: Option<&SourceRow>,
+) -> SourceStatus {
+    let status = row.and_then(|r| r.status.clone());
+    // Unhealthy if the live probe can't reach the backing store, or the last
+    // persisted sync recorded an error status.
+    let persisted_errored = status.as_deref() == Some("error");
+    SourceStatus {
+        id: source.id().to_string(),
+        ingest_mode: row
+            .map_or_else(|| source.ingest_mode().as_str().to_string(), |r| r.ingest_mode.clone()),
+        status,
+        last_refresh_at: row.and_then(|r| r.last_refresh_at.clone()),
+        detail: row.and_then(|r| r.detail.clone()),
+        reachable: live.reachable,
+        live_detail: live.detail.clone(),
+        healthy: live.reachable && !persisted_errored,
+    }
+}
+
+/// Read all `shirabe.source` rows for the health report, keyed by source name.
+/// Runtime query; reads only the `shirabe` schema. `last_refresh_at` is rendered
+/// to RFC3339 text in SQL to avoid pulling in a timestamp type/feature.
+async fn fetch_source_rows(pool: &PgPool) -> Result<BTreeMap<String, SourceRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT name,
+                ingest_mode,
+                to_char(last_refresh_at, 'YYYY-MM-DD\"T\"HH24:MI:SSOF') AS last_refresh_at,
+                status,
+                detail
+           FROM shirabe.source",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut map = BTreeMap::new();
+    for r in rows {
+        let name: String = r.get("name");
+        map.insert(
+            name,
+            SourceRow {
+                ingest_mode: r.get("ingest_mode"),
+                last_refresh_at: r.get("last_refresh_at"),
+                status: r.get("status"),
+                detail: r.get("detail"),
+            },
+        );
+    }
+    Ok(map)
 }
 
 /// Upsert a source's row in `shirabe.source` after a refresh. Runtime query
@@ -233,6 +362,11 @@ async fn upsert_refresh(
     source: &dyn Source,
     report: &RefreshReport,
 ) -> Result<(), sqlx::Error> {
+    // Fold the one-line summary into the persisted detail so a failure's error
+    // message is queryable in-app (via `/health/sources`), not only in the k8s
+    // job log: a failed refresh often carries `detail: Null` and only the summary
+    // describes what broke.
+    let detail = persisted_detail(report);
     sqlx::query(
         "INSERT INTO shirabe.source (name, ingest_mode, last_refresh_at, status, detail)
          VALUES ($1, $2, now(), $3, $4)
@@ -245,10 +379,27 @@ async fn upsert_refresh(
     .bind(source.id())
     .bind(source.ingest_mode().as_str())
     .bind(report.status_str())
-    .bind(&report.detail)
+    .bind(&detail)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Build the jsonb `detail` to persist for a refresh: always carry the one-line
+/// `summary` (so a failure's cause is queryable), merging it into the report's
+/// structured detail when present. Pure — unit-tested.
+fn persisted_detail(report: &RefreshReport) -> Value {
+    match &report.detail {
+        Value::Object(map) => {
+            let mut map = map.clone();
+            map.entry("summary".to_string())
+                .or_insert_with(|| Value::String(report.summary.clone()));
+            Value::Object(map)
+        }
+        Value::Null => serde_json::json!({ "summary": report.summary }),
+        // A non-object, non-null detail (rare): wrap it alongside the summary.
+        other => serde_json::json!({ "summary": report.summary, "detail": other }),
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +423,145 @@ mod tests {
     fn refresh_report_status_strings() {
         assert_eq!(RefreshReport::ok("done").status_str(), "ok");
         assert_eq!(RefreshReport::failed("boom").status_str(), "error");
+    }
+
+    /// A failed refresh with no structured detail still persists its summary, so
+    /// the error is queryable via `/health/sources` rather than lost.
+    #[test]
+    fn persisted_detail_carries_summary_for_null_detail() {
+        let report = RefreshReport::failed("mirror unreachable: timed out");
+        assert_eq!(
+            persisted_detail(&report),
+            serde_json::json!({ "summary": "mirror unreachable: timed out" })
+        );
+    }
+
+    /// A structured detail is preserved and the summary is merged in (without
+    /// clobbering an explicit `summary` key if the source already set one).
+    #[test]
+    fn persisted_detail_merges_summary_into_object() {
+        let report =
+            RefreshReport::ok("ingested 5 rows").with_detail(serde_json::json!({ "rows": 5 }));
+        assert_eq!(
+            persisted_detail(&report),
+            serde_json::json!({ "rows": 5, "summary": "ingested 5 rows" })
+        );
+    }
+
+    /// A minimal `Source` used to exercise the pure merge without a live DB.
+    struct FakeSource;
+
+    #[async_trait]
+    impl Source for FakeSource {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "fake"
+        }
+        fn ingest_mode(&self) -> IngestMode {
+            IngestMode::BulkDump
+        }
+        async fn refresh(&self, _ctx: &RefreshCtx) -> RefreshReport {
+            RefreshReport::ok("noop")
+        }
+        async fn health(&self) -> SourceHealth {
+            SourceHealth {
+                source: "fake".to_string(),
+                reachable: true,
+                detail: "fake reachable; 3 rows".to_string(),
+            }
+        }
+    }
+
+    /// Merge with a persisted ok row + a reachable live probe → healthy, and the
+    /// persisted fields (last_refresh_at/status/detail) flow through.
+    #[test]
+    fn merge_ok_row_with_reachable_probe_is_healthy() {
+        let live = SourceHealth {
+            source: "fake".to_string(),
+            reachable: true,
+            detail: "fake reachable; 3 rows".to_string(),
+        };
+        let row = SourceRow {
+            ingest_mode: "bulk_dump".to_string(),
+            last_refresh_at: Some("2026-06-29T07:00:00+00".to_string()),
+            status: Some("ok".to_string()),
+            detail: Some(serde_json::json!({ "rows": 3 })),
+        };
+        let status = merge_source_health(&FakeSource, &live, Some(&row));
+        assert_eq!(
+            status,
+            SourceStatus {
+                id: "fake".to_string(),
+                ingest_mode: "bulk_dump".to_string(),
+                status: Some("ok".to_string()),
+                last_refresh_at: Some("2026-06-29T07:00:00+00".to_string()),
+                detail: Some(serde_json::json!({ "rows": 3 })),
+                reachable: true,
+                live_detail: "fake reachable; 3 rows".to_string(),
+                healthy: true,
+            }
+        );
+    }
+
+    /// A persisted `error` status makes the source unhealthy even if the live
+    /// probe is reachable — a failed CronJob is visible in-app.
+    #[test]
+    fn merge_errored_row_is_unhealthy() {
+        let live = SourceHealth {
+            source: "fake".to_string(),
+            reachable: true,
+            detail: "fake reachable".to_string(),
+        };
+        let row = SourceRow {
+            ingest_mode: "bulk_dump".to_string(),
+            last_refresh_at: Some("2026-06-01T00:00:00+00".to_string()),
+            status: Some("error".to_string()),
+            detail: Some(serde_json::json!({ "summary": "ingest failed: 500" })),
+        };
+        let status = merge_source_health(&FakeSource, &live, Some(&row));
+        assert!(!status.healthy);
+        assert_eq!(status.status.as_deref(), Some("error"));
+    }
+
+    /// With no persisted row (source never synced, or shirabe pool absent), the
+    /// persisted fields are null, ingest_mode falls back to the source's own, and
+    /// `healthy` reflects only live reachability.
+    #[test]
+    fn merge_without_row_degrades_to_live_probe() {
+        let live = SourceHealth {
+            source: "fake".to_string(),
+            reachable: false,
+            detail: "unreachable".to_string(),
+        };
+        let status = merge_source_health(&FakeSource, &live, None);
+        assert_eq!(status.ingest_mode, "bulk_dump");
+        assert_eq!(status.status, None);
+        assert_eq!(status.last_refresh_at, None);
+        assert_eq!(status.detail, None);
+        assert!(!status.healthy);
+    }
+
+    /// The response model serializes to the documented `{ "sources": [ … ] }`
+    /// shape with the expected keys.
+    #[test]
+    fn report_serializes_to_sources_array() {
+        let report = SourcesHealthReport {
+            sources: vec![SourceStatus {
+                id: "fake".to_string(),
+                ingest_mode: "bulk_dump".to_string(),
+                status: Some("ok".to_string()),
+                last_refresh_at: Some("2026-06-29T07:00:00+00".to_string()),
+                detail: None,
+                reachable: true,
+                live_detail: "ok".to_string(),
+                healthy: true,
+            }],
+        };
+        let v = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(v["sources"][0]["id"], "fake");
+        assert_eq!(v["sources"][0]["ingest_mode"], "bulk_dump");
+        assert_eq!(v["sources"][0]["status"], "ok");
+        assert_eq!(v["sources"][0]["healthy"], true);
+        assert_eq!(v["sources"][0]["detail"], serde_json::Value::Null);
     }
 }
