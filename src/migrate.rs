@@ -15,21 +15,27 @@ use crate::config::Config;
 use crate::db::connect;
 
 /// Embedded migration SQL for the `shirabe` coordination DB.
-const SHIRABE_SQL: &str = include_str!("../migrations/shirabe/0001_init.sql");
+const SHIRABE_SQL: &[&str] = &[include_str!("../migrations/shirabe/0001_init.sql")];
 /// Embedded migration SQL for the `imdb` bulk-mirror DB.
-const IMDB_SQL: &str = include_str!("../migrations/imdb/0001_imdb_tables.sql");
-/// Embedded migration SQL for the `tmdb` cache/index DB.
-const TMDB_SQL: &str = include_str!("../migrations/tmdb/0001_tmdb_tables.sql");
+const IMDB_SQL: &[&str] = &[include_str!("../migrations/imdb/0001_imdb_tables.sql")];
+/// Embedded migration SQL for the `tmdb` cache/index DB (applied in file order).
+const TMDB_SQL: &[&str] = &[
+    include_str!("../migrations/tmdb/0001_tmdb_tables.sql"),
+    include_str!("../migrations/tmdb/0002_tmdb_cache_imdb_id_idx.sql"),
+];
 /// Embedded migration SQL for the `tvdb` cache DB.
-const TVDB_SQL: &str = include_str!("../migrations/tvdb/0001_tvdb_tables.sql");
+const TVDB_SQL: &[&str] = &[include_str!("../migrations/tvdb/0001_tvdb_tables.sql")];
 
 /// The four writable databases that `shirabe migrate` can bootstrap, in apply
 /// order for `migrate all`.
 const MIGRATABLE: &[&str] = &["shirabe", "imdb", "tmdb", "tvdb"];
 
-/// Resolve a db id to its embedded migration SQL. Returns `None` for unknown ids.
+/// Resolve a db id to its embedded migration SQL files (in apply order). Every
+/// file is idempotent DDL, so all files are (re)applied on each run — a fresh DB
+/// gets the full set, an existing one no-ops through the already-applied files.
+/// Returns `None` for unknown ids.
 #[must_use]
-fn embedded_sql(db: &str) -> Option<&'static str> {
+fn embedded_sql(db: &str) -> Option<&'static [&'static str]> {
     match db {
         "shirabe" => Some(SHIRABE_SQL),
         "imdb" => Some(IMDB_SQL),
@@ -54,7 +60,7 @@ fn db_url<'a>(config: &'a Config, db: &str) -> Option<&'a str> {
 /// Errors (and the caller exits non-zero) when the db id is unknown, its URL is
 /// unset, or the connection / SQL fails.
 async fn migrate_one(config: &Config, db: &str) -> anyhow::Result<()> {
-    let sql = embedded_sql(db)
+    let files = embedded_sql(db)
         .ok_or_else(|| anyhow::anyhow!("unknown db `{db}`; known: {}", MIGRATABLE.join(", ")))?;
     let url = db_url(config, db).ok_or_else(|| {
         anyhow::anyhow!(
@@ -62,11 +68,13 @@ async fn migrate_one(config: &Config, db: &str) -> anyhow::Result<()> {
             db.to_ascii_uppercase()
         )
     })?;
-    tracing::info!(db, "applying embedded migration");
+    tracing::info!(db, files = files.len(), "applying embedded migrations");
     let pool = connect(url, config.db_pool_size).await?;
-    apply_sql(&pool, sql).await?;
+    for sql in files {
+        apply_sql(&pool, sql).await?;
+    }
     pool.close().await;
-    tracing::info!(db, "migration applied");
+    tracing::info!(db, "migrations applied");
     Ok(())
 }
 
@@ -103,14 +111,19 @@ pub async fn run(config: &Config, db: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Each known db id maps to a non-empty embedded SQL constant, and the right
-    /// one (smoke-checked by a table name unique to that file). Unknown ids → None.
+    /// Concatenate a db's embedded migration files for content smoke-checks.
+    fn joined(db: &str) -> String {
+        embedded_sql(db).unwrap().join("\n")
+    }
+
+    /// Each known db id maps to non-empty embedded SQL files, and the right ones
+    /// (smoke-checked by a table name unique to that db). Unknown ids → None.
     #[test]
     fn maps_db_id_to_embedded_sql() {
-        assert!(embedded_sql("shirabe").unwrap().contains("shirabe.source"));
-        assert!(embedded_sql("imdb").unwrap().contains("imdb_title_basics"));
-        assert!(embedded_sql("tmdb").unwrap().contains("tmdb_id_index"));
-        assert!(embedded_sql("tvdb").unwrap().contains("tvdb_cache"));
+        assert!(joined("shirabe").contains("shirabe.source"));
+        assert!(joined("imdb").contains("imdb_title_basics"));
+        assert!(joined("tmdb").contains("tmdb_id_index"));
+        assert!(joined("tvdb").contains("tvdb_cache"));
         assert!(embedded_sql("musicbrainz").is_none());
         assert!(embedded_sql("nope").is_none());
     }
@@ -119,11 +132,21 @@ mod tests {
     /// migration — guards the five-DB split against regressions.
     #[test]
     fn shirabe_sql_no_longer_defines_tmdb_or_tvdb_tables() {
-        let shirabe = embedded_sql("shirabe").unwrap();
+        let shirabe = joined("shirabe");
         assert!(!shirabe.contains("CREATE TABLE IF NOT EXISTS shirabe.tmdb_cache"));
         assert!(!shirabe.contains("CREATE TABLE IF NOT EXISTS shirabe.tvdb_cache"));
         assert!(!shirabe.contains("CREATE TABLE IF NOT EXISTS shirabe.tmdb_id_index"));
-        assert!(embedded_sql("tmdb").unwrap().contains("CREATE TABLE IF NOT EXISTS tmdb_cache"));
-        assert!(embedded_sql("tvdb").unwrap().contains("CREATE TABLE IF NOT EXISTS tvdb_cache"));
+        assert!(joined("tmdb").contains("CREATE TABLE IF NOT EXISTS tmdb_cache"));
+        assert!(joined("tvdb").contains("CREATE TABLE IF NOT EXISTS tvdb_cache"));
+    }
+
+    /// The tmdb DB carries the SHIB-15 imdb_id cross-ref index migration, applied
+    /// after the base tables (file order = apply order).
+    #[test]
+    fn tmdb_sql_includes_imdb_id_xref_index() {
+        let files = embedded_sql("tmdb").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].contains("CREATE TABLE IF NOT EXISTS tmdb_cache"));
+        assert!(files[1].contains("tmdb_cache_kind_imdb_id_idx"));
     }
 }

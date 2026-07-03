@@ -267,7 +267,7 @@ const SEARCH_LIMIT: i64 = 20;
 /// is a TMDB numeric id) into a TMDB v3 search result object. `kind` selects the
 /// `name` (tv) vs `title` (movie) display field.
 fn local_hit_to_result(hit: &ScoredHit, kind: &str) -> Option<Value> {
-    let id: i64 = hit.id.parse().ok()?; // IMDb-tconst hits have no TMDB id → skipped
+    let id = hit.tmdb_id()?; // unresolved IMDb-tconst hits have no TMDB id → skipped
     let mut obj = json!({
         "id": id,
         "popularity": hit.popularity.unwrap_or(0.0),
@@ -334,10 +334,17 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     )
     .await;
 
-    let mut payload = local_results_payload(&local_hits, kind);
+    // Only hits with a TMDB id are renderable as native results; unresolved
+    // IMDb-tconst hits must not count toward the thinness gate either — a strong
+    // akas match without a known TMDB id is a reason TO consult the live API
+    // (which can actually name the title), never to suppress it (SHIB-15).
+    let renderable: Vec<ScoredHit> =
+        local_hits.iter().filter(|h| h.tmdb_id().is_some()).cloned().collect();
+
+    let mut payload = local_results_payload(&renderable, kind);
 
     // 2) Fall through to the live API on a thin/miss local result and merge.
-    if search::is_thin_result(&local_hits) {
+    if search::is_thin_result(&renderable) {
         if let Some(key) = state.config.tmdb_api_key.as_deref() {
             let path = format!("search/{kind}");
             match upstream_get(key, &path, &[("query", query)]).await {
@@ -525,6 +532,48 @@ mod tests {
             adult: None,
         };
         assert!(local_hit_to_result(&tconst, "movie").is_none());
+    }
+
+    /// SHIB-15 repro: "gintama" locally yields a strong IMDb-tconst akas hit
+    /// (unrenderable — no TMDB id) plus weak trigram junk. The renderable subset
+    /// the handler now gates on must (a) exclude the tconst hit from the payload
+    /// AND (b) be judged thin, so the live merge runs instead of serving junk.
+    #[test]
+    fn unresolved_tconst_hits_do_not_suppress_live_merge() {
+        let local_hits = [
+            ScoredHit {
+                id: "tt0988818".into(), // Gintama, exact akas match, unresolved
+                name: "Gintama".into(),
+                score: 100,
+                popularity: None,
+                adult: None,
+            },
+            ScoredHit {
+                id: "1001".into(),
+                name: "Gina".into(),
+                score: 50,
+                popularity: Some(3.0),
+                adult: Some(false),
+            },
+            ScoredHit {
+                id: "1002".into(),
+                name: "Ginirama".into(),
+                score: 45,
+                popularity: Some(1.0),
+                adult: Some(false),
+            },
+        ];
+        let renderable: Vec<ScoredHit> =
+            local_hits.iter().filter(|h| h.tmdb_id().is_some()).cloned().collect();
+        assert_eq!(renderable.len(), 2); // tconst hit not renderable
+        assert!(search::is_thin_result(&renderable)); // weak-only → live merge runs
+        // The old gate over ALL local hits called this confident — guard against
+        // reintroducing it.
+        let payload = local_results_payload(&renderable, "tv");
+        let results = payload["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        // tconst hit skipped, not mislabelled under a wrong id.
+        assert!(results.iter().all(|r| r["name"].as_str() != Some("Gintama")));
     }
 
     /// Live results merge into the local set, deduped by `id`, then re-ranked by
