@@ -350,6 +350,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>)
         query,
         imdb_kind(&search_type),
         SEARCH_LIMIT,
+        &state.config.search_work_mem,
     )
     .await;
     let local_thin = search::is_thin_result(&local_hits);

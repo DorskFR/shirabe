@@ -2,8 +2,7 @@
 //! schema). Uses sqlx runtime queries (no compile-time macros) so the build
 //! never needs a live DB.
 
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
@@ -11,6 +10,7 @@ use crate::models::{
     Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Medium, Recording, RecordingRef,
     Relation, Release, ReleaseGroup, ReleaseStub, Track, UrlRelation, UrlResource,
 };
+use crate::search::configure_search_session;
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
 ///
@@ -18,17 +18,6 @@ use crate::models::{
 /// `f32`; we widen to `f64` only for the arithmetic here.
 fn to_score(similarity: f32) -> i32 {
     (f64::from(similarity) * 100.0).round().clamp(0.0, 100.0) as i32
-}
-
-/// Set the `pg_trgm.similarity_threshold` GUC (the cutoff used by the `%`
-/// operator) on a single connection. `set_limit()` clamps to [0,1] and applies
-/// to the session, so it must run on the same connection as the search query.
-async fn set_similarity_limit(
-    conn: &mut PoolConnection<Postgres>,
-    threshold: f64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
-    Ok(())
 }
 
 // ── Artist search ─────────────────────────────────────────
@@ -41,6 +30,7 @@ pub async fn search_artists(
     name: &str,
     limit: i64,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<Vec<Artist>, sqlx::Error> {
     // Candidate filter uses the `%` trigram operator against the RAW columns so
     // the gin_trgm_ops indexes (shirabe_artist_name_trgm / _sortname_trgm) are
@@ -48,7 +38,7 @@ pub async fn search_artists(
     // score is the GREATEST over name + sort_name similarity so romanised /
     // native variants both rank.
     let mut conn = pool.acquire().await?;
-    set_similarity_limit(&mut conn, threshold).await?;
+    configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
         SELECT a.id, a.gid, a.name,
@@ -254,6 +244,7 @@ pub async fn search_releases(
     year: Option<&str>,
     limit: i64,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<Vec<Release>, sqlx::Error> {
     // Combine release-title trigram score with an optional artist-credit-name
     // trigram score. The artist score, when requested, is a weighted bonus so
@@ -261,7 +252,7 @@ pub async fn search_releases(
     // operator on the RAW columns (release.name / artist_credit.name) so the
     // gin_trgm_ops indexes are used; the `%` cutoff is set via `set_limit`.
     let mut conn = pool.acquire().await?;
-    set_similarity_limit(&mut conn, threshold).await?;
+    configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
@@ -567,12 +558,13 @@ pub async fn search_recordings(
     artist: Option<&str>,
     limit: i64,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<Vec<Recording>, sqlx::Error> {
     // Candidate filter uses the `%` operator on the RAW recording.name /
     // artist_credit.name columns so the gin_trgm_ops indexes are used; cutoff
     // set via `set_limit` on this connection.
     let mut conn = pool.acquire().await?;
-    set_similarity_limit(&mut conn, threshold).await?;
+    configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
         SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
