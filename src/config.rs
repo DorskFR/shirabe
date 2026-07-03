@@ -85,6 +85,15 @@ pub struct Config {
     #[arg(long, env = "SHIRABE_SIMILARITY_THRESHOLD", default_value_t = 0.2)]
     pub similarity_threshold: f64,
 
+    /// Per-connection `work_mem` applied to trigram search sessions (SHIB-16).
+    /// The default 4MB makes the GIN bitmap scan over the 58M-row
+    /// `imdb_title_akas` table go lossy, forcing a multi-million-row heap
+    /// recheck (55s cold). 256MB keeps the bitmap exact. Any Postgres memory
+    /// unit is accepted (e.g. `256MB`, `1GB`); the value is sanitised before
+    /// being spliced into `SET work_mem` (see `search::sanitize_work_mem`).
+    #[arg(long, env = "SHIRABE_SEARCH_WORK_MEM", default_value = "256MB")]
+    pub search_work_mem: String,
+
     /// Server-side TMDB v3 API key. Optional: when unset, the `/3` facade and the
     /// `tmdb` source degrade gracefully (503-style error / cache-only) rather than
     /// panicking, and the API server still boots and serves `/ws/2` + other

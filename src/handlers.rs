@@ -37,8 +37,14 @@ pub async fn search_artist(
         .or(parsed.artist)
         .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
     let limit = state.config.resolve_limit(params.limit);
-    let artists =
-        repo::search_artists(state.pool(), &name, limit, state.config.similarity_threshold).await?;
+    let artists = repo::search_artists(
+        state.pool(),
+        &name,
+        limit,
+        state.config.similarity_threshold,
+        &state.config.search_work_mem,
+    )
+    .await?;
     Ok(Json(ArtistSearchResponse { artists }))
 }
 
@@ -61,6 +67,7 @@ pub async fn search_release(
         parsed.date_year.as_deref(),
         limit,
         state.config.similarity_threshold,
+        &state.config.search_work_mem,
     )
     .await?;
     Ok(Json(ReleaseSearchResponse { releases }))
@@ -84,6 +91,7 @@ pub async fn search_recording(
         parsed.artist.as_deref(),
         limit,
         state.config.similarity_threshold,
+        &state.config.search_work_mem,
     )
     .await?;
     Ok(Json(RecordingSearchResponse { recordings }))

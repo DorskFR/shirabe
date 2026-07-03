@@ -27,6 +27,46 @@ use sqlx::{PgPool, Postgres, Row};
 /// surface.
 pub const LOCAL_SIMILARITY_THRESHOLD: f64 = 0.3;
 
+/// Floor on the pg_trgm `%` cutoff for queries probing the IMDb tables (SHIB-16).
+///
+/// `imdb_title_akas` holds ~58M rows; at a 0.2 cutoff a short query like
+/// "inception" pulls ~1.5M trigram candidates out of the GIN index, the bitmap
+/// goes lossy at default `work_mem`, and the heap recheck touches tens of
+/// millions of rows (~55s cold on prod — past Kusaritoi's 30s HTTP timeout).
+/// Clamping the probe to 0.4 cuts the candidate set to a sane size (~6.5s with
+/// the raised `work_mem`) while exact-name recall stays intact (an exact aka
+/// match like "Gintama" still scores 1.0). Applies ONLY to the IMDb probes; the
+/// MusicBrainz search paths keep the configured threshold unchanged.
+pub const IMDB_PROBE_MIN_THRESHOLD: f64 = 0.4;
+
+/// Fallback `work_mem` when the configured value sanitises to nothing.
+const DEFAULT_SEARCH_WORK_MEM: &str = "256MB";
+
+/// Clamp a configured similarity threshold to the IMDb probe floor
+/// ([`IMDB_PROBE_MIN_THRESHOLD`]). Pure so it is unit-testable.
+#[must_use]
+pub const fn imdb_probe_threshold(configured: f64) -> f64 {
+    configured.max(IMDB_PROBE_MIN_THRESHOLD)
+}
+
+/// Sanitise a configured `work_mem` value for splicing into `SET work_mem = '…'`.
+///
+/// `SET` cannot take a bind parameter, so the value ends up in the SQL text —
+/// and it arrives from an env var (`SHIRABE_SEARCH_WORK_MEM`), so it must not be
+/// able to smuggle SQL. Only ASCII alphanumerics survive (every valid Postgres
+/// memory setting — `64000`, `256MB`, `1GB` — is alphanumeric); anything that
+/// sanitises to a value not starting with a digit falls back to
+/// [`DEFAULT_SEARCH_WORK_MEM`].
+#[must_use]
+pub fn sanitize_work_mem(value: &str) -> String {
+    let cleaned: String = value.chars().filter(char::is_ascii_alphanumeric).collect();
+    if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        cleaned
+    } else {
+        DEFAULT_SEARCH_WORK_MEM.to_string()
+    }
+}
+
 /// A local result is considered "thin" (→ fall through to the live API and merge)
 /// when it has fewer than this many STRONG hits…
 pub const THIN_RESULT_MIN_HITS: usize = 3;
@@ -128,13 +168,20 @@ pub fn is_thin_result(hits: &[ScoredHit]) -> bool {
     strong < THIN_RESULT_MIN_HITS
 }
 
-/// Set the session pg_trgm `%` cutoff on a single connection (the `%` operator
-/// reads this GUC, so it must run on the same connection as the search).
-async fn set_similarity_limit(
+/// Configure a search session on a single connection: the pg_trgm `%` cutoff
+/// (the operator reads this GUC, so it must run on the same connection as the
+/// search) and `work_mem` (SHIB-16 — the default 4MB makes big GIN bitmap scans
+/// go lossy and recheck the heap). `work_mem` cannot be bound as a parameter in
+/// `SET`, so the value is sanitised via [`sanitize_work_mem`] before splicing.
+pub async fn configure_search_session(
     conn: &mut PoolConnection<Postgres>,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
+    sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(work_mem)))
+        .execute(&mut **conn)
+        .await?;
     Ok(())
 }
 
@@ -148,9 +195,10 @@ async fn search_tmdb_id_index(
     kind: &str,
     limit: i64,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    set_similarity_limit(&mut conn, threshold).await?;
+    configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
         SELECT id, name, popularity, adult,
@@ -196,9 +244,12 @@ async fn search_imdb_titles(
     title_types: &[&str],
     limit: i64,
     threshold: f64,
+    work_mem: &str,
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    set_similarity_limit(&mut conn, threshold).await?;
+    // The IMDb tables are probed with `%`, so the cutoff is clamped to the
+    // probe floor — see [`IMDB_PROBE_MIN_THRESHOLD`] (SHIB-16).
+    configure_search_session(&mut conn, imdb_probe_threshold(threshold), work_mem).await?;
     // Candidate tconsts come from EITHER a basics-title match OR an akas-title
     // match (the akas GIN index carries the non-latin variants). We then take the
     // GREATEST similarity over primary/original/aka for the score. `$3` is a
@@ -423,18 +474,23 @@ pub async fn local_tmdb_search(
     query: &str,
     kind: &str,
     limit: i64,
+    work_mem: &str,
 ) -> Vec<ScoredHit> {
     let mut sources: Vec<Vec<ScoredHit>> = Vec::new();
 
     if let Some(pool) = tmdb_pool {
-        match search_tmdb_id_index(pool, query, kind, limit, LOCAL_SIMILARITY_THRESHOLD).await {
+        match search_tmdb_id_index(pool, query, kind, limit, LOCAL_SIMILARITY_THRESHOLD, work_mem)
+            .await
+        {
             Ok(hits) => sources.push(hits),
             Err(e) => tracing::warn!(error = %e, kind, "local tmdb_id_index search failed"),
         }
     }
     if let Some(pool) = imdb_pool {
         let types = imdb_title_types(kind);
-        match search_imdb_titles(pool, query, types, limit, LOCAL_SIMILARITY_THRESHOLD).await {
+        match search_imdb_titles(pool, query, types, limit, LOCAL_SIMILARITY_THRESHOLD, work_mem)
+            .await
+        {
             // Cross-reference tconst hits to TMDB ids (via previously hydrated
             // cache payloads) before merging, so an exact IMDb-akas match (e.g.
             // "gintama" → tt0988818) surfaces under its TMDB id (57041) and
@@ -483,6 +539,58 @@ mod tests {
             let expected = (f64::from(raw) * 100.0).round().clamp(0.0, 100.0) as i32;
             assert_eq!(similarity_to_score(raw), expected);
         }
+    }
+
+    // ── IMDb probe threshold clamp (SHIB-16) ────────────────────
+
+    /// Bit-exact float equality for the clamp tests (avoids `float_cmp` while
+    /// still asserting the exact value, not an approximation).
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert!(actual.to_bits() == expected.to_bits(), "expected {expected}, got {actual}");
+    }
+
+    #[test]
+    fn imdb_probe_clamps_low_thresholds_to_floor() {
+        // The permissive MB default (0.2) and the local default (0.3) explode
+        // the 58M-row akas trigram candidate set — both clamp up to 0.4.
+        assert_f64_eq(imdb_probe_threshold(0.2), IMDB_PROBE_MIN_THRESHOLD);
+        assert_f64_eq(imdb_probe_threshold(LOCAL_SIMILARITY_THRESHOLD), IMDB_PROBE_MIN_THRESHOLD);
+        assert_f64_eq(imdb_probe_threshold(0.0), IMDB_PROBE_MIN_THRESHOLD);
+    }
+
+    #[test]
+    fn imdb_probe_keeps_thresholds_at_or_above_floor() {
+        // A stricter configured cutoff is respected, never lowered.
+        assert_f64_eq(imdb_probe_threshold(0.4), 0.4);
+        assert_f64_eq(imdb_probe_threshold(0.7), 0.7);
+        assert_f64_eq(imdb_probe_threshold(1.0), 1.0);
+    }
+
+    // ── work_mem sanitisation (SET cannot bind a parameter) ─────
+
+    #[test]
+    fn work_mem_valid_values_pass_through() {
+        assert_eq!(sanitize_work_mem("256MB"), "256MB");
+        assert_eq!(sanitize_work_mem("1GB"), "1GB");
+        assert_eq!(sanitize_work_mem("64000"), "64000"); // bare kB units
+    }
+
+    #[test]
+    fn work_mem_strips_injection_attempts() {
+        // A quote-breaking payload loses every non-alphanumeric character, so
+        // nothing can escape the `SET work_mem = '…'` literal.
+        assert_eq!(sanitize_work_mem("256MB'; DROP TABLE x; --"), "256MBDROPTABLEx");
+        assert!(!sanitize_work_mem("1'||pg_sleep(10)||'").contains('\''));
+    }
+
+    #[test]
+    fn work_mem_garbage_falls_back_to_default() {
+        // Empty, whitespace, or values not starting with a digit (nothing
+        // Postgres would accept for work_mem) fall back to the safe default.
+        assert_eq!(sanitize_work_mem(""), "256MB");
+        assert_eq!(sanitize_work_mem("   "), "256MB");
+        assert_eq!(sanitize_work_mem("'; DROP TABLE x; --"), "256MB");
+        assert_eq!(sanitize_work_mem("MB256"), "256MB");
     }
 
     // ── thin-result / fall-through decision ─────────────────────

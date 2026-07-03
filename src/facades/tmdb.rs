@@ -331,6 +331,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
         &query,
         kind,
         SEARCH_LIMIT,
+        &state.config.search_work_mem,
     )
     .await;
 
