@@ -32,23 +32,35 @@ pub async fn search_artists(
     threshold: f64,
     work_mem: &str,
 ) -> Result<Vec<Artist>, sqlx::Error> {
-    // Candidate filter uses the `%` trigram operator against the RAW columns so
-    // the gin_trgm_ops indexes (shirabe_artist_name_trgm / _sortname_trgm) are
-    // used; `set_limit` sets the operator's cutoff for this connection. The
-    // score is the GREATEST over name + sort_name similarity so romanised /
-    // native variants both rank.
+    // KNN top-N: `<->` (trigram distance = 1 - similarity) streams the closest
+    // rows straight out of the gist_trgm_ops indexes. A single scan can only KNN
+    // one column, and the score is the GREATEST over name + sort_name similarity
+    // (so romanised / native variants both rank), so we UNION the per-column
+    // top-N KNN candidates and re-rank the (<= 2 * limit) survivors by score.
+    // The `%` filter keeps `set_limit`'s threshold as the match cutoff.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
-        SELECT a.id, a.gid, a.name,
+        SELECT c.id, c.gid, c.name,
                GREATEST(
-                 similarity(a.name, $1),
-                 similarity(a.sort_name, $1)
+                 similarity(c.name, $1),
+                 similarity(c.sort_name, $1)
                ) AS score
-        FROM musicbrainz.artist a
-        WHERE a.name % $1 OR a.sort_name % $1
-        ORDER BY score DESC, a.id ASC
+        FROM (
+            ( SELECT a.id, a.gid, a.name, a.sort_name
+              FROM musicbrainz.artist a
+              WHERE a.name % $1
+              ORDER BY a.name <-> $1
+              LIMIT $2 )
+            UNION
+            ( SELECT a.id, a.gid, a.name, a.sort_name
+              FROM musicbrainz.artist a
+              WHERE a.sort_name % $1
+              ORDER BY a.sort_name <-> $1
+              LIMIT $2 )
+        ) c
+        ORDER BY score DESC, c.id ASC
         LIMIT $2
         ",
     )
@@ -248,32 +260,39 @@ pub async fn search_releases(
 ) -> Result<Vec<Release>, sqlx::Error> {
     // Combine release-title trigram score with an optional artist-credit-name
     // trigram score. The artist score, when requested, is a weighted bonus so
-    // title remains the dominant signal. The candidate filter uses the `%`
-    // operator on the RAW columns (release.name / artist_credit.name) so the
-    // gin_trgm_ops indexes are used; the `%` cutoff is set via `set_limit`.
+    // title remains the dominant signal. Ranking is done in `<->` distance space
+    // (trigram distance = 1 - similarity) so the gist_trgm_ops indexes drive it
+    // and each distance is computed exactly ONCE in the derived candidate set;
+    // the outer query only derives the reported title_score (= 1 - distance) and
+    // orders by the additive distance (minimising distance == maximising the old
+    // additive similarity, so ranking is unchanged). The `%` filter on the RAW
+    // columns keeps `set_limit`'s threshold as the match cutoff.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
-        SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
-               ac.name AS credit_name,
-               similarity(r.name, $1) AS title_score,
-               CASE WHEN $2::text IS NULL THEN NULL
-                    ELSE similarity(ac.name, $2) END AS artist_score
-        FROM musicbrainz.release r
-        JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
-        WHERE r.name % $1
-          AND ($2::text IS NULL OR ac.name % $2)
-          AND ($3::int IS NULL OR EXISTS (
-                SELECT 1 FROM musicbrainz.release_country rc
-                WHERE rc.release = r.id AND rc.date_year = $3
-                UNION ALL
-                SELECT 1 FROM musicbrainz.release_unknown_country ruc
-                WHERE ruc.release = r.id AND ruc.date_year = $3))
-        ORDER BY (similarity(r.name, $1)
-                  + COALESCE(CASE WHEN $2::text IS NULL THEN 0
-                       ELSE similarity(ac.name, $2) END, 0) * 0.5) DESC,
-                 r.id ASC
+        SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
+               c.credit_name,
+               (1.0 - c.title_dist)::real AS title_score
+        FROM (
+            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+                   ac.name AS credit_name,
+                   (r.name <-> $1) AS title_dist,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (ac.name <-> $2) END AS artist_dist
+            FROM musicbrainz.release r
+            JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
+            WHERE r.name % $1
+              AND ($2::text IS NULL OR ac.name % $2)
+              AND ($3::int IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_country rc
+                    WHERE rc.release = r.id AND rc.date_year = $3
+                    UNION ALL
+                    SELECT 1 FROM musicbrainz.release_unknown_country ruc
+                    WHERE ruc.release = r.id AND ruc.date_year = $3))
+        ) c
+        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
+                 c.id ASC
         LIMIT $4
         ",
     )
@@ -560,23 +579,32 @@ pub async fn search_recordings(
     threshold: f64,
     work_mem: &str,
 ) -> Result<Vec<Recording>, sqlx::Error> {
-    // Candidate filter uses the `%` operator on the RAW recording.name /
-    // artist_credit.name columns so the gin_trgm_ops indexes are used; cutoff
-    // set via `set_limit` on this connection.
+    // Ranking is done in `<->` distance space (trigram distance = 1 -
+    // similarity) so the gist_trgm_ops indexes drive it and each distance is
+    // computed exactly ONCE in the derived candidate set; the outer query only
+    // derives the reported title_score (= 1 - distance) and orders by the
+    // additive distance (minimising distance == maximising the old additive
+    // similarity, so ranking is unchanged). The `%` filter on the RAW
+    // recording.name / artist_credit.name columns keeps `set_limit`'s threshold
+    // as the match cutoff.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
-        SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
-               similarity(rec.name, $1) AS title_score
-        FROM musicbrainz.recording rec
-        JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
-        WHERE rec.name % $1
-          AND ($2::text IS NULL OR ac.name % $2)
-        ORDER BY (similarity(rec.name, $1)
-                  + COALESCE(CASE WHEN $2::text IS NULL THEN 0
-                       ELSE similarity(ac.name, $2) END, 0) * 0.5) DESC,
-                 rec.id ASC
+        SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
+               (1.0 - c.title_dist)::real AS title_score
+        FROM (
+            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+                   (rec.name <-> $1) AS title_dist,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (ac.name <-> $2) END AS artist_dist
+            FROM musicbrainz.recording rec
+            JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
+            WHERE rec.name % $1
+              AND ($2::text IS NULL OR ac.name % $2)
+        ) c
+        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
+                 c.id ASC
         LIMIT $3
         ",
     )
