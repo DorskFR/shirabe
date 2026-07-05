@@ -22,7 +22,9 @@ jobs:
       # fmt uses unstable options (imports_granularity), so it needs nightly.
       - name: fmt
         run: cargo +nightly fmt --check
+      # Pin to +stable: the nightly toolchain step above makes nightly the
+      # default, and clippy is only installed on stable (nightly carries rustfmt).
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo +stable clippy --all-targets -- -D warnings
       - name: test
-        run: cargo test
+        run: cargo +stable test
