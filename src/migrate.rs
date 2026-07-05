@@ -6,8 +6,10 @@
 //! EMBEDDED into the binary via [`include_str!`] so it ships in the image with no
 //! filesystem dependency. The migrations are idempotent DDL
 //! (`CREATE … IF NOT EXISTS`, `CREATE EXTENSION IF NOT EXISTS`), so re-running is
-//! safe. The read-only `musicbrainz` mirror is NOT migrated here — its migrations
-//! are applied to the mirror out of band.
+//! safe. The `musicbrainz` mirror can also be migrated explicitly
+//! (`shirabe migrate musicbrainz`, against `DATABASE_URL`) to apply shirabe's
+//! pg_trgm gin/gist index layer — but it is excluded from `migrate all` so a heavy
+//! (non-CONCURRENTLY) index build never runs implicitly on the live read path.
 
 use sqlx::PgPool;
 
@@ -28,9 +30,22 @@ const TMDB_SQL: &[&str] = &[
 ];
 /// Embedded migration SQL for the `tvdb` cache DB.
 const TVDB_SQL: &[&str] = &[include_str!("../migrations/tvdb/0001_tvdb_tables.sql")];
+/// Embedded migration SQL for the `musicbrainz` mirror (the pg_trgm + gin/gist
+/// index layer shirabe adds on top of the replicated MB schema). Applied against
+/// `DATABASE_URL`. Idempotent (`CREATE INDEX IF NOT EXISTS` + safe drops), so on a
+/// mirror that already carries the GIN indexes only the GiST additions build.
+const MUSICBRAINZ_SQL: &[&str] = &[
+    include_str!("../migrations/0001_shirabe_search_indexes.sql"),
+    include_str!("../migrations/0002_release_date_year_indexes.sql"),
+    include_str!("../migrations/0003_search_knn_gist.sql"),
+    include_str!("../migrations/0004_artist_alias_knn_gist.sql"),
+];
 
-/// The four writable databases that `shirabe migrate` can bootstrap, in apply
-/// order for `migrate all`.
+/// The four writable databases that `shirabe migrate all` bootstraps, in apply
+/// order. `musicbrainz` is deliberately NOT in this set: its migrations are plain
+/// (non-CONCURRENTLY) `CREATE INDEX`, so it is migrated only when named explicitly
+/// (`shirabe migrate musicbrainz`) — never implicitly on every deploy, so a heavy
+/// index build can't lock the live mirror unexpectedly.
 const MIGRATABLE: &[&str] = &["shirabe", "imdb", "tmdb", "tvdb"];
 
 /// Resolve a db id to its embedded migration SQL files (in apply order). Every
@@ -44,17 +59,21 @@ fn embedded_sql(db: &str) -> Option<&'static [&'static str]> {
         "imdb" => Some(IMDB_SQL),
         "tmdb" => Some(TMDB_SQL),
         "tvdb" => Some(TVDB_SQL),
+        "musicbrainz" => Some(MUSICBRAINZ_SQL),
         _ => None,
     }
 }
 
-/// Resolve a db id to its configured connection URL, if any.
+/// Resolve a db id to its configured connection URL, if any. `musicbrainz` maps
+/// to the (required) `DATABASE_URL` — the mirror shirabe reads and now owns the
+/// index layer of.
 fn db_url<'a>(config: &'a Config, db: &str) -> Option<&'a str> {
     match db {
         "shirabe" => config.shirabe_database_url.as_deref(),
         "imdb" => config.imdb_database_url.as_deref(),
         "tmdb" => config.tmdb_database_url.as_deref(),
         "tvdb" => config.tvdb_database_url.as_deref(),
+        "musicbrainz" => Some(&config.database_url),
         _ => None,
     }
 }
@@ -63,8 +82,9 @@ fn db_url<'a>(config: &'a Config, db: &str) -> Option<&'a str> {
 /// Errors (and the caller exits non-zero) when the db id is unknown, its URL is
 /// unset, or the connection / SQL fails.
 async fn migrate_one(config: &Config, db: &str) -> anyhow::Result<()> {
-    let files = embedded_sql(db)
-        .ok_or_else(|| anyhow::anyhow!("unknown db `{db}`; known: {}", MIGRATABLE.join(", ")))?;
+    let files = embedded_sql(db).ok_or_else(|| {
+        anyhow::anyhow!("unknown db `{db}`; known: {}, musicbrainz", MIGRATABLE.join(", "))
+    })?;
     let url = db_url(config, db).ok_or_else(|| {
         anyhow::anyhow!(
             "{}_DATABASE_URL is not set; cannot migrate `{db}`",
@@ -127,7 +147,10 @@ mod tests {
         assert!(joined("imdb").contains("imdb_title_basics"));
         assert!(joined("tmdb").contains("tmdb_id_index"));
         assert!(joined("tvdb").contains("tvdb_cache"));
-        assert!(embedded_sql("musicbrainz").is_none());
+        // musicbrainz maps to the mirror index layer (gist_trgm_ops KNN), but is
+        // excluded from `migrate all` (see `MIGRATABLE`).
+        assert!(joined("musicbrainz").contains("gist_trgm_ops"));
+        assert!(!MIGRATABLE.contains(&"musicbrainz"));
         assert!(embedded_sql("nope").is_none());
     }
 
