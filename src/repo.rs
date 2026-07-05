@@ -34,32 +34,48 @@ pub async fn search_artists(
 ) -> Result<Vec<Artist>, sqlx::Error> {
     // KNN top-N: `<->` (trigram distance = 1 - similarity) streams the closest
     // rows straight out of the gist_trgm_ops indexes. A single scan can only KNN
-    // one column, and the score is the GREATEST over name + sort_name similarity
-    // (so romanised / native variants both rank), so we UNION the per-column
-    // top-N KNN candidates and re-rank the (<= 2 * limit) survivors by score.
-    // The `%` filter keeps `set_limit`'s threshold as the match cutoff.
+    // one column, so we UNION the per-column top-N KNN candidates and re-rank the
+    // survivors by the GREATEST similarity across the searched columns (so
+    // romanised / native variants both rank). The `%` filter keeps `set_limit`'s
+    // threshold as the match cutoff.
+    //
+    // SHIB-20: a third KNN branch scans artist_alias.name so alias-only matches
+    // (localised / alternate names — a common MB recall case) compete with
+    // artist.name / artist.sort_name hits instead of being missed (aliases were
+    // previously only loaded per-row by FK, never trigram-searched). Because an
+    // artist can match on several columns, the candidate set is de-duped by
+    // artist id in the outer aggregate, keeping the MAX similarity across name,
+    // sort_name and the best-matching alias (GROUP BY id, MAX(score)). Ranking
+    // stays in similarity space (higher = better), matching the wave-1 style.
+    // The alias branch uses gist_trgm_ops on artist_alias.name (migration 0004).
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let rows = sqlx::query(
         r"
-        SELECT c.id, c.gid, c.name,
-               GREATEST(
-                 similarity(c.name, $1),
-                 similarity(c.sort_name, $1)
-               ) AS score
+        SELECT c.id, c.gid, c.name, MAX(c.score) AS score
         FROM (
-            ( SELECT a.id, a.gid, a.name, a.sort_name
+            ( SELECT a.id, a.gid, a.name,
+                     GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
               FROM musicbrainz.artist a
               WHERE a.name % $1
               ORDER BY a.name <-> $1
               LIMIT $2 )
-            UNION
-            ( SELECT a.id, a.gid, a.name, a.sort_name
+            UNION ALL
+            ( SELECT a.id, a.gid, a.name,
+                     GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
               FROM musicbrainz.artist a
               WHERE a.sort_name % $1
               ORDER BY a.sort_name <-> $1
               LIMIT $2 )
+            UNION ALL
+            ( SELECT a.id, a.gid, a.name, similarity(aa.name, $1) AS score
+              FROM musicbrainz.artist_alias aa
+              JOIN musicbrainz.artist a ON a.id = aa.artist
+              WHERE aa.name % $1
+              ORDER BY aa.name <-> $1
+              LIMIT $2 )
         ) c
+        GROUP BY c.id, c.gid, c.name
         ORDER BY score DESC, c.id ASC
         LIMIT $2
         ",
