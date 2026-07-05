@@ -42,6 +42,14 @@ pub const IMDB_PROBE_MIN_THRESHOLD: f64 = 0.4;
 /// Fallback `work_mem` when the configured value sanitises to nothing.
 const DEFAULT_SEARCH_WORK_MEM: &str = "256MB";
 
+/// Per-connection `statement_timeout` (ms) for trigram search sessions (SHIB-19).
+///
+/// A runaway trigram query would otherwise run unbounded server-side and only die
+/// at the client's request cap; this caps it server-side so it fails fast with a
+/// clear Postgres error on the SAME connection that runs the search. Mirrors the
+/// `SHIRABE_STATEMENT_TIMEOUT_MS` config default.
+const DEFAULT_STATEMENT_TIMEOUT_MS: i64 = 10_000;
+
 /// Clamp a configured similarity threshold to the IMDb probe floor
 /// ([`IMDB_PROBE_MIN_THRESHOLD`]). Pure so it is unit-testable.
 #[must_use]
@@ -170,9 +178,13 @@ pub fn is_thin_result(hits: &[ScoredHit]) -> bool {
 
 /// Configure a search session on a single connection: the pg_trgm `%` cutoff
 /// (the operator reads this GUC, so it must run on the same connection as the
-/// search) and `work_mem` (SHIB-16 — the default 4MB makes big GIN bitmap scans
-/// go lossy and recheck the heap). `work_mem` cannot be bound as a parameter in
-/// `SET`, so the value is sanitised via [`sanitize_work_mem`] before splicing.
+/// search), `work_mem` (SHIB-16 — the default 4MB makes big GIN bitmap scans
+/// go lossy and recheck the heap), and `statement_timeout` (SHIB-19 — bound
+/// runaway queries server-side so they fail fast). `work_mem` cannot be bound as
+/// a parameter in `SET`, so the value is sanitised via [`sanitize_work_mem`]
+/// before splicing; `statement_timeout` is a fixed integer count of milliseconds
+/// ([`DEFAULT_STATEMENT_TIMEOUT_MS`]), so it is spliced directly (no injection
+/// surface).
 pub async fn configure_search_session(
     conn: &mut PoolConnection<Postgres>,
     threshold: f64,
@@ -180,6 +192,11 @@ pub async fn configure_search_session(
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
     sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(work_mem)))
+        .execute(&mut **conn)
+        .await?;
+    // `statement_timeout` as a bare integer is interpreted by Postgres as ms.
+    // Set on THIS connection so the search query below inherits the cap.
+    sqlx::query(&format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"))
         .execute(&mut **conn)
         .await?;
     Ok(())
