@@ -16,8 +16,11 @@ use crate::db::connect;
 
 /// Embedded migration SQL for the `shirabe` coordination DB.
 const SHIRABE_SQL: &[&str] = &[include_str!("../migrations/shirabe/0001_init.sql")];
-/// Embedded migration SQL for the `imdb` bulk-mirror DB.
-const IMDB_SQL: &[&str] = &[include_str!("../migrations/imdb/0001_imdb_tables.sql")];
+/// Embedded migration SQL for the `imdb` bulk-mirror DB (applied in file order).
+const IMDB_SQL: &[&str] = &[
+    include_str!("../migrations/imdb/0001_imdb_tables.sql"),
+    include_str!("../migrations/imdb/0002_title_knn_gist.sql"),
+];
 /// Embedded migration SQL for the `tmdb` cache/index DB (applied in file order).
 const TMDB_SQL: &[&str] = &[
     include_str!("../migrations/tmdb/0001_tmdb_tables.sql"),

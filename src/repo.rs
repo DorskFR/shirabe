@@ -12,6 +12,7 @@ use crate::models::{
     Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Medium, Recording, RecordingRef,
     Relation, Release, ReleaseGroup, ReleaseStub, Track, UrlRelation, UrlResource,
 };
+use crate::queries;
 use crate::search::configure_search_session;
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
@@ -42,17 +43,7 @@ async fn batch_artist_aliases(
     if artist_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT artist, name, sort_name
-        FROM musicbrainz.artist_alias
-        WHERE artist = ANY($1)
-        ORDER BY artist, id ASC
-        ",
-    )
-    .bind(artist_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_ARTIST_ALIASES).bind(artist_ids).fetch_all(pool).await?;
     for r in rows {
         let aid: i32 = r.try_get("artist")?;
         map.entry(aid)
@@ -75,19 +66,7 @@ async fn batch_artist_credits(
     if ac_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT acn.artist_credit AS ac_id, a.id AS artist_id, a.gid AS artist_gid,
-               acn.name AS credit_name
-        FROM musicbrainz.artist_credit_name acn
-        JOIN musicbrainz.artist a ON a.id = acn.artist
-        WHERE acn.artist_credit = ANY($1)
-        ORDER BY acn.artist_credit, acn.position ASC
-        ",
-    )
-    .bind(ac_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_ARTIST_CREDITS).bind(ac_ids).fetch_all(pool).await?;
 
     let aliases_map = if with_aliases {
         let mut aids: Vec<i32> =
@@ -124,17 +103,7 @@ async fn batch_release_groups(
     if rg_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT rg.id, rg.gid, rgpt.name AS primary_type
-        FROM musicbrainz.release_group rg
-        LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
-        WHERE rg.id = ANY($1)
-        ",
-    )
-    .bind(rg_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_RELEASE_GROUPS).bind(rg_ids).fetch_all(pool).await?;
     for r in rows {
         let id: i32 = r.try_get("id")?;
         let gid: Uuid = r.get("gid");
@@ -156,22 +125,7 @@ async fn batch_release_dates(
     if release_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT rc.release AS rel, rc.date_year::int AS y, rc.date_month::int AS m,
-               rc.date_day::int AS d, (iso.code = 'XW') AS is_xw
-        FROM musicbrainz.release_country rc
-        LEFT JOIN musicbrainz.iso_3166_1 iso ON iso.area = rc.country
-        WHERE rc.release = ANY($1)
-        UNION ALL
-        SELECT release, date_year::int, date_month::int, date_day::int, false
-        FROM musicbrainz.release_unknown_country
-        WHERE release = ANY($1)
-        ",
-    )
-    .bind(release_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_RELEASE_DATES).bind(release_ids).fetch_all(pool).await?;
 
     let mut events: HashMap<i32, Vec<DateEvent>> = HashMap::new();
     for r in rows {
@@ -199,17 +153,8 @@ async fn batch_release_statuses(
     if release_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT r.id, rs.name
-        FROM musicbrainz.release r
-        JOIN musicbrainz.release_status rs ON rs.id = r.status
-        WHERE r.id = ANY($1)
-        ",
-    )
-    .bind(release_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::BATCH_RELEASE_STATUSES).bind(release_ids).fetch_all(pool).await?;
     for r in rows {
         let id: i32 = r.try_get("id")?;
         map.insert(id, r.get("name"));
@@ -226,10 +171,8 @@ async fn batch_release_comments(
     if release_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query("SELECT id, comment FROM musicbrainz.release WHERE id = ANY($1)")
-        .bind(release_ids)
-        .fetch_all(pool)
-        .await?;
+    let rows =
+        sqlx::query(queries::BATCH_RELEASE_COMMENTS).bind(release_ids).fetch_all(pool).await?;
     for r in rows {
         let id: i32 = r.try_get("id")?;
         let c: String = r.get("comment");
@@ -249,17 +192,8 @@ async fn batch_release_track_counts(
     if release_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT release AS rel, COALESCE(SUM(track_count), 0)::bigint AS total
-        FROM musicbrainz.medium
-        WHERE release = ANY($1)
-        GROUP BY release
-        ",
-    )
-    .bind(release_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::BATCH_RELEASE_TRACK_COUNTS).bind(release_ids).fetch_all(pool).await?;
     for r in rows {
         let rel: i32 = r.try_get("rel")?;
         let total: i64 = r.try_get("total")?;
@@ -333,20 +267,7 @@ async fn batch_tracks(
     if medium_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT t.medium AS mid, t.gid AS track_gid, t.name AS track_name, t.position,
-               t.number, t.artist_credit AS track_ac,
-               rec.gid AS rec_gid, rec.name AS rec_name, rec.length AS rec_length
-        FROM musicbrainz.track t
-        JOIN musicbrainz.recording rec ON rec.id = t.recording
-        WHERE t.medium = ANY($1)
-        ORDER BY t.medium, t.position ASC
-        ",
-    )
-    .bind(medium_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_TRACKS).bind(medium_ids).fetch_all(pool).await?;
 
     let mut ac_ids: Vec<i32> =
         rows.iter().filter_map(|r| r.try_get::<i32, _>("track_ac").ok()).collect();
@@ -385,19 +306,7 @@ async fn batch_media(
     if release_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT m.release AS rel, m.id, m.position, m.track_count, m.name AS title,
-               mf.name AS format
-        FROM musicbrainz.medium m
-        LEFT JOIN musicbrainz.medium_format mf ON mf.id = m.format
-        WHERE m.release = ANY($1)
-        ORDER BY m.release, m.position ASC
-        ",
-    )
-    .bind(release_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::BATCH_MEDIA).bind(release_ids).fetch_all(pool).await?;
 
     let medium_ids: Vec<i32> = rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
     let mut tracks_map = batch_tracks(pool, &medium_ids).await?;
@@ -451,40 +360,8 @@ pub async fn search_artists(
     // The alias branch uses gist_trgm_ops on artist_alias.name (migration 0004).
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows = sqlx::query(
-        r"
-        SELECT c.id, c.gid, c.name, MAX(c.score) AS score
-        FROM (
-            ( SELECT a.id, a.gid, a.name,
-                     GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
-              FROM musicbrainz.artist a
-              WHERE a.name % $1
-              ORDER BY a.name <-> $1
-              LIMIT $2 )
-            UNION ALL
-            ( SELECT a.id, a.gid, a.name,
-                     GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
-              FROM musicbrainz.artist a
-              WHERE a.sort_name % $1
-              ORDER BY a.sort_name <-> $1
-              LIMIT $2 )
-            UNION ALL
-            ( SELECT a.id, a.gid, a.name, similarity(aa.name, $1) AS score
-              FROM musicbrainz.artist_alias aa
-              JOIN musicbrainz.artist a ON a.id = aa.artist
-              WHERE aa.name % $1
-              ORDER BY aa.name <-> $1
-              LIMIT $2 )
-        ) c
-        GROUP BY c.id, c.gid, c.name
-        ORDER BY score DESC, c.id ASC
-        LIMIT $2
-        ",
-    )
-    .bind(name)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows =
+        sqlx::query(queries::SEARCH_ARTISTS).bind(name).bind(limit).fetch_all(&mut *conn).await?;
     drop(conn);
 
     // SHIB-17: batch all artists' aliases in one query instead of one per row.
@@ -518,17 +395,7 @@ pub async fn lookup_artist(
     gid: Uuid,
     with_url_rels: bool,
 ) -> Result<Option<ArtistLookup>, sqlx::Error> {
-    let Some(row) = sqlx::query(
-        r"
-        SELECT a.id, a.gid, a.name, a.sort_name, a.comment, at.name AS type_name
-        FROM musicbrainz.artist a
-        LEFT JOIN musicbrainz.artist_type at ON at.id = a.type
-        WHERE a.gid = $1
-        ",
-    )
-    .bind(gid)
-    .fetch_optional(pool)
-    .await?
+    let Some(row) = sqlx::query(queries::LOOKUP_ARTIST).bind(gid).fetch_optional(pool).await?
     else {
         return Ok(None);
     };
@@ -555,20 +422,8 @@ async fn load_artist_url_relations(
     pool: &PgPool,
     artist_id: i32,
 ) -> Result<Vec<UrlRelation>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT lt.name AS rel_type, u.url AS resource
-        FROM musicbrainz.l_artist_url l
-        JOIN musicbrainz.link lk ON lk.id = l.link
-        JOIN musicbrainz.link_type lt ON lt.id = lk.link_type
-        JOIN musicbrainz.url u ON u.id = l.entity1
-        WHERE l.entity0 = $1
-        ORDER BY l.id ASC
-        ",
-    )
-    .bind(artist_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::LOAD_ARTIST_URL_RELATIONS).bind(artist_id).fetch_all(pool).await?;
 
     Ok(rows
         .into_iter()
@@ -581,17 +436,7 @@ async fn load_artist_url_relations(
 }
 
 async fn load_artist_aliases(pool: &PgPool, artist_id: i32) -> Result<Vec<Alias>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT name, sort_name
-        FROM musicbrainz.artist_alias
-        WHERE artist = $1
-        ORDER BY id ASC
-        ",
-    )
-    .bind(artist_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::LOAD_ARTIST_ALIASES).bind(artist_id).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(|r| Alias { name: r.get("name"), sort_name: r.try_get("sort_name").ok() })
@@ -607,18 +452,8 @@ async fn load_artist_credit(
     artist_credit_id: i32,
     with_aliases: bool,
 ) -> Result<Vec<ArtistCredit>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT a.id AS artist_id, a.gid AS artist_gid, acn.name AS credit_name
-        FROM musicbrainz.artist_credit_name acn
-        JOIN musicbrainz.artist a ON a.id = acn.artist
-        WHERE acn.artist_credit = $1
-        ORDER BY acn.position ASC
-        ",
-    )
-    .bind(artist_credit_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::LOAD_ARTIST_CREDIT).bind(artist_credit_id).fetch_all(pool).await?;
 
     let mut credits = Vec::with_capacity(rows.len());
     for row in rows {
@@ -638,22 +473,7 @@ async fn load_artist_credit(
 /// Gather all date events for a release across `release_country` and
 /// `release_unknown_country`, then collapse to one MB partial date string.
 async fn release_date(pool: &PgPool, release_id: i32) -> Result<String, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT rc.date_year::int AS y, rc.date_month::int AS m, rc.date_day::int AS d,
-               (iso.code = 'XW') AS is_xw
-        FROM musicbrainz.release_country rc
-        LEFT JOIN musicbrainz.iso_3166_1 iso ON iso.area = rc.country
-        WHERE rc.release = $1
-        UNION ALL
-        SELECT date_year::int, date_month::int, date_day::int, false
-        FROM musicbrainz.release_unknown_country
-        WHERE release = $1
-        ",
-    )
-    .bind(release_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::RELEASE_DATE).bind(release_id).fetch_all(pool).await?;
 
     let events: Vec<DateEvent> = rows
         .into_iter()
@@ -690,39 +510,13 @@ pub async fn search_releases(
     // columns keeps `set_limit`'s threshold as the match cutoff.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows = sqlx::query(
-        r"
-        SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
-               c.credit_name,
-               (1.0 - c.title_dist)::real AS title_score
-        FROM (
-            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
-                   ac.name AS credit_name,
-                   (r.name <-> $1) AS title_dist,
-                   CASE WHEN $2::text IS NULL THEN NULL
-                        ELSE (ac.name <-> $2) END AS artist_dist
-            FROM musicbrainz.release r
-            JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
-            WHERE r.name % $1
-              AND ($2::text IS NULL OR ac.name % $2)
-              AND ($3::int IS NULL OR EXISTS (
-                    SELECT 1 FROM musicbrainz.release_country rc
-                    WHERE rc.release = r.id AND rc.date_year = $3
-                    UNION ALL
-                    SELECT 1 FROM musicbrainz.release_unknown_country ruc
-                    WHERE ruc.release = r.id AND ruc.date_year = $3))
-        ) c
-        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
-                 c.id ASC
-        LIMIT $4
-        ",
-    )
-    .bind(title)
-    .bind(artist)
-    .bind(year.and_then(|y| y.parse::<i32>().ok()))
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows = sqlx::query(queries::SEARCH_RELEASES)
+        .bind(title)
+        .bind(artist)
+        .bind(year.and_then(|y| y.parse::<i32>().ok()))
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
     drop(conn);
 
     // SHIB-17: collect keys across all rows and batch every per-release load into
@@ -780,17 +574,7 @@ async fn load_release_group(
     rg_id: Option<i32>,
 ) -> Result<Option<ReleaseGroup>, sqlx::Error> {
     let Some(rg_id) = rg_id else { return Ok(None) };
-    let row = sqlx::query(
-        r"
-        SELECT rg.gid, rgpt.name AS primary_type
-        FROM musicbrainz.release_group rg
-        LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
-        WHERE rg.id = $1
-        ",
-    )
-    .bind(rg_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query(queries::LOAD_RELEASE_GROUP).bind(rg_id).fetch_optional(pool).await?;
     Ok(row.map(|r| {
         let gid: Uuid = r.get("gid");
         ReleaseGroup { id: gid.to_string(), primary_type: r.try_get("primary_type").ok() }
@@ -801,17 +585,8 @@ async fn load_release_status(
     pool: &PgPool,
     release_id: i32,
 ) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query(
-        r"
-        SELECT rs.name
-        FROM musicbrainz.release r
-        JOIN musicbrainz.release_status rs ON rs.id = r.status
-        WHERE r.id = $1
-        ",
-    )
-    .bind(release_id)
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        sqlx::query(queries::LOAD_RELEASE_STATUS).bind(release_id).fetch_optional(pool).await?;
     Ok(row.map(|r| r.get("name")))
 }
 
@@ -819,10 +594,8 @@ async fn load_release_comment(
     pool: &PgPool,
     release_id: i32,
 ) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query("SELECT comment FROM musicbrainz.release WHERE id = $1")
-        .bind(release_id)
-        .fetch_optional(pool)
-        .await?;
+    let row =
+        sqlx::query(queries::LOAD_RELEASE_COMMENT).bind(release_id).fetch_optional(pool).await?;
     Ok(row.and_then(|r| {
         let c: String = r.get("comment");
         if c.is_empty() { None } else { Some(c) }
@@ -833,16 +606,7 @@ async fn load_release_comment(
 
 /// `GET /ws/2/release/{mbid}?inc=...media+recordings+...rels`
 pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>, sqlx::Error> {
-    let Some(row) = sqlx::query(
-        r"
-        SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
-        FROM musicbrainz.release r
-        WHERE r.gid = $1
-        ",
-    )
-    .bind(gid)
-    .fetch_optional(pool)
-    .await?
+    let Some(row) = sqlx::query(queries::LOOKUP_RELEASE).bind(gid).fetch_optional(pool).await?
     else {
         return Ok(None);
     };
@@ -877,18 +641,7 @@ pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>,
 
 /// Load all media (discs) for a release, ordered by position, each with tracks.
 async fn load_media(pool: &PgPool, release_id: i32) -> Result<Vec<Medium>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT m.id, m.position, m.track_count, m.name AS title, mf.name AS format
-        FROM musicbrainz.medium m
-        LEFT JOIN musicbrainz.medium_format mf ON mf.id = m.format
-        WHERE m.release = $1
-        ORDER BY m.position ASC
-        ",
-    )
-    .bind(release_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::LOAD_MEDIA).bind(release_id).fetch_all(pool).await?;
 
     let mut media = Vec::with_capacity(rows.len());
     for row in rows {
@@ -913,20 +666,7 @@ async fn load_media(pool: &PgPool, release_id: i32) -> Result<Vec<Medium>, sqlx:
 /// Load tracks for one medium, ordered by position, with their recordings and
 /// any track-level artist credit (for compilations).
 async fn load_tracks(pool: &PgPool, medium_id: i32) -> Result<Vec<Track>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT t.gid AS track_gid, t.name AS track_name, t.position, t.number,
-               t.artist_credit AS track_ac,
-               rec.gid AS rec_gid, rec.name AS rec_name, rec.length AS rec_length
-        FROM musicbrainz.track t
-        JOIN musicbrainz.recording rec ON rec.id = t.recording
-        WHERE t.medium = $1
-        ORDER BY t.position ASC
-        ",
-    )
-    .bind(medium_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::LOAD_TRACKS).bind(medium_id).fetch_all(pool).await?;
 
     let mut tracks = Vec::with_capacity(rows.len());
     for row in rows {
@@ -963,22 +703,8 @@ async fn load_release_relations(
     pool: &PgPool,
     release_id: i32,
 ) -> Result<Vec<Relation>, sqlx::Error> {
-    let rows = sqlx::query(
-        r"
-        SELECT 'forward' AS direction, r1.gid AS gid, r1.name AS name
-        FROM musicbrainz.l_release_release l
-        JOIN musicbrainz.release r1 ON r1.id = l.entity1
-        WHERE l.entity0 = $1
-        UNION ALL
-        SELECT 'backward' AS direction, r0.gid AS gid, r0.name AS name
-        FROM musicbrainz.l_release_release l
-        JOIN musicbrainz.release r0 ON r0.id = l.entity0
-        WHERE l.entity1 = $1
-        ",
-    )
-    .bind(release_id)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::LOAD_RELEASE_RELATIONS).bind(release_id).fetch_all(pool).await?;
 
     Ok(rows
         .into_iter()
@@ -1014,30 +740,12 @@ pub async fn search_recordings(
     // as the match cutoff.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows = sqlx::query(
-        r"
-        SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
-               (1.0 - c.title_dist)::real AS title_score
-        FROM (
-            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
-                   (rec.name <-> $1) AS title_dist,
-                   CASE WHEN $2::text IS NULL THEN NULL
-                        ELSE (ac.name <-> $2) END AS artist_dist
-            FROM musicbrainz.recording rec
-            JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
-            WHERE rec.name % $1
-              AND ($2::text IS NULL OR ac.name % $2)
-        ) c
-        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
-                 c.id ASC
-        LIMIT $3
-        ",
-    )
-    .bind(title)
-    .bind(artist)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows = sqlx::query(queries::SEARCH_RECORDINGS)
+        .bind(title)
+        .bind(artist)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
     drop(conn);
 
     // SHIB-17: batch the artist-credits (with aliases) for every recording in one
@@ -1077,16 +785,7 @@ pub async fn search_recordings(
 
 /// `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases`
 pub async fn lookup_recording(pool: &PgPool, gid: Uuid) -> Result<Option<Recording>, sqlx::Error> {
-    let Some(row) = sqlx::query(
-        r"
-        SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
-        FROM musicbrainz.recording rec
-        WHERE rec.gid = $1
-        ",
-    )
-    .bind(gid)
-    .fetch_optional(pool)
-    .await?
+    let Some(row) = sqlx::query(queries::LOOKUP_RECORDING).bind(gid).fetch_optional(pool).await?
     else {
         return Ok(None);
     };
@@ -1128,20 +827,8 @@ async fn batch_recording_releases(
     if recording_ids.is_empty() {
         return Ok(result);
     }
-    let rows = sqlx::query(
-        r"
-        SELECT DISTINCT t.recording AS rec, r.id, r.gid, r.name, r.artist_credit,
-               r.release_group
-        FROM musicbrainz.release r
-        JOIN musicbrainz.medium m ON m.release = r.id
-        JOIN musicbrainz.track t ON t.medium = m.id
-        WHERE t.recording = ANY($1)
-        ORDER BY t.recording, r.id ASC
-        ",
-    )
-    .bind(recording_ids)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::BATCH_RECORDING_RELEASES).bind(recording_ids).fetch_all(pool).await?;
 
     // Distinct keys across every recording's releases, hydrated once.
     let mut release_ids: Vec<i32> =
@@ -1206,5 +893,5 @@ async fn batch_recording_releases(
 
 /// Cheap connectivity probe used by the health endpoint.
 pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT 1").execute(pool).await.map(|_| ())
+    sqlx::query(queries::PING).execute(pool).await.map(|_| ())
 }

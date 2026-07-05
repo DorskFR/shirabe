@@ -137,6 +137,16 @@ pub struct Config {
     #[arg(long, env = "TVDB_CACHE_TTL_DAYS", default_value_t = 7)]
     pub tvdb_cache_ttl_days: i64,
 
+    /// Enable the opt-in SQL query explorer at `/debug/queries` (SHIB-21). OFF by
+    /// default. When set, shirabe serves a self-generated page listing every SQL
+    /// statement it runs and a runner that executes each (and `EXPLAIN [ANALYZE]`)
+    /// against the live pools with adjustable params / session knobs — for
+    /// diagnosing slow trigram searches. Params are bound (never interpolated) and
+    /// only catalog SQL is runnable; still, keep this off in any exposed
+    /// deployment as it can run arbitrary EXPLAIN ANALYZE load against the DBs.
+    #[arg(long, env = "SHIRABE_DEBUG_UI", default_value_t = false)]
+    pub debug_ui: bool,
+
     /// Externally-reachable base URL of the `caache` image proxy (SHIB-9). TMDB/TVDB
     /// poster/artwork URLs in the `/3` and `/v4` facade payloads are rewritten to
     /// route through caache's `/_ia/<host>/<path>` passthrough so the bytes are
