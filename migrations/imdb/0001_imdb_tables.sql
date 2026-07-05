@@ -38,10 +38,16 @@ CREATE TABLE IF NOT EXISTS imdb_title_basics (
     genres          text
 );
 
-CREATE INDEX IF NOT EXISTS imdb_title_basics_primary_title_trgm
-    ON imdb_title_basics USING gin (primary_title gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS imdb_title_basics_original_title_trgm
-    ON imdb_title_basics USING gin (original_title gin_trgm_ops);
+-- SHIB-21: gist_trgm_ops answers both the `%` containment operator and the KNN
+-- distance operator `<->`, so SEARCH_IMDB_TITLES can stream each branch's top-N
+-- straight out of the index (bounded) instead of materialising the whole `%`
+-- candidate set — which made short queries like "dune" time out. The ingest
+-- source (src/sources/imdb.rs) rebuilds these same gist indexes post-swap; the
+-- superseded gin indexes are dropped in 0002.
+CREATE INDEX IF NOT EXISTS imdb_title_basics_primary_title_trgm_gist
+    ON imdb_title_basics USING gist (primary_title gist_trgm_ops);
+CREATE INDEX IF NOT EXISTS imdb_title_basics_original_title_trgm_gist
+    ON imdb_title_basics USING gist (original_title gist_trgm_ops);
 
 -- ── title.episode ──────────────────────────────────────────────────────────
 -- episode <-> series link with season + episode numbers.
@@ -70,8 +76,9 @@ CREATE TABLE IF NOT EXISTS imdb_title_akas (
     PRIMARY KEY (title_id, ordering)
 );
 
-CREATE INDEX IF NOT EXISTS imdb_title_akas_title_trgm
-    ON imdb_title_akas USING gin (title gin_trgm_ops);
+-- SHIB-21: gist_trgm_ops for KNN `<->` (see title.basics note above).
+CREATE INDEX IF NOT EXISTS imdb_title_akas_title_trgm_gist
+    ON imdb_title_akas USING gist (title gist_trgm_ops);
 
 -- ── title.ratings ──────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS imdb_title_ratings (

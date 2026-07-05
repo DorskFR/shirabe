@@ -129,11 +129,14 @@ fn datasets() -> Vec<Dataset> {
             create_new: "tconst text PRIMARY KEY, title_type text, primary_title text, \
                  original_title text, is_adult boolean, start_year integer, end_year integer, \
                  runtime_minutes integer, genres text",
+            // SHIB-21: gist_trgm_ops (answers both `%` and the KNN `<->` operator)
+            // so SEARCH_IMDB_TITLES can KNN-bound each branch (top-N straight out
+            // of the index) instead of materialising the whole `%` candidate set.
             indexes: &[
-                "CREATE INDEX imdb_title_basics_primary_title_trgm \
-                 ON imdb_title_basics USING gin (primary_title gin_trgm_ops)",
-                "CREATE INDEX imdb_title_basics_original_title_trgm \
-                 ON imdb_title_basics USING gin (original_title gin_trgm_ops)",
+                "CREATE INDEX imdb_title_basics_primary_title_trgm_gist \
+                 ON imdb_title_basics USING gist (primary_title gist_trgm_ops)",
+                "CREATE INDEX imdb_title_basics_original_title_trgm_gist \
+                 ON imdb_title_basics USING gist (original_title gist_trgm_ops)",
             ],
             to_copy_fields: |r| {
                 vec![
@@ -177,8 +180,9 @@ fn datasets() -> Vec<Dataset> {
             create_new: "title_id text NOT NULL, ordering integer NOT NULL, title text, \
                  region text, language text, types text, attributes text, \
                  is_original_title boolean, PRIMARY KEY (title_id, ordering)",
-            indexes: &["CREATE INDEX imdb_title_akas_title_trgm \
-                 ON imdb_title_akas USING gin (title gin_trgm_ops)"],
+            // SHIB-21: gist_trgm_ops for KNN `<->` (see basics above).
+            indexes: &["CREATE INDEX imdb_title_akas_title_trgm_gist \
+                 ON imdb_title_akas USING gist (title gist_trgm_ops)"],
             to_copy_fields: |r| {
                 vec![
                     field(&r[0]),

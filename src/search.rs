@@ -22,6 +22,8 @@
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres, Row};
 
+use crate::queries;
+
 /// Default pg_trgm `%` cutoff for local search candidate filtering. Matches the
 /// permissive end of the MB search thresholds so romanised/native variants both
 /// surface.
@@ -216,21 +218,12 @@ async fn search_tmdb_id_index(
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows = sqlx::query(
-        r"
-        SELECT id, name, popularity, adult,
-               similarity(name, $1) AS score
-        FROM tmdb_id_index
-        WHERE kind = $2 AND name % $1
-        ORDER BY score DESC, popularity DESC NULLS LAST, id ASC
-        LIMIT $3
-        ",
-    )
-    .bind(query)
-    .bind(kind)
-    .bind(limit)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows = sqlx::query(queries::SEARCH_TMDB_ID_INDEX)
+        .bind(query)
+        .bind(kind)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
     drop(conn);
 
     Ok(rows
@@ -271,45 +264,12 @@ async fn search_imdb_titles(
     // match (the akas GIN index carries the non-latin variants). We then take the
     // GREATEST similarity over primary/original/aka for the score. `$3` is a
     // (possibly empty) title_type allow-list applied only to basics rows.
-    let rows = sqlx::query(
-        r"
-        WITH basics_hit AS (
-            SELECT b.tconst,
-                   GREATEST(
-                     similarity(b.primary_title, $1),
-                     similarity(coalesce(b.original_title, ''), $1)
-                   ) AS s
-            FROM imdb_title_basics b
-            WHERE (b.primary_title % $1 OR b.original_title % $1)
-              AND (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
-        ),
-        akas_hit AS (
-            SELECT a.title_id AS tconst, max(similarity(a.title, $1)) AS s
-            FROM imdb_title_akas a
-            WHERE a.title % $1
-            GROUP BY a.title_id
-        ),
-        unioned AS (
-            SELECT tconst, s FROM basics_hit
-            UNION ALL
-            SELECT tconst, s FROM akas_hit
-        )
-        SELECT u.tconst,
-               max(u.s) AS score,
-               b.primary_title AS name
-        FROM unioned u
-        JOIN imdb_title_basics b ON b.tconst = u.tconst
-        WHERE (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
-        GROUP BY u.tconst, b.primary_title
-        ORDER BY score DESC, u.tconst ASC
-        LIMIT $2
-        ",
-    )
-    .bind(query)
-    .bind(limit)
-    .bind(title_types)
-    .fetch_all(&mut *conn)
-    .await?;
+    let rows = sqlx::query(queries::SEARCH_IMDB_TITLES)
+        .bind(query)
+        .bind(limit)
+        .bind(title_types)
+        .fetch_all(&mut *conn)
+        .await?;
     drop(conn);
 
     Ok(rows
@@ -358,19 +318,11 @@ async fn resolve_tconsts_via_cache(
     if tconsts.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let rows = sqlx::query(
-        r"
-        SELECT COALESCE(payload -> 'external_ids' ->> 'imdb_id', payload ->> 'imdb_id') AS imdb_id,
-               id
-        FROM tmdb_cache
-        WHERE kind = $1
-          AND COALESCE(payload -> 'external_ids' ->> 'imdb_id', payload ->> 'imdb_id') = ANY($2)
-        ",
-    )
-    .bind(kind)
-    .bind(tconsts)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(queries::RESOLVE_TCONSTS_VIA_CACHE)
+        .bind(kind)
+        .bind(tconsts)
+        .fetch_all(pool)
+        .await?;
     Ok(rows
         .into_iter()
         .filter_map(|r| {
@@ -390,13 +342,8 @@ async fn index_meta_for_ids(
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
-    let rows = sqlx::query(
-        "SELECT id, name, popularity, adult FROM tmdb_id_index WHERE kind = $1 AND id = ANY($2)",
-    )
-    .bind(kind)
-    .bind(ids)
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query(queries::INDEX_META_FOR_IDS).bind(kind).bind(ids).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(|r| {

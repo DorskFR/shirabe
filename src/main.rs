@@ -4,12 +4,14 @@
 mod config;
 mod date;
 mod db;
+mod debug_ui;
 mod error;
 mod facades;
 mod handlers;
 mod images;
 mod migrate;
 mod models;
+mod queries;
 mod query;
 mod repo;
 mod search;
@@ -126,7 +128,7 @@ async fn serve(
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/health/sources", get(handlers::health_sources))
         .route("/ws/2", get(handlers::health))
@@ -139,7 +141,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Native-shape provider facades (routing skeletons; 501 until SHIB-4/5).
         // Kusaritoi points `tvdb.base_url` → …/v4 and `tmdb.base_url` → …/3.
         .merge(facades::tvdb::router())
-        .merge(facades::tmdb::router())
+        .merge(facades::tmdb::router());
+
+    // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
+    // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
+    let app = if state.config.debug_ui { app.merge(debug_ui::router()) } else { app };
+
+    app
         // Per-request access log (method, path, status, latency). Enable with
         // `tower_http=debug` in RUST_LOG to see every ws/2 call.
         .layer(TraceLayer::new_for_http())
