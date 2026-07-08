@@ -22,11 +22,13 @@ const SHIRABE_SQL: &[&str] = &[include_str!("../migrations/shirabe/0001_init.sql
 const IMDB_SQL: &[&str] = &[
     include_str!("../migrations/imdb/0001_imdb_tables.sql"),
     include_str!("../migrations/imdb/0002_title_knn_gist.sql"),
+    include_str!("../migrations/imdb/0003_title_fts.sql"),
 ];
 /// Embedded migration SQL for the `tmdb` cache/index DB (applied in file order).
 const TMDB_SQL: &[&str] = &[
     include_str!("../migrations/tmdb/0001_tmdb_tables.sql"),
     include_str!("../migrations/tmdb/0002_tmdb_cache_imdb_id_idx.sql"),
+    include_str!("../migrations/tmdb/0003_id_index_name_fts.sql"),
 ];
 /// Embedded migration SQL for the `tvdb` cache DB.
 const TVDB_SQL: &[&str] = &[include_str!("../migrations/tvdb/0001_tvdb_tables.sql")];
@@ -170,8 +172,9 @@ mod tests {
     #[test]
     fn tmdb_sql_includes_imdb_id_xref_index() {
         let files = embedded_sql("tmdb").unwrap();
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert!(files[0].contains("CREATE TABLE IF NOT EXISTS tmdb_cache"));
         assert!(files[1].contains("tmdb_cache_kind_imdb_id_idx"));
+        assert!(files[2].contains("tmdb_id_index_name_fts_ua"));
     }
 }

@@ -375,7 +375,26 @@ pub const LOAD_RELEASE_RELATIONS: &str = r"
 pub const PING: &str = "SELECT 1";
 
 // tmdb DB
+//
+// SHIB-24: FTS + f_unaccent fast path (whole-word, accent-folded). Trigram `%` on
+// the 1.4M-row id index shares common 3-grams with a large candidate slice for a
+// short query like 'dune' (~340ms, scoring 30k rows); FTS intersects lexeme
+// posting lists down to the rows that actually contain the word (~2ms). Falls back
+// to the trigram version (SEARCH_TMDB_ID_INDEX_FUZZY) only when FTS matches none.
 pub const SEARCH_TMDB_ID_INDEX: &str = r"
+        SELECT id, name, popularity, adult,
+               similarity(public.f_unaccent(name), public.f_unaccent($1)) AS score
+        FROM tmdb_id_index
+        WHERE kind = $2
+          AND to_tsvector('simple', public.f_unaccent(name))
+              @@ websearch_to_tsquery('simple', public.f_unaccent($1))
+        ORDER BY score DESC, popularity DESC NULLS LAST, id ASC
+        LIMIT $3
+        ";
+
+// Trigram fuzzy fallback for TMDB id-index search — used only when the FTS primary
+// matched nothing (typos / partials). Bounded by the session statement_timeout.
+pub const SEARCH_TMDB_ID_INDEX_FUZZY: &str = r"
         SELECT id, name, popularity, adult,
                similarity(name, $1) AS score
         FROM tmdb_id_index
@@ -397,13 +416,69 @@ pub const INDEX_META_FOR_IDS: &str =
 
 // imdb DB
 //
-// SHIB-21: KNN-bounded per-branch top-N (mirrors SEARCH_ARTISTS) so a short,
-// common-trigram query ("dune") no longer materialises the entire `%` candidate
-// set out of the 58M-row `imdb_title_akas` before the outer LIMIT. Each branch
-// streams its top-N straight out of a `gist_trgm_ops` index via `<->`; the union
-// is then re-ranked by GREATEST similarity and limited. `$1`=query, `$2`=limit,
-// `$3`=title_type allow-list (empty array = all types).
+// SHIB-24: FTS + f_unaccent fast path (whole-word, accent-folded). SHIB-21's
+// gist_trgm KNN (`<->`) does NOT bound for short, common query words: measured on
+// the live 58M-row mirror, 'dune' reads ~113k index buffers (~880MB) to return 25
+// rows — ~44 seconds. FTS intersects lexeme posting lists so 'dune' reduces to the
+// handful of rows that contain the word (single-digit ms). Each branch scores by
+// GREATEST similarity across primary/original/aka and is re-ranked in the union;
+// `$1`=query, `$2`=limit, `$3`=title_type allow-list (empty array = all types).
+// Falls back to the trigram version (SEARCH_IMDB_TITLES_FUZZY) only when FTS
+// matched nothing.
 pub const SEARCH_IMDB_TITLES: &str = r"
+        WITH primary_hit AS (
+            SELECT b.tconst,
+                   similarity(public.f_unaccent(b.primary_title), public.f_unaccent($1)) AS s
+            FROM imdb_title_basics b
+            WHERE to_tsvector('simple', public.f_unaccent(b.primary_title))
+                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
+              AND (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
+            ORDER BY s DESC
+            LIMIT $2
+        ),
+        original_hit AS (
+            SELECT b.tconst,
+                   similarity(public.f_unaccent(coalesce(b.original_title, '')), public.f_unaccent($1)) AS s
+            FROM imdb_title_basics b
+            WHERE to_tsvector('simple', public.f_unaccent(b.original_title))
+                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
+              AND (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
+            ORDER BY s DESC
+            LIMIT $2
+        ),
+        akas_hit AS (
+            SELECT a.title_id AS tconst,
+                   similarity(public.f_unaccent(a.title), public.f_unaccent($1)) AS s
+            FROM imdb_title_akas a
+            WHERE to_tsvector('simple', public.f_unaccent(a.title))
+                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
+            ORDER BY s DESC
+            LIMIT $2
+        ),
+        unioned AS (
+            SELECT tconst, s FROM primary_hit
+            UNION ALL
+            SELECT tconst, s FROM original_hit
+            UNION ALL
+            SELECT tconst, s FROM akas_hit
+        )
+        SELECT u.tconst,
+               max(u.s) AS score,
+               b.primary_title AS name
+        FROM unioned u
+        JOIN imdb_title_basics b ON b.tconst = u.tconst
+        WHERE (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
+        GROUP BY u.tconst, b.primary_title
+        ORDER BY score DESC, u.tconst ASC
+        LIMIT $2
+        ";
+
+// Trigram fuzzy fallback for IMDb title search — used only when the FTS primary
+// matched nothing (typos / partials). Each branch streams its top-N straight out
+// of a `gist_trgm_ops` index via the KNN `<->` operator; bounded by the session
+// statement_timeout (a pathological common-token fallback yields no rows rather
+// than erroring — the FTS primary already returned none).
+pub const SEARCH_IMDB_TITLES_FUZZY: &str = r"
         WITH primary_hit AS (
             SELECT b.tconst, similarity(b.primary_title, $1) AS s
             FROM imdb_title_basics b
@@ -585,7 +660,7 @@ pub fn catalog() -> Vec<QuerySpec> {
         },
         QuerySpec {
             id: "search_tmdb_id_index",
-            title: "TMDB id-index search (trigram)",
+            title: "TMDB id-index search (FTS)",
             endpoint: "GET /3/search/{movie,tv} (local)",
             db: TargetDb::Tmdb,
             trigram: true,
@@ -597,12 +672,38 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
+            id: "search_tmdb_id_index_fuzzy",
+            title: "TMDB id-index search (trigram fallback)",
+            endpoint: "GET /3/search/{movie,tv} (local, fallback)",
+            db: TargetDb::Tmdb,
+            trigram: true,
+            sql: SEARCH_TMDB_ID_INDEX_FUZZY,
+            params: vec![
+                p("query", Text, "dune"),
+                p("kind", Text, "movie"),
+                p("limit", BigInt, "25"),
+            ],
+        },
+        QuerySpec {
             id: "search_imdb_titles",
-            title: "IMDb title search (trigram) — the \"dune\" path",
+            title: "IMDb title search (FTS) — the \"dune\" path",
             endpoint: "GET /3/search/{movie,tv} (local)",
             db: TargetDb::Imdb,
             trigram: true,
             sql: SEARCH_IMDB_TITLES,
+            params: vec![
+                p("query", Text, "dune"),
+                p("limit", BigInt, "25"),
+                p("title_types", TextArray, "movie,tvMovie,short,video"),
+            ],
+        },
+        QuerySpec {
+            id: "search_imdb_titles_fuzzy",
+            title: "IMDb title search (trigram fallback)",
+            endpoint: "GET /3/search/{movie,tv} (local, fallback)",
+            db: TargetDb::Imdb,
+            trigram: true,
+            sql: SEARCH_IMDB_TITLES_FUZZY,
             params: vec![
                 p("query", Text, "dune"),
                 p("limit", BigInt, "25"),
