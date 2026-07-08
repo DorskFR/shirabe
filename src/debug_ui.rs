@@ -93,12 +93,6 @@ struct RunRequest {
     /// `statement_timeout` in ms; `0` disables it (so a slow query still EXPLAINs).
     #[serde(default)]
     timeout_ms: i64,
-    /// Run `DISCARD ALL` before the query to drop this connection's cached
-    /// prepared-statement plans (so a re-run re-plans from scratch). Note this
-    /// cannot evict Postgres `shared_buffers` / OS page cache — that needs a
-    /// restart — so use `iterations` + the reported min to read the warm floor.
-    #[serde(default = "default_bust")]
-    bust: bool,
     /// How many times to execute the statement; timings are collected per run and
     /// reported as min/median/max so a single noisy sample can't mislead.
     #[serde(default = "default_iterations")]
@@ -110,9 +104,6 @@ const fn default_threshold() -> f64 {
 }
 fn default_work_mem() -> String {
     "256MB".to_string()
-}
-const fn default_bust() -> bool {
-    true
 }
 const fn default_iterations() -> u32 {
     1
@@ -162,39 +153,29 @@ async fn run_query(state: &AppState, req: RunRequest) -> Result<Value, String> {
     let mut timings_ms: Vec<f64> = Vec::with_capacity(iterations as usize);
     let mut last_rows = Vec::new();
 
-    for _ in 0..iterations {
-        // Drop this connection's cached prepared plans so the re-run re-plans from
-        // scratch. Cannot evict shared_buffers/OS cache (needs a restart), but it
-        // removes the plan-cache confound between runs.
-        if req.bust {
-            sqlx::query("DISCARD ALL")
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| format!("discard all: {e}"))?;
-        }
+    // statement_timeout: 0 disables (Postgres semantics). Applied once for the
+    // session; splicing (not binding) is required — SET takes no parameters.
+    let timeout = req.timeout_ms.max(0);
+    sqlx::query(&format!("SET statement_timeout = {timeout}"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("set statement_timeout: {e}"))?;
 
-        // statement_timeout: 0 disables (Postgres semantics). Re-applied each
-        // iteration because DISCARD ALL resets session GUCs.
-        let timeout = req.timeout_ms.max(0);
-        sqlx::query(&format!("SET statement_timeout = {timeout}"))
+    // Trigram queries read the `%` cutoff GUC and benefit from a larger work_mem —
+    // mirror how the handler configures the session (crate::search).
+    if spec.trigram {
+        sqlx::query("SELECT set_limit($1)")
+            .bind(req.threshold as f32)
             .execute(&mut *conn)
             .await
-            .map_err(|e| format!("set statement_timeout: {e}"))?;
+            .map_err(|e| format!("set_limit: {e}"))?;
+        sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(&req.work_mem)))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("set work_mem: {e}"))?;
+    }
 
-        // Trigram queries read the `%` cutoff GUC and benefit from a larger
-        // work_mem — mirror how the handler configures the session (crate::search).
-        if spec.trigram {
-            sqlx::query("SELECT set_limit($1)")
-                .bind(req.threshold as f32)
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| format!("set_limit: {e}"))?;
-            sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(&req.work_mem)))
-                .execute(&mut *conn)
-                .await
-                .map_err(|e| format!("set work_mem: {e}"))?;
-        }
-
+    for _ in 0..iterations {
         let mut q = sqlx::query(&final_sql);
         for (param, raw) in spec.params.iter().zip(req.params.iter()) {
             q = bind_param(q, param.ty, param.nullable, raw.trim())?;
@@ -404,8 +385,6 @@ const PAGE_HTML: &str = r#"<!doctype html>
   th { background: #161c24; color: #9ecbff; position: sticky; top: 0; }
   section { margin-top: 18px; }
   .hint { color: #6b7684; font-size: 12px; }
-  .chk { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #9aa5b1; font-size: 12px; }
-  .chk input { width: auto; }
   td.ko { color: #ff8f8f; font-weight: 600; }
   td.pass { color: #86e29b; font-weight: 600; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -498,13 +477,8 @@ function renderDetail() {
   const section = el("section", {});
   section.append(el("label", {}, "Session"));
   section.append(knobs);
-  const bustWrap = el("label", {class:"chk"});
-  const bust = el("input", {id:"bust", type:"checkbox"});
-  bust.checked = true;
-  bustWrap.append(bust, document.createTextNode(" DISCARD ALL before each run (drop cached plans)"));
-  section.append(bustWrap);
   section.append(el("div", {class:"hint"},
-    "Note: cannot evict Postgres shared_buffers / OS page cache without a restart — raise iterations and read the min as the warm floor."));
+    "iterations run the statement N times on a warm connection; read the reported min as the warm-cache floor."));
   if (!q.trigram) section.append(el("div", {class:"hint"}, "threshold/work_mem ignored (non-trigram query)"));
   m.append(section);
 
@@ -532,7 +506,6 @@ async function execute(mode) {
     threshold: parseFloat(document.getElementById("threshold").value) || 0.3,
     work_mem: document.getElementById("work_mem").value || "256MB",
     timeout_ms: parseInt(document.getElementById("timeout_ms").value, 10) || 0,
-    bust: document.getElementById("bust").checked,
     iterations: parseInt(document.getElementById("iterations").value, 10) || 1,
   };
   const status = document.getElementById("status");
@@ -595,7 +568,7 @@ async function runBenchmark() {
   m.innerHTML = "";
   m.append(el("h2", {}, "Benchmark", el("span", {class:"badge"}, `objective ≤ ${OBJECTIVE_MS} ms`)));
   m.append(el("div", {class:"meta"},
-    `Runs every query ${BENCH_ITERS}× (DISCARD ALL between iterations) with its example params; reports the min (warm floor).`));
+    `Runs every query ${BENCH_ITERS}× with its example params; reports the min (warm floor).`));
   const table = el("table", {});
   const head = el("tr", {});
   ["", "query", "db", "min ms", "med ms", "max ms", "result"].forEach(h => head.append(el("th", {}, h)));
@@ -618,7 +591,7 @@ async function runBenchmark() {
       id: q.id, mode: "run",
       params: q.params.map(p => p.example),
       threshold: 0.3, work_mem: "256MB", timeout_ms: 0,
-      bust: true, iterations: BENCH_ITERS,
+      iterations: BENCH_ITERS,
     };
     try {
       const r = await fetch("/debug/run", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
