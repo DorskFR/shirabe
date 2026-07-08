@@ -397,7 +397,8 @@ const PAGE_HTML: &str = r#"<!doctype html>
 <aside>
   <h1>shirabe · queries</h1>
   <div style="padding:10px 14px; border-bottom:1px solid #232a33;">
-    <button id="benchBtn" style="width:100%">▶ Benchmark all</button>
+    <button id="benchFastBtn" style="width:100%">▶ Benchmark FTS (fast)</button>
+    <button id="benchTrigramBtn" class="secondary" style="width:100%; margin-top:6px">▶ Benchmark trigram (slow)</button>
   </div>
   <div id="list"></div>
 </aside>
@@ -585,14 +586,16 @@ function renderRows(container, rows, count) {
 const OBJECTIVE_MS = 100;   // no query should be slower than this.
 const BENCH_ITERS = 5;      // per-query iterations; the min is the warm floor.
 
-async function runBenchmark() {
+async function runBenchmark(kind) {
   document.querySelectorAll(".item").forEach(i => i.classList.remove("active"));
   current = null;
+  const queries = CATALOG.filter(q => kind === "trigram" ? q.trigram : !q.trigram);
+  const label = kind === "trigram" ? "trigram (slow)" : "FTS (fast)";
   const m = document.getElementById("main");
   m.innerHTML = "";
-  m.append(el("h2", {}, "Benchmark", el("span", {class:"badge"}, `objective ≤ ${OBJECTIVE_MS} ms`)));
+  m.append(el("h2", {}, `Benchmark · ${label}`, el("span", {class:"badge"}, `objective ≤ ${OBJECTIVE_MS} ms`)));
   m.append(el("div", {class:"meta"},
-    `Runs every query ${BENCH_ITERS}× with its example params; reports the min (warm floor).`));
+    `Runs ${queries.length} ${label} ${queries.length === 1 ? "query" : "queries"} ${BENCH_ITERS}× with its example params; reports the min (warm floor).`));
   const table = el("table", {});
   const head = el("tr", {});
   ["", "query", "db", "min ms", "med ms", "max ms", "result"].forEach(h => head.append(el("th", {}, h)));
@@ -601,12 +604,12 @@ async function runBenchmark() {
   const progress = el("div", {class:"status", id:"benchProgress"}, "");
   m.append(progress);
 
-  const btn = document.getElementById("benchBtn");
-  btn.disabled = true;
+  const btns = [document.getElementById("benchFastBtn"), document.getElementById("benchTrigramBtn")];
+  btns.forEach(b => b.disabled = true);
   let pass = 0, ko = 0;
-  for (let i = 0; i < CATALOG.length; i++) {
-    const q = CATALOG[i];
-    progress.textContent = `running ${i+1}/${CATALOG.length} · ${q.title}…`;
+  for (let i = 0; i < queries.length; i++) {
+    const q = queries[i];
+    progress.textContent = `running ${i+1}/${queries.length} · ${q.title}…`;
     const tr = el("tr", {});
     tr.append(el("td", {class:"num"}, String(i+1)));
     tr.append(el("td", {}, q.title));
@@ -644,10 +647,11 @@ async function runBenchmark() {
     table.append(tr);
   }
   progress.innerHTML = `done · <span class="ok">${pass} OK</span> · <span class="err">${ko} KO</span> (objective ≤ ${OBJECTIVE_MS} ms)`;
-  btn.disabled = false;
+  btns.forEach(b => b.disabled = false);
 }
 
-document.getElementById("benchBtn").onclick = runBenchmark;
+document.getElementById("benchFastBtn").onclick = () => runBenchmark("fast");
+document.getElementById("benchTrigramBtn").onclick = () => runBenchmark("trigram");
 renderList();
 </script>
 </body>
