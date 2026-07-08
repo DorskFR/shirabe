@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 
-use sqlx::{PgPool, Row};
+use sqlx::postgres::{PgArguments, PgRow};
+use sqlx::{PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
@@ -21,6 +22,26 @@ use crate::search::configure_search_session;
 /// `f32`; we widen to `f64` only for the arithmetic here.
 fn to_score(similarity: f32) -> i32 {
     (f64::from(similarity) * 100.0).round().clamp(0.0, 100.0) as i32
+}
+
+/// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
+/// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
+/// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
+/// than erroring the whole request — the FTS primary already returned none.
+async fn fetch_fuzzy(
+    query: sqlx::query::Query<'_, Postgres, PgArguments>,
+    conn: &mut PgConnection,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    match query.fetch_all(conn).await {
+        Ok(rows) => Ok(rows),
+        Err(e)
+            if e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref()
+                == Some("57014") =>
+        {
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ── Batched (set-based) hydration ─────────────────────────
@@ -342,26 +363,23 @@ pub async fn search_artists(
     threshold: f64,
     work_mem: &str,
 ) -> Result<Vec<Artist>, sqlx::Error> {
-    // KNN top-N: `<->` (trigram distance = 1 - similarity) streams the closest
-    // rows straight out of the gist_trgm_ops indexes. A single scan can only KNN
-    // one column, so we UNION the per-column top-N KNN candidates and re-rank the
-    // survivors by the GREATEST similarity across the searched columns (so
-    // romanised / native variants both rank). The `%` filter keeps `set_limit`'s
-    // threshold as the match cutoff.
-    //
-    // SHIB-20: a third KNN branch scans artist_alias.name so alias-only matches
-    // (localised / alternate names — a common MB recall case) compete with
-    // artist.name / artist.sort_name hits instead of being missed (aliases were
-    // previously only loaded per-row by FK, never trigram-searched). Because an
-    // artist can match on several columns, the candidate set is de-duped by
-    // artist id in the outer aggregate, keeping the MAX similarity across name,
-    // sort_name and the best-matching alias (GROUP BY id, MAX(score)). Ranking
-    // stays in similarity space (higher = better), matching the wave-1 style.
-    // The alias branch uses gist_trgm_ops on artist_alias.name (migration 0004).
+    // SHIB-23: FTS + f_unaccent whole-word fast path across artist.name /
+    // sort_name / artist_alias.name (3 UNION branches, de-duped by id with MAX
+    // score so a name/sort_name/alias hit all compete). Accent-folded, so 'bjork'
+    // matches 'Björk'. Trigram `%` fallback only when FTS matches nothing (typo'd /
+    // partial query). SHIB-20: the alias branch keeps alias-only recall (localised
+    // / alternate names), previously loaded per-row by FK but never searched.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows =
+    let mut rows =
         sqlx::query(queries::SEARCH_ARTISTS).bind(name).bind(limit).fetch_all(&mut *conn).await?;
+    if rows.is_empty() {
+        rows = fetch_fuzzy(
+            sqlx::query(queries::SEARCH_ARTISTS_FUZZY).bind(name).bind(limit),
+            &mut conn,
+        )
+        .await?;
+    }
     drop(conn);
 
     // SHIB-17: batch all artists' aliases in one query instead of one per row.
@@ -516,13 +534,15 @@ pub async fn search_releases(
         .fetch_all(&mut *conn)
         .await?;
     if rows.is_empty() {
-        rows = sqlx::query(queries::SEARCH_RELEASES_FUZZY)
-            .bind(title)
-            .bind(artist)
-            .bind(year_i32)
-            .bind(limit)
-            .fetch_all(&mut *conn)
-            .await?;
+        rows = fetch_fuzzy(
+            sqlx::query(queries::SEARCH_RELEASES_FUZZY)
+                .bind(title)
+                .bind(artist)
+                .bind(year_i32)
+                .bind(limit),
+            &mut conn,
+        )
+        .await?;
     }
     drop(conn);
 
@@ -750,12 +770,11 @@ pub async fn search_recordings(
         .fetch_all(&mut *conn)
         .await?;
     if rows.is_empty() {
-        rows = sqlx::query(queries::SEARCH_RECORDINGS_FUZZY)
-            .bind(title)
-            .bind(artist)
-            .bind(limit)
-            .fetch_all(&mut *conn)
-            .await?;
+        rows = fetch_fuzzy(
+            sqlx::query(queries::SEARCH_RECORDINGS_FUZZY).bind(title).bind(artist).bind(limit),
+            &mut conn,
+        )
+        .await?;
     }
     drop(conn);
 
