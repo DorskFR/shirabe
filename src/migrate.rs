@@ -30,15 +30,14 @@ const TMDB_SQL: &[&str] = &[
 ];
 /// Embedded migration SQL for the `tvdb` cache DB.
 const TVDB_SQL: &[&str] = &[include_str!("../migrations/tvdb/0001_tvdb_tables.sql")];
-/// Embedded migration SQL for the `musicbrainz` mirror (the pg_trgm + gin/gist
+/// Embedded migration SQL for the `musicbrainz` mirror (the pg_trgm GIN + FTS
 /// index layer shirabe adds on top of the replicated MB schema). Applied against
-/// `DATABASE_URL`. Idempotent (`CREATE INDEX IF NOT EXISTS` + safe drops), so on a
-/// mirror that already carries the GIN indexes only the GiST additions build.
+/// `DATABASE_URL`. Idempotent (`CREATE INDEX IF NOT EXISTS`), so on a mirror that
+/// already carries the indexes each file no-ops.
 const MUSICBRAINZ_SQL: &[&str] = &[
     include_str!("../migrations/0001_shirabe_search_indexes.sql"),
     include_str!("../migrations/0002_release_date_year_indexes.sql"),
-    include_str!("../migrations/0003_search_knn_gist.sql"),
-    include_str!("../migrations/0004_artist_alias_knn_gist.sql"),
+    include_str!("../migrations/0003_search_fts.sql"),
 ];
 
 /// The four writable databases that `shirabe migrate all` bootstraps, in apply
@@ -147,9 +146,9 @@ mod tests {
         assert!(joined("imdb").contains("imdb_title_basics"));
         assert!(joined("tmdb").contains("tmdb_id_index"));
         assert!(joined("tvdb").contains("tvdb_cache"));
-        // musicbrainz maps to the mirror index layer (gist_trgm_ops KNN), but is
+        // musicbrainz maps to the mirror index layer (pg_trgm GIN + FTS), but is
         // excluded from `migrate all` (see `MIGRATABLE`).
-        assert!(joined("musicbrainz").contains("gist_trgm_ops"));
+        assert!(joined("musicbrainz").contains("to_tsvector"));
         assert!(!MIGRATABLE.contains(&"musicbrainz"));
         assert!(embedded_sql("nope").is_none());
     }

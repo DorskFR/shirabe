@@ -42,16 +42,48 @@ pub const SEARCH_ARTISTS: &str = r"
         LIMIT $2
         ";
 
+// SHIB-22: FTS fast path. `to_tsvector(name) @@ websearch_to_tsquery(q)` reduces a
+// multi-word title to the handful of rows containing every word (whole-lexeme
+// posting-list intersection via shirabe_release_name_fts), so ranking those few by
+// similarity() is ~free (0.4ms warm vs ~350ms for the trigram `%` scan over the
+// tens of thousands of rows that share common 3-grams). The optional artist filter
+// / year filter run on that tiny candidate set; the title score stays similarity()
+// (higher = better), artist adds a weighted bonus so title dominates.
 pub const SEARCH_RELEASES: &str = r"
         SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
                c.credit_name,
-               (1.0 - c.title_dist)::real AS title_score
+               similarity(c.name, $1)::real AS title_score
         FROM (
             SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
-                   ac.name AS credit_name,
-                   (r.name <-> $1) AS title_dist,
-                   CASE WHEN $2::text IS NULL THEN NULL
-                        ELSE (ac.name <-> $2) END AS artist_dist
+                   ac.name AS credit_name
+            FROM musicbrainz.release r
+            JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
+            WHERE to_tsvector('simple', r.name) @@ websearch_to_tsquery('simple', $1)
+              AND ($2::text IS NULL OR ac.name % $2)
+              AND ($3::int IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_country rc
+                    WHERE rc.release = r.id AND rc.date_year = $3
+                    UNION ALL
+                    SELECT 1 FROM musicbrainz.release_unknown_country ruc
+                    WHERE ruc.release = r.id AND ruc.date_year = $3))
+        ) c
+        ORDER BY (similarity(c.name, $1)
+                  + CASE WHEN $2::text IS NULL THEN 0::real
+                         ELSE similarity(c.credit_name, $2) * 0.5::real END) DESC,
+                 c.id ASC
+        LIMIT $4
+        ";
+
+// Trigram fallback for SEARCH_RELEASES: used only when FTS matches nothing (a
+// typo'd / partial query with no whole-word lexeme hit). Uses the gin_trgm_ops `%`
+// filter — slower, but the rare path — so recall never regresses vs pure FTS.
+pub const SEARCH_RELEASES_FUZZY: &str = r"
+        SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
+               c.credit_name,
+               similarity(c.name, $1)::real AS title_score
+        FROM (
+            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+                   ac.name AS credit_name
             FROM musicbrainz.release r
             JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
             WHERE r.name % $1
@@ -63,25 +95,46 @@ pub const SEARCH_RELEASES: &str = r"
                     SELECT 1 FROM musicbrainz.release_unknown_country ruc
                     WHERE ruc.release = r.id AND ruc.date_year = $3))
         ) c
-        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
+        ORDER BY (similarity(c.name, $1)
+                  + CASE WHEN $2::text IS NULL THEN 0::real
+                         ELSE similarity(c.credit_name, $2) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $4
         ";
 
 pub const SEARCH_RECORDINGS: &str = r"
         SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
-               (1.0 - c.title_dist)::real AS title_score
+               similarity(c.name, $1)::real AS title_score
         FROM (
             SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
-                   (rec.name <-> $1) AS title_dist,
-                   CASE WHEN $2::text IS NULL THEN NULL
-                        ELSE (ac.name <-> $2) END AS artist_dist
+                   ac.name AS credit_name
+            FROM musicbrainz.recording rec
+            JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
+            WHERE to_tsvector('simple', rec.name) @@ websearch_to_tsquery('simple', $1)
+              AND ($2::text IS NULL OR ac.name % $2)
+        ) c
+        ORDER BY (similarity(c.name, $1)
+                  + CASE WHEN $2::text IS NULL THEN 0::real
+                         ELSE similarity(c.credit_name, $2) * 0.5::real END) DESC,
+                 c.id ASC
+        LIMIT $3
+        ";
+
+// Trigram fallback for SEARCH_RECORDINGS (see SEARCH_RELEASES_FUZZY).
+pub const SEARCH_RECORDINGS_FUZZY: &str = r"
+        SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
+               similarity(c.name, $1)::real AS title_score
+        FROM (
+            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+                   ac.name AS credit_name
             FROM musicbrainz.recording rec
             JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
             WHERE rec.name % $1
               AND ($2::text IS NULL OR ac.name % $2)
         ) c
-        ORDER BY (c.title_dist + COALESCE(c.artist_dist, 0) * 0.5) ASC,
+        ORDER BY (similarity(c.name, $1)
+                  + CASE WHEN $2::text IS NULL THEN 0::real
+                         ELSE similarity(c.credit_name, $2) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $3
         ";
@@ -422,7 +475,7 @@ pub fn catalog() -> Vec<QuerySpec> {
         },
         QuerySpec {
             id: "search_releases",
-            title: "Release search (KNN trigram)",
+            title: "Release search (FTS)",
             endpoint: "GET /ws/2/release",
             db: TargetDb::Musicbrainz,
             trigram: true,
@@ -435,12 +488,39 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
+            id: "search_releases_fuzzy",
+            title: "Release search (trigram fallback)",
+            endpoint: "GET /ws/2/release (fallback)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: SEARCH_RELEASES_FUZZY,
+            params: vec![
+                p("title", Text, "ok computer"),
+                pn("artist", Text, ""),
+                pn("year", Int, ""),
+                p("limit", BigInt, "25"),
+            ],
+        },
+        QuerySpec {
             id: "search_recordings",
-            title: "Recording search (KNN trigram)",
+            title: "Recording search (FTS)",
             endpoint: "GET /ws/2/recording",
             db: TargetDb::Musicbrainz,
             trigram: true,
             sql: SEARCH_RECORDINGS,
+            params: vec![
+                p("title", Text, "paranoid android"),
+                pn("artist", Text, ""),
+                p("limit", BigInt, "25"),
+            ],
+        },
+        QuerySpec {
+            id: "search_recordings_fuzzy",
+            title: "Recording search (trigram fallback)",
+            endpoint: "GET /ws/2/recording (fallback)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: SEARCH_RECORDINGS_FUZZY,
             params: vec![
                 p("title", Text, "paranoid android"),
                 pn("artist", Text, ""),

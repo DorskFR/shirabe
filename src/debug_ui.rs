@@ -364,7 +364,10 @@ const PAGE_HTML: &str = r#"<!doctype html>
   .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; background: #22303f;
            color: #9ecbff; font-size: 11px; margin-left: 6px; }
   pre { background: #11161d; border: 1px solid #232a33; border-radius: 6px; padding: 12px;
-        overflow-x: auto; white-space: pre; }
+        overflow-x: auto; white-space: pre; margin: 0; }
+  .prewrap { position: relative; margin: 12px 0; }
+  .prewrap .copy { position: absolute; top: 6px; right: 6px; padding: 3px 10px; font-size: 12px; opacity: .6; }
+  .prewrap:hover .copy { opacity: 1; }
   .sql { color: #cfe1ff; }
   label { display: block; color: #9aa5b1; font-size: 12px; margin: 8px 0 2px; }
   input, select { background: #11161d; border: 1px solid #2b3441; color: #e8edf3;
@@ -417,6 +420,27 @@ function el(tag, attrs, ...kids) {
   return n;
 }
 
+// A small "Copy" button that copies the string returned by getText().
+function copyBtn(getText, label) {
+  const b = el("button", {class:"secondary copy"}, label || "Copy");
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(getText()); }
+    catch (e) { const ta = document.createElement("textarea"); ta.value = getText();
+      document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
+    const prev = b.textContent; b.textContent = "Copied ✓";
+    setTimeout(() => { b.textContent = prev; }, 1200);
+  };
+  return b;
+}
+
+// A <pre> with a Copy button floated in its top-right corner.
+function copyablePre(text, cls) {
+  const wrap = el("div", {class:"prewrap"});
+  wrap.append(copyBtn(() => text, "Copy"));
+  wrap.append(el("pre", cls ? {class:cls} : {}, text));
+  return wrap;
+}
+
 function renderList() {
   const list = document.getElementById("list");
   list.innerHTML = "";
@@ -447,7 +471,7 @@ function renderDetail() {
   m.innerHTML = "";
   m.append(el("h2", {}, q.title, el("span", {class:"badge"}, q.db + (q.trigram ? " · trigram" : ""))));
   m.append(el("div", {class:"meta"}, q.endpoint));
-  m.append(el("pre", {class:"sql"}, q.sql.trim()));
+  m.append(copyablePre(q.sql.trim(), "sql"));
 
   // params
   if (q.params.length) {
@@ -527,9 +551,9 @@ async function execute(mode) {
       ? ` · db min ${data.min_ms.toFixed(1)} / med ${data.median_ms.toFixed(1)} / max ${data.max_ms.toFixed(1)} ms (${iters}×)`
       : ` · db ${data.elapsed_ms.toFixed(1)} ms`;
     status.innerHTML = `<span class="ok">ok</span>${dist} · round-trip ${wall} ms`;
-    if (data.final_sql) result.append(el("pre", {class:"hint"}, data.final_sql.trim()));
+    if (data.final_sql) result.append(copyablePre(data.final_sql.trim(), "hint"));
     if (mode === "run") renderRows(result, data.rows, data.row_count);
-    else result.append(el("pre", {}, data.plan || "(no plan)"));
+    else result.append(copyablePre(data.plan || "(no plan)"));
   } catch (e) {
     status.textContent = "request failed"; status.className = "err";
     result.append(el("pre", {class:"err"}, String(e)));
