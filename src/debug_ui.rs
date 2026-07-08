@@ -93,6 +93,16 @@ struct RunRequest {
     /// `statement_timeout` in ms; `0` disables it (so a slow query still EXPLAINs).
     #[serde(default)]
     timeout_ms: i64,
+    /// Run `DISCARD ALL` before the query to drop this connection's cached
+    /// prepared-statement plans (so a re-run re-plans from scratch). Note this
+    /// cannot evict Postgres `shared_buffers` / OS page cache — that needs a
+    /// restart — so use `iterations` + the reported min to read the warm floor.
+    #[serde(default = "default_bust")]
+    bust: bool,
+    /// How many times to execute the statement; timings are collected per run and
+    /// reported as min/median/max so a single noisy sample can't mislead.
+    #[serde(default = "default_iterations")]
+    iterations: u32,
 }
 
 const fn default_threshold() -> f64 {
@@ -100,6 +110,12 @@ const fn default_threshold() -> f64 {
 }
 fn default_work_mem() -> String {
     "256MB".to_string()
+}
+const fn default_bust() -> bool {
+    true
+}
+const fn default_iterations() -> u32 {
+    1
 }
 
 async fn run(State(state): State<Arc<AppState>>, Json(req): Json<RunRequest>) -> impl IntoResponse {
@@ -142,64 +158,104 @@ async fn run_query(state: &AppState, req: RunRequest) -> Result<Value, String> {
 
     let mut conn = pool.acquire().await.map_err(|e| format!("acquire connection: {e}"))?;
 
-    // statement_timeout: 0 disables (Postgres semantics). Always applied so the
-    // operator controls whether a slow query is allowed to run to completion.
-    let timeout = req.timeout_ms.max(0);
-    sqlx::query(&format!("SET statement_timeout = {timeout}"))
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| format!("set statement_timeout: {e}"))?;
+    let iterations = req.iterations.clamp(1, 25);
+    let mut timings_ms: Vec<f64> = Vec::with_capacity(iterations as usize);
+    let mut last_rows = Vec::new();
 
-    // Trigram queries read the `%` cutoff GUC and benefit from a larger work_mem —
-    // mirror how the handler configures the session (crate::search).
-    if spec.trigram {
-        sqlx::query("SELECT set_limit($1)")
-            .bind(req.threshold as f32)
+    for _ in 0..iterations {
+        // Drop this connection's cached prepared plans so the re-run re-plans from
+        // scratch. Cannot evict shared_buffers/OS cache (needs a restart), but it
+        // removes the plan-cache confound between runs.
+        if req.bust {
+            sqlx::query("DISCARD ALL")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| format!("discard all: {e}"))?;
+        }
+
+        // statement_timeout: 0 disables (Postgres semantics). Re-applied each
+        // iteration because DISCARD ALL resets session GUCs.
+        let timeout = req.timeout_ms.max(0);
+        sqlx::query(&format!("SET statement_timeout = {timeout}"))
             .execute(&mut *conn)
             .await
-            .map_err(|e| format!("set_limit: {e}"))?;
-        sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(&req.work_mem)))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| format!("set work_mem: {e}"))?;
+            .map_err(|e| format!("set statement_timeout: {e}"))?;
+
+        // Trigram queries read the `%` cutoff GUC and benefit from a larger
+        // work_mem — mirror how the handler configures the session (crate::search).
+        if spec.trigram {
+            sqlx::query("SELECT set_limit($1)")
+                .bind(req.threshold as f32)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| format!("set_limit: {e}"))?;
+            sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(&req.work_mem)))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| format!("set work_mem: {e}"))?;
+        }
+
+        let mut q = sqlx::query(&final_sql);
+        for (param, raw) in spec.params.iter().zip(req.params.iter()) {
+            q = bind_param(q, param.ty, param.nullable, raw.trim())?;
+        }
+
+        let started = std::time::Instant::now();
+        let rows = q.fetch_all(&mut *conn).await.map_err(|e| e.to_string())?;
+        timings_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+        last_rows = rows;
     }
 
-    let mut q = sqlx::query(&final_sql);
-    for (param, raw) in spec.params.iter().zip(req.params.iter()) {
-        q = bind_param(q, param.ty, param.nullable, raw.trim())?;
-    }
-
-    let started = std::time::Instant::now();
-    let rows = q.fetch_all(&mut *conn).await.map_err(|e| e.to_string())?;
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (min_ms, median_ms, max_ms) = summarize(&timings_ms);
 
     if req.mode == "explain" || req.mode == "explain_analyze" {
         // Default (TEXT) EXPLAIN → one text column ("QUERY PLAN") per line.
         let plan: Vec<String> =
-            rows.iter().map(|r| r.try_get::<String, _>(0).unwrap_or_default()).collect();
+            last_rows.iter().map(|r| r.try_get::<String, _>(0).unwrap_or_default()).collect();
         Ok(json!({
             "ok": true,
             "mode": req.mode,
-            "elapsed_ms": elapsed_ms,
+            "elapsed_ms": min_ms,
+            "min_ms": min_ms,
+            "median_ms": median_ms,
+            "max_ms": max_ms,
+            "iterations": iterations,
             "final_sql": final_sql,
             "plan": plan.join("\n"),
         }))
     } else {
         // `run`: each row is a single ::text column holding the row as JSON.
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
+        let mut out = Vec::with_capacity(last_rows.len());
+        for r in &last_rows {
             let s: String = r.try_get::<String, _>(0).unwrap_or_default();
             out.push(serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)));
         }
         Ok(json!({
             "ok": true,
             "mode": req.mode,
-            "elapsed_ms": elapsed_ms,
+            "elapsed_ms": min_ms,
+            "min_ms": min_ms,
+            "median_ms": median_ms,
+            "max_ms": max_ms,
+            "iterations": iterations,
             "final_sql": final_sql,
             "row_count": out.len(),
             "rows": out,
         }))
     }
+}
+
+/// (min, median, max) of the collected per-iteration timings.
+fn summarize(timings: &[f64]) -> (f64, f64, f64) {
+    if timings.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut sorted = timings.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    let median = sorted[sorted.len() / 2];
+    (min, median, max)
 }
 
 /// Wrap / prefix the catalog SQL for the requested mode. `run` wraps the SELECT
@@ -348,11 +404,19 @@ const PAGE_HTML: &str = r#"<!doctype html>
   th { background: #161c24; color: #9ecbff; position: sticky; top: 0; }
   section { margin-top: 18px; }
   .hint { color: #6b7684; font-size: 12px; }
+  .chk { display: flex; align-items: center; gap: 6px; margin-top: 10px; color: #9aa5b1; font-size: 12px; }
+  .chk input { width: auto; }
+  td.ko { color: #ff8f8f; font-weight: 600; }
+  td.pass { color: #86e29b; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
 <aside>
   <h1>shirabe · queries</h1>
+  <div style="padding:10px 14px; border-bottom:1px solid #232a33;">
+    <button id="benchBtn" style="width:100%">▶ Benchmark all</button>
+  </div>
   <div id="list"></div>
 </aside>
 <main id="main">
@@ -430,9 +494,17 @@ function renderDetail() {
   knobs.append(mk("threshold", "set_limit (threshold)", "0.3"));
   knobs.append(mk("work_mem", "work_mem", "256MB"));
   knobs.append(mk("timeout_ms", "statement_timeout ms (0=off)", "0"));
+  knobs.append(mk("iterations", "iterations (min/med/max)", "1"));
   const section = el("section", {});
   section.append(el("label", {}, "Session"));
   section.append(knobs);
+  const bustWrap = el("label", {class:"chk"});
+  const bust = el("input", {id:"bust", type:"checkbox"});
+  bust.checked = true;
+  bustWrap.append(bust, document.createTextNode(" DISCARD ALL before each run (drop cached plans)"));
+  section.append(bustWrap);
+  section.append(el("div", {class:"hint"},
+    "Note: cannot evict Postgres shared_buffers / OS page cache without a restart — raise iterations and read the min as the warm floor."));
   if (!q.trigram) section.append(el("div", {class:"hint"}, "threshold/work_mem ignored (non-trigram query)"));
   m.append(section);
 
@@ -460,6 +532,8 @@ async function execute(mode) {
     threshold: parseFloat(document.getElementById("threshold").value) || 0.3,
     work_mem: document.getElementById("work_mem").value || "256MB",
     timeout_ms: parseInt(document.getElementById("timeout_ms").value, 10) || 0,
+    bust: document.getElementById("bust").checked,
+    iterations: parseInt(document.getElementById("iterations").value, 10) || 1,
   };
   const status = document.getElementById("status");
   const result = document.getElementById("result");
@@ -475,7 +549,11 @@ async function execute(mode) {
       result.append(el("pre", {class:"err"}, data.error));
       return;
     }
-    status.innerHTML = `<span class="ok">ok</span> · db ${data.elapsed_ms.toFixed(1)} ms · round-trip ${wall} ms`;
+    const iters = data.iterations || 1;
+    const dist = iters > 1
+      ? ` · db min ${data.min_ms.toFixed(1)} / med ${data.median_ms.toFixed(1)} / max ${data.max_ms.toFixed(1)} ms (${iters}×)`
+      : ` · db ${data.elapsed_ms.toFixed(1)} ms`;
+    status.innerHTML = `<span class="ok">ok</span>${dist} · round-trip ${wall} ms`;
     if (data.final_sql) result.append(el("pre", {class:"hint"}, data.final_sql.trim()));
     if (mode === "run") renderRows(result, data.rows, data.row_count);
     else result.append(el("pre", {}, data.plan || "(no plan)"));
@@ -506,6 +584,73 @@ function renderRows(container, rows, count) {
   container.append(table);
 }
 
+// ── benchmark ──────────────────────────────────────────────────
+const OBJECTIVE_MS = 100;   // no query should be slower than this.
+const BENCH_ITERS = 5;      // per-query iterations; the min is the warm floor.
+
+async function runBenchmark() {
+  document.querySelectorAll(".item").forEach(i => i.classList.remove("active"));
+  current = null;
+  const m = document.getElementById("main");
+  m.innerHTML = "";
+  m.append(el("h2", {}, "Benchmark", el("span", {class:"badge"}, `objective ≤ ${OBJECTIVE_MS} ms`)));
+  m.append(el("div", {class:"meta"},
+    `Runs every query ${BENCH_ITERS}× (DISCARD ALL between iterations) with its example params; reports the min (warm floor).`));
+  const table = el("table", {});
+  const head = el("tr", {});
+  ["", "query", "db", "min ms", "med ms", "max ms", "result"].forEach(h => head.append(el("th", {}, h)));
+  table.append(head);
+  m.append(table);
+  const progress = el("div", {class:"status", id:"benchProgress"}, "");
+  m.append(progress);
+
+  const btn = document.getElementById("benchBtn");
+  btn.disabled = true;
+  let pass = 0, ko = 0;
+  for (let i = 0; i < CATALOG.length; i++) {
+    const q = CATALOG[i];
+    progress.textContent = `running ${i+1}/${CATALOG.length} · ${q.title}…`;
+    const tr = el("tr", {});
+    tr.append(el("td", {class:"num"}, String(i+1)));
+    tr.append(el("td", {}, q.title));
+    tr.append(el("td", {}, q.db));
+    const body = {
+      id: q.id, mode: "run",
+      params: q.params.map(p => p.example),
+      threshold: 0.3, work_mem: "256MB", timeout_ms: 0,
+      bust: true, iterations: BENCH_ITERS,
+    };
+    try {
+      const r = await fetch("/debug/run", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
+      const data = await r.json();
+      if (!data.ok) {
+        tr.append(el("td", {class:"num"}, "—"));
+        tr.append(el("td", {class:"num"}, "—"));
+        tr.append(el("td", {class:"num"}, "—"));
+        tr.append(el("td", {class:"ko", title: data.error}, "ERROR"));
+        ko++;
+      } else {
+        const ok = data.min_ms <= OBJECTIVE_MS;
+        if (ok) pass++; else ko++;
+        tr.append(el("td", {class:"num"}, data.min_ms.toFixed(1)));
+        tr.append(el("td", {class:"num"}, data.median_ms.toFixed(1)));
+        tr.append(el("td", {class:"num"}, data.max_ms.toFixed(1)));
+        tr.append(el("td", {class: ok ? "pass" : "ko"}, ok ? "OK" : "KO"));
+      }
+    } catch (e) {
+      tr.append(el("td", {class:"num"}, "—"));
+      tr.append(el("td", {class:"num"}, "—"));
+      tr.append(el("td", {class:"num"}, "—"));
+      tr.append(el("td", {class:"ko", title:String(e)}, "FAIL"));
+      ko++;
+    }
+    table.append(tr);
+  }
+  progress.innerHTML = `done · <span class="ok">${pass} OK</span> · <span class="err">${ko} KO</span> (objective ≤ ${OBJECTIVE_MS} ms)`;
+  btn.disabled = false;
+}
+
+document.getElementById("benchBtn").onclick = runBenchmark;
 renderList();
 </script>
 </body>
