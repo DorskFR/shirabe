@@ -20,9 +20,30 @@
 //! itself be key-gated and yield nothing — never a panic).
 
 use sqlx::pool::PoolConnection;
+use sqlx::postgres::{PgArguments, PgRow};
 use sqlx::{PgPool, Postgres, Row};
 
 use crate::queries;
+
+/// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
+/// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
+/// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
+/// than erroring the whole request — the FTS primary already returned none.
+async fn fetch_fuzzy(
+    query: sqlx::query::Query<'_, Postgres, PgArguments>,
+    conn: &mut PoolConnection<Postgres>,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    match query.fetch_all(&mut **conn).await {
+        Ok(rows) => Ok(rows),
+        Err(e)
+            if e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref()
+                == Some("57014") =>
+        {
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Default pg_trgm `%` cutoff for local search candidate filtering. Matches the
 /// permissive end of the MB search thresholds so romanised/native variants both
@@ -218,12 +239,21 @@ async fn search_tmdb_id_index(
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let rows = sqlx::query(queries::SEARCH_TMDB_ID_INDEX)
+    // FTS primary (SHIB-24); fall back to the trigram fuzzy query only when FTS
+    // matched nothing (typos / partials), bounded by the session statement_timeout.
+    let mut rows = sqlx::query(queries::SEARCH_TMDB_ID_INDEX)
         .bind(query)
         .bind(kind)
         .bind(limit)
         .fetch_all(&mut *conn)
         .await?;
+    if rows.is_empty() {
+        rows = fetch_fuzzy(
+            sqlx::query(queries::SEARCH_TMDB_ID_INDEX_FUZZY).bind(query).bind(kind).bind(limit),
+            &mut conn,
+        )
+        .await?;
+    }
     drop(conn);
 
     Ok(rows
@@ -264,12 +294,25 @@ async fn search_imdb_titles(
     // match (the akas GIN index carries the non-latin variants). We then take the
     // GREATEST similarity over primary/original/aka for the score. `$3` is a
     // (possibly empty) title_type allow-list applied only to basics rows.
-    let rows = sqlx::query(queries::SEARCH_IMDB_TITLES)
+    // FTS primary (SHIB-24); fall back to the trigram/gist-KNN fuzzy query only
+    // when FTS matched nothing, bounded by the session statement_timeout (a
+    // pathological common-token fallback yields no rows rather than erroring).
+    let mut rows = sqlx::query(queries::SEARCH_IMDB_TITLES)
         .bind(query)
         .bind(limit)
         .bind(title_types)
         .fetch_all(&mut *conn)
         .await?;
+    if rows.is_empty() {
+        rows = fetch_fuzzy(
+            sqlx::query(queries::SEARCH_IMDB_TITLES_FUZZY)
+                .bind(query)
+                .bind(limit)
+                .bind(title_types),
+            &mut conn,
+        )
+        .await?;
+    }
     drop(conn);
 
     Ok(rows
