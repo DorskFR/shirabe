@@ -112,16 +112,25 @@ impl ImdbIndexSource {
     }
 }
 
-/// Names from `pg_indexes` (public schema) intersected with `expected`.
-async fn existing_indexes(pool: &PgPool, expected: &[IndexDef]) -> sqlx::Result<Vec<String>> {
+/// `(name, indisvalid)` for the expected indexes that exist in `public`.
+/// Validity matters: a failed `CREATE INDEX CONCURRENTLY` leaves an INVALID
+/// index behind, which the planner ignores but `IF NOT EXISTS` still skips.
+async fn existing_indexes(
+    pool: &PgPool,
+    expected: &[IndexDef],
+) -> sqlx::Result<Vec<(String, bool)>> {
     let names: Vec<String> = expected.iter().map(|d| d.name.to_string()).collect();
     let rows = sqlx::query(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname = ANY($1)",
+        "SELECT c.relname AS indexname, i.indisvalid
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relname = ANY($1)",
     )
     .bind(&names)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| r.get::<String, _>("indexname")).collect())
+    Ok(rows.iter().map(|r| (r.get("indexname"), r.get("indisvalid"))).collect())
 }
 
 #[async_trait]
@@ -153,10 +162,19 @@ impl Source for ImdbIndexSource {
             Err(e) => return RefreshReport::failed(format!("failed to read pg_indexes: {e}")),
         };
 
+        for (name, valid) in &pre_existing {
+            if !valid {
+                tracing::warn!(source = self.id(), index = %name, "dropping INVALID index");
+                if let Err(e) = sqlx::query(&format!("DROP INDEX {name}")).execute(pool).await {
+                    return RefreshReport::failed(format!("dropping invalid {name} failed: {e}"));
+                }
+            }
+        }
+
         let mut detail = serde_json::Map::new();
         let mut built = 0usize;
         for def in self.set.indexes() {
-            let existed = pre_existing.iter().any(|n| n == def.name);
+            let existed = pre_existing.iter().any(|(n, valid)| n == def.name && *valid);
             let started = std::time::Instant::now();
             if let Err(e) = sqlx::query(def.ddl).execute(pool).await {
                 return RefreshReport::failed(format!("building {} failed: {e}", def.name))
@@ -191,12 +209,12 @@ impl Source for ImdbIndexSource {
                     .indexes()
                     .iter()
                     .map(|d| d.name)
-                    .filter(|n| !present.iter().any(|p| p == n))
+                    .filter(|n| !present.iter().any(|(p, valid)| p == n && *valid))
                     .collect();
                 let detail = if missing.is_empty() {
-                    format!("all {} indexes present", self.set.indexes().len())
+                    format!("all {} indexes present and valid", self.set.indexes().len())
                 } else {
-                    format!("MISSING indexes: {}", missing.join(", "))
+                    format!("MISSING or INVALID indexes: {}", missing.join(", "))
                 };
                 // A missing index is the exact failure this job exists to
                 // prevent, so it must flip `healthy`, not just the detail text.
