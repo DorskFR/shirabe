@@ -126,11 +126,10 @@ pub fn normalize_query(raw: &str) -> String {
     if let Some((head, rest)) = q.split_once(':') {
         let field: String =
             head.trim().chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
-        // Lucene syntax has no space after the colon; "Mission: Impossible" does.
-        if LUCENE_FIELD_PREFIXES.contains(&field.as_str())
-            && rest.starts_with(|c: char| c == '"' || c.is_alphanumeric())
-        {
-            q = rest;
+        // The whitelist is what keeps colon titles safe, so the colon-space
+        // form (`title: dune`) can be stripped too.
+        if LUCENE_FIELD_PREFIXES.contains(&field.as_str()) {
+            q = rest.trim_start();
         }
     }
     let cleaned: String = q.chars().map(|c| if c == '"' { ' ' } else { c }).collect();
@@ -584,12 +583,14 @@ mod tests {
         ScoredHit { id: id.to_string(), name: id.to_string(), score, popularity: pop, adult: None }
     }
 
-    /// Lucene field syntax is stripped: prefix + quotes, quoted phrase intact.
+    /// Lucene field syntax is stripped: prefix + quotes, quoted phrase intact,
+    /// with or without a space after the colon.
     #[test]
     fn normalize_strips_lucene_field_prefix_and_quotes() {
         assert_eq!(normalize_query(r#"title:"dancer in the dark""#), "dancer in the dark");
         assert_eq!(normalize_query("title:inception"), "inception");
-        assert_eq!(normalize_query(r#"name:"the wire""#), "the wire");
+        assert_eq!(normalize_query("title: dune"), "dune");
+        assert_eq!(normalize_query(r#"name: "the wire""#), "the wire");
         assert_eq!(
             normalize_query(r#"original_title:"El laberinto del fauno""#),
             "El laberinto del fauno"
