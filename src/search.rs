@@ -117,23 +117,37 @@ const LUCENE_FIELD_PREFIXES: &[&str] =
     &["title", "name", "originaltitle", "primarytitle", "artist", "release", "recording", "alias"];
 
 /// Normalize a consumer-typed search query for the provider facades: strip a
-/// whitelisted Lucene `field:` prefix and drop double quotes (`title:"dancer in
-/// the dark"` → `dancer in the dark`). Neither the FTS/trigram pipeline nor the
-/// upstream TMDB/TVDB APIs understand Lucene syntax.
+/// whitelisted field prefix (`title:` / `title=`) and drop double quotes
+/// (`title:"dancer in the dark"` → `dancer in the dark`). Neither the
+/// FTS/trigram pipeline nor the upstream TMDB/TVDB APIs understand field
+/// syntax. A NEGATED whitelisted field (`title!="x"`) returns `None`: a text
+/// search cannot express exclusion, and answering it with matches FOR the
+/// value would be the opposite of what was asked.
 #[must_use]
-pub fn normalize_query(raw: &str) -> String {
+pub fn normalize_query(raw: &str) -> Option<String> {
     let mut q = raw.trim();
-    if let Some((head, rest)) = q.split_once(':') {
+    if let Some(sep) = q.find([':', '=']) {
+        let (mut head, mut rest) = (&q[..sep], &q[sep + 1..]);
+        if q.as_bytes()[sep] == b'=' && rest.starts_with('=') {
+            rest = &rest[1..];
+        }
+        let negated = head.ends_with('!');
+        if negated {
+            head = &head[..head.len() - 1];
+        }
         let field: String =
             head.trim().chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
         // The whitelist is what keeps colon titles safe, so the colon-space
         // form (`title: dune`) can be stripped too.
         if LUCENE_FIELD_PREFIXES.contains(&field.as_str()) {
+            if negated {
+                return None;
+            }
             q = rest.trim_start();
         }
     }
     let cleaned: String = q.chars().map(|c| if c == '"' { ' ' } else { c }).collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    Some(cleaned.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// A local result is considered "thin" (→ fall through to the live API and merge)
@@ -586,34 +600,45 @@ mod tests {
     /// Lucene field syntax is stripped: prefix + quotes, quoted phrase intact,
     /// with or without a space after the colon.
     #[test]
-    fn normalize_strips_lucene_field_prefix_and_quotes() {
-        assert_eq!(normalize_query(r#"title:"dancer in the dark""#), "dancer in the dark");
-        assert_eq!(normalize_query("title:inception"), "inception");
-        assert_eq!(normalize_query("title: dune"), "dune");
-        assert_eq!(normalize_query(r#"name: "the wire""#), "the wire");
-        assert_eq!(
-            normalize_query(r#"original_title:"El laberinto del fauno""#),
-            "El laberinto del fauno"
-        );
+    fn normalize_strips_field_prefix_and_quotes() {
+        let n = |s: &str| normalize_query(s).expect("answerable");
+        assert_eq!(n(r#"title:"dancer in the dark""#), "dancer in the dark");
+        assert_eq!(n("title:inception"), "inception");
+        assert_eq!(n("title: dune"), "dune");
+        assert_eq!(n(r#"title="star wars""#), "star wars");
+        assert_eq!(n(r#"name: "the wire""#), "the wire");
+        assert_eq!(n(r#"original_title:"El laberinto del fauno""#), "El laberinto del fauno");
+    }
+
+    /// A negated whitelisted field cannot be answered by a text search — it must
+    /// yield None (empty results), never matches FOR the excluded value.
+    #[test]
+    fn normalize_rejects_negated_fields() {
+        assert_eq!(normalize_query(r#"title!="star wars""#), None);
+        assert_eq!(normalize_query("name!=foo"), None);
+        assert_eq!(normalize_query("title!:foo"), None);
     }
 
     /// Real titles containing a colon are NOT mistaken for field syntax: unknown
     /// prefixes, digit prefixes, and colon-space all pass through.
     #[test]
     fn normalize_keeps_titles_with_colons() {
-        assert_eq!(normalize_query("Mission: Impossible"), "Mission: Impossible");
-        assert_eq!(normalize_query("RE:BORN"), "RE:BORN");
-        assert_eq!(normalize_query("8:46"), "8:46");
-        assert_eq!(normalize_query("Frost:Nixon"), "Frost:Nixon");
+        let n = |s: &str| normalize_query(s).expect("answerable");
+        assert_eq!(n("Mission: Impossible"), "Mission: Impossible");
+        assert_eq!(n("RE:BORN"), "RE:BORN");
+        assert_eq!(n("8:46"), "8:46");
+        assert_eq!(n("Frost:Nixon"), "Frost:Nixon");
+        assert_eq!(n("a!=b movie"), "a!=b movie");
     }
 
     /// Plain queries are untouched beyond whitespace collapsing; bare quotes drop.
     #[test]
     fn normalize_plain_queries() {
-        assert_eq!(normalize_query("dancer in the dark"), "dancer in the dark");
-        assert_eq!(normalize_query(r#""dune part two""#), "dune part two");
-        assert_eq!(normalize_query("  spirited   away  "), "spirited away");
-        assert_eq!(normalize_query(""), "");
+        let n = |s: &str| normalize_query(s).expect("answerable");
+        assert_eq!(n("dancer in the dark"), "dancer in the dark");
+        assert_eq!(n(r#""dune part two""#), "dune part two");
+        assert_eq!(n("  spirited   away  "), "spirited away");
+        assert_eq!(n(""), "");
     }
 
     // ── score synthesis (similarity 0..1 → 0..100) ──────────────

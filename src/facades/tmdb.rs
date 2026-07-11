@@ -232,9 +232,20 @@ async fn upstream_get(key: &str, path: &str, extra: &[(&str, String)]) -> Result
 }
 
 /// Read the inbound `query` search term from the accepted query params,
-/// normalized via [`search::normalize_query`].
+/// normalized via [`search::normalize_query`]. `None` for both a missing
+/// param and an unanswerable (negated-field) query; the caller distinguishes
+/// via [`is_unanswerable`].
 fn search_query(params: &Value) -> Option<String> {
-    params.get("query").and_then(Value::as_str).map(search::normalize_query)
+    params.get("query").and_then(Value::as_str).and_then(search::normalize_query)
+}
+
+/// True when a `query` param is present but cannot be answered by a text
+/// search (e.g. `title!="x"` — see [`search::normalize_query`]).
+fn is_unanswerable(params: &Value) -> bool {
+    params
+        .get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|raw| search::normalize_query(raw).is_none())
 }
 
 /// Sort a TMDB `results` array in place by descending `popularity` (ranking ties).
@@ -315,6 +326,9 @@ fn merge_live_results(results: &mut Vec<Value>, live: &Value) {
 /// served without re-hitting upstream.
 async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     let Some(query) = search_query(params) else {
+        if is_unanswerable(params) {
+            return Json(local_results_payload(&[], kind)).into_response();
+        }
         return tmdb_error(StatusCode::BAD_REQUEST, 22, "query parameter is required");
     };
     let cache_kind = format!("search_{kind}");
