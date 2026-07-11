@@ -522,29 +522,54 @@ pub async fn local_tmdb_search(
     limit: i64,
     work_mem: &str,
 ) -> Vec<ScoredHit> {
+    // The two pools are separate databases; probe them concurrently so their
+    // latencies (worst case: one fuzzy-fallback cap each) overlap instead of
+    // stacking. Source order (tmdb before imdb) is preserved for merge_hits.
+    let tmdb_search = async {
+        if let Some(pool) = tmdb_pool {
+            match search_tmdb_id_index(
+                pool,
+                query,
+                kind,
+                limit,
+                LOCAL_SIMILARITY_THRESHOLD,
+                work_mem,
+            )
+            .await
+            {
+                Ok(hits) => return Some(hits),
+                Err(e) => tracing::warn!(error = %e, kind, "local tmdb_id_index search failed"),
+            }
+        }
+        None
+    };
+    let imdb_search = async {
+        if let Some(pool) = imdb_pool {
+            let types = imdb_title_types(kind);
+            match search_imdb_titles(
+                pool,
+                query,
+                types,
+                limit,
+                LOCAL_SIMILARITY_THRESHOLD,
+                work_mem,
+            )
+            .await
+            {
+                // Cross-reference tconst hits to TMDB ids (via previously hydrated
+                // cache payloads) before merging, so an exact IMDb-akas match (e.g.
+                // "gintama" → tt0988818) surfaces under its TMDB id (57041) and
+                // dedupes with any tmdb_id_index hit for the same title (SHIB-15).
+                Ok(hits) => return Some(resolve_imdb_hits(tmdb_pool, hits, kind).await),
+                Err(e) => tracing::warn!(error = %e, kind, "local imdb title search failed"),
+            }
+        }
+        None
+    };
+    let (tmdb_hits, imdb_hits) = tokio::join!(tmdb_search, imdb_search);
     let mut sources: Vec<Vec<ScoredHit>> = Vec::new();
-
-    if let Some(pool) = tmdb_pool {
-        match search_tmdb_id_index(pool, query, kind, limit, LOCAL_SIMILARITY_THRESHOLD, work_mem)
-            .await
-        {
-            Ok(hits) => sources.push(hits),
-            Err(e) => tracing::warn!(error = %e, kind, "local tmdb_id_index search failed"),
-        }
-    }
-    if let Some(pool) = imdb_pool {
-        let types = imdb_title_types(kind);
-        match search_imdb_titles(pool, query, types, limit, LOCAL_SIMILARITY_THRESHOLD, work_mem)
-            .await
-        {
-            // Cross-reference tconst hits to TMDB ids (via previously hydrated
-            // cache payloads) before merging, so an exact IMDb-akas match (e.g.
-            // "gintama" → tt0988818) surfaces under its TMDB id (57041) and
-            // dedupes with any tmdb_id_index hit for the same title (SHIB-15).
-            Ok(hits) => sources.push(resolve_imdb_hits(tmdb_pool, hits, kind).await),
-            Err(e) => tracing::warn!(error = %e, kind, "local imdb title search failed"),
-        }
-    }
+    sources.extend(tmdb_hits);
+    sources.extend(imdb_hits);
 
     let mut merged = merge_hits(sources);
     merged.truncate(limit.max(0) as usize);
