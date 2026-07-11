@@ -327,9 +327,11 @@ fn merge_live_data(data: &mut Vec<Value>, live: &Value) {
 /// v4 API and MERGE by `tvdb_id`. `name`/`aliases`/`translations` are preserved
 /// verbatim so Kusaritoi can score against the native + non-latin variants.
 async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
-    let Some(query) = params.get("query").and_then(Value::as_str) else {
+    let Some(query) = params.get("query").and_then(Value::as_str).map(search::normalize_query)
+    else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "query parameter is required");
     };
+    let query = query.as_str();
     let search_type = params.get("type").and_then(Value::as_str).unwrap_or("series").to_string();
     let cache_kind = format!("search_{search_type}");
     let cache_id = stable_cache_id(query);

@@ -26,14 +26,16 @@ use sqlx::{PgPool, Postgres, Row};
 use crate::queries;
 
 /// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
-/// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
-/// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
-/// than erroring the whole request — the FTS primary already returned none.
+/// nothing), time-boxed to [`FUZZY_STATEMENT_TIMEOUT_MS`]. Hitting the cap
+/// yields no rows (SQLSTATE 57014) rather than erroring the whole request.
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PoolConnection<Postgres>,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
-    match query.fetch_all(&mut **conn).await {
+    sqlx::query(&format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}"))
+        .execute(&mut **conn)
+        .await?;
+    let result = match query.fetch_all(&mut **conn).await {
         Ok(rows) => Ok(rows),
         Err(e)
             if e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref()
@@ -42,7 +44,12 @@ async fn fetch_fuzzy(
             Ok(Vec::new())
         }
         Err(e) => Err(e),
-    }
+    };
+    // The pooled connection must not carry the tight cap into later queries.
+    let _ = sqlx::query(&format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"))
+        .execute(&mut **conn)
+        .await;
+    result
 }
 
 /// Default pg_trgm `%` cutoff for local search candidate filtering. Matches the
@@ -73,6 +80,11 @@ const DEFAULT_SEARCH_WORK_MEM: &str = "256MB";
 /// `SHIRABE_STATEMENT_TIMEOUT_MS` config default.
 const DEFAULT_STATEMENT_TIMEOUT_MS: i64 = 10_000;
 
+/// Tighter `statement_timeout` (ms) for the trigram fuzzy fallback only: a KNN
+/// scan that hasn't answered in 3s will not answer well, and it must not hold
+/// the request for the full session cap.
+const FUZZY_STATEMENT_TIMEOUT_MS: i64 = 3_000;
+
 /// Clamp a configured similarity threshold to the IMDb probe floor
 /// ([`IMDB_PROBE_MIN_THRESHOLD`]). Pure so it is unit-testable.
 #[must_use]
@@ -96,6 +108,33 @@ pub fn sanitize_work_mem(value: &str) -> String {
     } else {
         DEFAULT_SEARCH_WORK_MEM.to_string()
     }
+}
+
+/// Lucene-ish field prefixes users type into consumer search boxes (MusicBrainz
+/// ws/2 habit). Whitelisted so titles containing a colon ("Mission: Impossible",
+/// "RE:BORN", "8:46") are never mistaken for field syntax.
+const LUCENE_FIELD_PREFIXES: &[&str] =
+    &["title", "name", "originaltitle", "primarytitle", "artist", "release", "recording", "alias"];
+
+/// Normalize a consumer-typed search query for the provider facades: strip a
+/// whitelisted Lucene `field:` prefix and drop double quotes (`title:"dancer in
+/// the dark"` → `dancer in the dark`). Neither the FTS/trigram pipeline nor the
+/// upstream TMDB/TVDB APIs understand Lucene syntax.
+#[must_use]
+pub fn normalize_query(raw: &str) -> String {
+    let mut q = raw.trim();
+    if let Some((head, rest)) = q.split_once(':') {
+        let field: String =
+            head.trim().chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
+        // Lucene syntax has no space after the colon; "Mission: Impossible" does.
+        if LUCENE_FIELD_PREFIXES.contains(&field.as_str())
+            && rest.starts_with(|c: char| c == '"' || c.is_alphanumeric())
+        {
+            q = rest;
+        }
+    }
+    let cleaned: String = q.chars().map(|c| if c == '"' { ' ' } else { c }).collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A local result is considered "thin" (→ fall through to the live API and merge)
@@ -518,6 +557,37 @@ mod tests {
 
     fn hit(id: &str, score: i32, pop: Option<f64>) -> ScoredHit {
         ScoredHit { id: id.to_string(), name: id.to_string(), score, popularity: pop, adult: None }
+    }
+
+    /// Lucene field syntax is stripped: prefix + quotes, quoted phrase intact.
+    #[test]
+    fn normalize_strips_lucene_field_prefix_and_quotes() {
+        assert_eq!(normalize_query(r#"title:"dancer in the dark""#), "dancer in the dark");
+        assert_eq!(normalize_query("title:inception"), "inception");
+        assert_eq!(normalize_query(r#"name:"the wire""#), "the wire");
+        assert_eq!(
+            normalize_query(r#"original_title:"El laberinto del fauno""#),
+            "El laberinto del fauno"
+        );
+    }
+
+    /// Real titles containing a colon are NOT mistaken for field syntax: unknown
+    /// prefixes, digit prefixes, and colon-space all pass through.
+    #[test]
+    fn normalize_keeps_titles_with_colons() {
+        assert_eq!(normalize_query("Mission: Impossible"), "Mission: Impossible");
+        assert_eq!(normalize_query("RE:BORN"), "RE:BORN");
+        assert_eq!(normalize_query("8:46"), "8:46");
+        assert_eq!(normalize_query("Frost:Nixon"), "Frost:Nixon");
+    }
+
+    /// Plain queries are untouched beyond whitespace collapsing; bare quotes drop.
+    #[test]
+    fn normalize_plain_queries() {
+        assert_eq!(normalize_query("dancer in the dark"), "dancer in the dark");
+        assert_eq!(normalize_query(r#""dune part two""#), "dune part two");
+        assert_eq!(normalize_query("  spirited   away  "), "spirited away");
+        assert_eq!(normalize_query(""), "");
     }
 
     // ── score synthesis (similarity 0..1 → 0..100) ──────────────

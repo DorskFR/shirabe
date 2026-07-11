@@ -231,9 +231,10 @@ async fn upstream_get(key: &str, path: &str, extra: &[(&str, String)]) -> Result
     serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("upstream json: {e}"))
 }
 
-/// Read the inbound `query` search term from the accepted query params.
+/// Read the inbound `query` search term from the accepted query params,
+/// normalized via [`search::normalize_query`].
 fn search_query(params: &Value) -> Option<String> {
-    params.get("query").and_then(Value::as_str).map(ToString::to_string)
+    params.get("query").and_then(Value::as_str).map(search::normalize_query)
 }
 
 /// Sort a TMDB `results` array in place by descending `popularity` (ranking ties).
