@@ -12,6 +12,7 @@
 //! `LazyScrape`) is just: implement `Source`, register it.
 
 pub mod imdb;
+pub mod imdb_index;
 pub mod musicbrainz;
 pub mod tmdb;
 pub mod tvdb;
@@ -42,6 +43,8 @@ pub enum IngestMode {
     LazyScrape,
     /// An already-mirrored upstream we only read (the MusicBrainz Postgres mirror).
     ReadOnlyMirror,
+    /// Rebuilds search indexes after a bulk-dump swap (imdb-fts, imdb-trgm).
+    IndexMaintenance,
 }
 
 impl IngestMode {
@@ -53,6 +56,7 @@ impl IngestMode {
             Self::EnumerateLazyHydrate => "enumerate_lazy_hydrate",
             Self::LazyScrape => "lazy_scrape",
             Self::ReadOnlyMirror => "read_only_mirror",
+            Self::IndexMaintenance => "index_maintenance",
         }
     }
 }
@@ -167,7 +171,15 @@ impl Registry {
         let tvdb_pool = pools.tvdb.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
-        registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool)));
+        registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool.clone())));
+        registry.register(Arc::new(imdb_index::ImdbIndexSource::new(
+            imdb_pool.clone(),
+            imdb_index::IndexSet::Fts,
+        )));
+        registry.register(Arc::new(imdb_index::ImdbIndexSource::new(
+            imdb_pool,
+            imdb_index::IndexSet::Trgm,
+        )));
         registry.register(Arc::new(tmdb::TmdbSource::new(tmdb_pool)));
         registry.register(Arc::new(tvdb::TvdbSource::new(tvdb_pool, tvdb_tokens, config)));
         registry
@@ -411,6 +423,7 @@ mod tests {
             IngestMode::EnumerateLazyHydrate,
             IngestMode::LazyScrape,
             IngestMode::ReadOnlyMirror,
+            IngestMode::IndexMaintenance,
         ] {
             assert_eq!(mode.to_string(), mode.as_str());
             assert!(!mode.as_str().is_empty());

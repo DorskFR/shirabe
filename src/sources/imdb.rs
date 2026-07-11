@@ -14,8 +14,9 @@
 //! (`\N` = null, no quoting — IMDb's exact dialect), and COPY-loads each into a
 //! `_new` staging table. After a dataset loads cleanly it is atomically swapped
 //! into place (DROP live, RENAME staging) so live reads never observe a
-//! half-loaded set. pg_trgm GIN indexes on the title columns back non-latin
-//! akas search (e.g. 銀魂 / Gintama).
+//! half-loaded set. The swap destroys the search indexes; the `imdb-fts` and
+//! `imdb-trgm` sources (`imdb_index.rs`, SHIB-25) must run after this sync to
+//! rebuild them — only small structural indexes are rebuilt inline.
 //!
 //! Writes only the dedicated `imdb` database (`ctx.pools.imdb`); errors clearly
 //! when `IMDB_DATABASE_URL` is unset.
@@ -129,15 +130,9 @@ fn datasets() -> Vec<Dataset> {
             create_new: "tconst text PRIMARY KEY, title_type text, primary_title text, \
                  original_title text, is_adult boolean, start_year integer, end_year integer, \
                  runtime_minutes integer, genres text",
-            // SHIB-21: gist_trgm_ops (answers both `%` and the KNN `<->` operator)
-            // so SEARCH_IMDB_TITLES can KNN-bound each branch (top-N straight out
-            // of the index) instead of materialising the whole `%` candidate set.
-            indexes: &[
-                "CREATE INDEX imdb_title_basics_primary_title_trgm_gist \
-                 ON imdb_title_basics USING gist (primary_title gist_trgm_ops)",
-                "CREATE INDEX imdb_title_basics_original_title_trgm_gist \
-                 ON imdb_title_basics USING gist (original_title gist_trgm_ops)",
-            ],
+            // Search indexes (FTS + trigram) are rebuilt by the imdb-fts /
+            // imdb-trgm follow-up steps (SHIB-25), not inline here.
+            indexes: &[],
             to_copy_fields: |r| {
                 vec![
                     field(&r[0]),
@@ -180,9 +175,8 @@ fn datasets() -> Vec<Dataset> {
             create_new: "title_id text NOT NULL, ordering integer NOT NULL, title text, \
                  region text, language text, types text, attributes text, \
                  is_original_title boolean, PRIMARY KEY (title_id, ordering)",
-            // SHIB-21: gist_trgm_ops for KNN `<->` (see basics above).
-            indexes: &["CREATE INDEX imdb_title_akas_title_trgm_gist \
-                 ON imdb_title_akas USING gist (title gist_trgm_ops)"],
+            // Search indexes are rebuilt by imdb-fts / imdb-trgm (SHIB-25).
+            indexes: &[],
             to_copy_fields: |r| {
                 vec![
                     field(&r[0]),
