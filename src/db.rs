@@ -25,9 +25,11 @@ pub fn connect_lazy(database_url: &str, max_connections: u32) -> Result<PgPool, 
 ///   `tmdb_cache` + `tmdb_id_index`.
 /// - `tvdb` — the optional WRITABLE TheTVDB cache DB (`TVDB_DATABASE_URL`):
 ///   `tvdb_cache`.
+/// - `fanart` — the optional WRITABLE fanart.tv cache DB (`FANART_DATABASE_URL`):
+///   `fanart_cache`.
 ///
-/// Only the `shirabe`, `imdb`, `tmdb`, and `tvdb` pools are ever written to;
-/// `musicbrainz` stays strictly read-only.
+/// Only the `shirabe`, `imdb`, `tmdb`, `tvdb`, and `fanart` pools are ever written
+/// to; `musicbrainz` stays strictly read-only.
 #[derive(Clone)]
 pub struct Pools {
     pub musicbrainz: PgPool,
@@ -35,12 +37,13 @@ pub struct Pools {
     pub imdb: Option<PgPool>,
     pub tmdb: Option<PgPool>,
     pub tvdb: Option<PgPool>,
+    pub fanart: Option<PgPool>,
 }
 
 impl Pools {
     /// Connect the required MB pool and, when their URLs are set, the optional
-    /// writable shirabe + imdb + tmdb + tvdb pools. The API pod boots with only
-    /// the MB pool.
+    /// writable shirabe + imdb + tmdb + tvdb + fanart pools. The API pod boots with
+    /// only the MB pool.
     // `tmdb`/`tvdb` differ by one char (fixed provider names) → similar_names noise.
     #[allow(clippy::similar_names)]
     pub async fn connect(
@@ -49,6 +52,7 @@ impl Pools {
         imdb_database_url: Option<&str>,
         tmdb_database_url: Option<&str>,
         tvdb_database_url: Option<&str>,
+        fanart_database_url: Option<&str>,
         max_connections: u32,
     ) -> Result<Self, sqlx::Error> {
         let musicbrainz = connect(database_url, max_connections).await?;
@@ -62,6 +66,7 @@ impl Pools {
         let imdb = connect_opt(imdb_database_url)?;
         let tmdb = connect_opt(tmdb_database_url)?;
         let tvdb = connect_opt(tvdb_database_url)?;
-        Ok(Self { musicbrainz, shirabe, imdb, tmdb, tvdb })
+        let fanart = connect_opt(fanart_database_url)?;
+        Ok(Self { musicbrainz, shirabe, imdb, tmdb, tvdb, fanart })
     }
 }

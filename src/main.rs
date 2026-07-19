@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         config.imdb_database_url.as_deref(),
         config.tmdb_database_url.as_deref(),
         config.tvdb_database_url.as_deref(),
+        config.fanart_database_url.as_deref(),
         config.db_pool_size,
     )
     .await?;
@@ -148,6 +149,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Kusaritoi points `tvdb.base_url` → …/v4 and `tmdb.base_url` → …/3.
         .merge(facades::tvdb::router())
         .merge(facades::tmdb::router())
+        .merge(facades::fanart::router())
         .merge(facades::coverart::router());
 
     // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the

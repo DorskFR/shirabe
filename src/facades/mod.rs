@@ -7,6 +7,7 @@
 //! - `/ws/2/*` — MusicBrainz ws/2 subset (implemented; see [`crate::handlers`]).
 //! - `/v4/*`   — TheTVDB v4 facade (implemented; see [`tvdb`]).
 //! - `/3/*`    — TMDB v3 facade (implemented; see [`tmdb`]).
+//! - `/v3/*`   — fanart.tv v3 facade (implemented; see [`fanart`]).
 //! - `/release`, `/release-group`, `/_ia/*` — Cover Art Archive proxy (see
 //!   [`coverart`]), the native fold-in of the standalone `caache` image cache.
 //!
@@ -17,5 +18,6 @@
 //! `docs/shirabe-api-contract.md`.
 
 pub mod coverart;
+pub mod fanart;
 pub mod tmdb;
 pub mod tvdb;
