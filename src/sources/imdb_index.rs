@@ -27,7 +27,51 @@ const FTS_PREREQS: &[&str] = &[
      $$ SELECT public.unaccent('public.unaccent', $1) $$",
 ];
 
+/// The bulk-dump swap drops the base tables and leaves this derived table stale,
+/// so it is TRUNCATEd and repopulated on every run, not incrementally updated.
+const SEARCH_TABLE_BUILD: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS imdb_search_titles ( \
+        tconst text NOT NULL, title_ua text NOT NULL, title_type text, \
+        num_votes integer NOT NULL DEFAULT 0, tsv tsvector NOT NULL )",
+    "TRUNCATE imdb_search_titles",
+    "INSERT INTO imdb_search_titles (tconst, title_ua, title_type, num_votes, tsv) \
+     SELECT DISTINCT ON (tconst, title_ua) \
+            tconst, title_ua, title_type, num_votes, to_tsvector('simple', title_ua) \
+     FROM ( \
+        SELECT b.tconst, public.f_unaccent(b.primary_title) AS title_ua, b.title_type, \
+               COALESCE(r.num_votes, 0) AS num_votes \
+        FROM imdb_title_basics b \
+        LEFT JOIN imdb_title_ratings r ON r.tconst = b.tconst \
+        WHERE b.primary_title IS NOT NULL \
+        UNION ALL \
+        SELECT b.tconst, public.f_unaccent(b.original_title), b.title_type, \
+               COALESCE(r.num_votes, 0) \
+        FROM imdb_title_basics b \
+        LEFT JOIN imdb_title_ratings r ON r.tconst = b.tconst \
+        WHERE b.original_title IS NOT NULL \
+        UNION ALL \
+        SELECT a.title_id, public.f_unaccent(a.title), b.title_type, \
+               COALESCE(r.num_votes, 0) \
+        FROM imdb_title_akas a \
+        JOIN imdb_title_basics b ON b.tconst = a.title_id \
+        LEFT JOIN imdb_title_ratings r ON r.tconst = a.title_id \
+        WHERE a.title IS NOT NULL \
+     ) s \
+     WHERE title_ua <> '' \
+     ORDER BY tconst, title_ua, num_votes DESC",
+];
+
 const FTS_INDEXES: &[IndexDef] = &[
+    IndexDef {
+        name: "imdb_search_titles_tsv_gin",
+        ddl: "CREATE INDEX IF NOT EXISTS imdb_search_titles_tsv_gin \
+              ON imdb_search_titles USING gin (tsv)",
+    },
+    IndexDef {
+        name: "imdb_search_titles_tconst_idx",
+        ddl: "CREATE INDEX IF NOT EXISTS imdb_search_titles_tconst_idx \
+              ON imdb_search_titles (tconst)",
+    },
     IndexDef {
         name: "imdb_title_basics_primary_title_fts_ua",
         ddl: "CREATE INDEX IF NOT EXISTS imdb_title_basics_primary_title_fts_ua \
@@ -87,6 +131,13 @@ impl IndexSet {
         match self {
             Self::Fts => FTS_PREREQS,
             Self::Trgm => TRGM_PREREQS,
+        }
+    }
+
+    const fn build_steps(self) -> &'static [&'static str] {
+        match self {
+            Self::Fts => SEARCH_TABLE_BUILD,
+            Self::Trgm => &[],
         }
     }
 
@@ -154,6 +205,12 @@ impl Source for ImdbIndexSource {
         for stmt in self.set.prereqs() {
             if let Err(e) = sqlx::query(stmt).execute(pool).await {
                 return RefreshReport::failed(format!("prerequisite failed ({stmt}): {e}"));
+            }
+        }
+
+        for stmt in self.set.build_steps() {
+            if let Err(e) = sqlx::query(stmt).execute(pool).await {
+                return RefreshReport::failed(format!("search-table build failed: {e}"));
             }
         }
 
@@ -246,7 +303,8 @@ mod tests {
             assert!(def.ddl.contains(def.name), "DDL must name {}", def.name);
             assert!(
                 def.ddl.contains("ON imdb_title_basics ")
-                    || def.ddl.contains("ON imdb_title_akas "),
+                    || def.ddl.contains("ON imdb_title_akas ")
+                    || def.ddl.contains("ON imdb_search_titles "),
                 "{} targets an unexpected table",
                 def.name
             );
@@ -262,6 +320,8 @@ mod tests {
         assert_eq!(
             fts,
             vec![
+                "imdb_search_titles_tsv_gin",
+                "imdb_search_titles_tconst_idx",
                 "imdb_title_basics_primary_title_fts_ua",
                 "imdb_title_basics_original_title_fts_ua",
                 "imdb_title_akas_title_fts_ua",

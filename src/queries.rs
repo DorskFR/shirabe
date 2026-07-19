@@ -416,60 +416,27 @@ pub const INDEX_META_FOR_IDS: &str =
 
 // imdb DB
 //
-// SHIB-24: FTS + f_unaccent fast path (whole-word, accent-folded). SHIB-21's
-// gist_trgm KNN (`<->`) does NOT bound for short, common query words: measured on
-// the live 58M-row mirror, 'dune' reads ~113k index buffers (~880MB) to return 25
-// rows — ~44 seconds. FTS intersects lexeme posting lists so 'dune' reduces to the
-// handful of rows that contain the word (single-digit ms). Each branch scores by
-// GREATEST similarity across primary/original/aka and is re-ranked in the union;
-// `$1`=query, `$2`=limit, `$3`=title_type allow-list (empty array = all types).
-// Falls back to the trigram version (SEARCH_IMDB_TITLES_FUZZY) only when FTS
-// matched nothing.
 pub const SEARCH_IMDB_TITLES: &str = r"
-        WITH primary_hit AS (
-            SELECT b.tconst,
-                   similarity(public.f_unaccent(b.primary_title), public.f_unaccent($1)) AS s
-            FROM imdb_title_basics b
-            WHERE to_tsvector('simple', public.f_unaccent(b.primary_title))
-                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
-              AND (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
-            ORDER BY s DESC
-            LIMIT $2
+        WITH matched AS (
+            SELECT tconst, title_ua, num_votes
+            FROM imdb_search_titles
+            WHERE tsv @@ websearch_to_tsquery('simple', public.f_unaccent($1))
+              AND (cardinality($3::text[]) = 0 OR title_type = ANY($3))
+            ORDER BY num_votes DESC
+            LIMIT 500
         ),
-        original_hit AS (
-            SELECT b.tconst,
-                   similarity(public.f_unaccent(coalesce(b.original_title, '')), public.f_unaccent($1)) AS s
-            FROM imdb_title_basics b
-            WHERE to_tsvector('simple', public.f_unaccent(b.original_title))
-                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
-              AND (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
-            ORDER BY s DESC
-            LIMIT $2
-        ),
-        akas_hit AS (
-            SELECT a.title_id AS tconst,
-                   similarity(public.f_unaccent(a.title), public.f_unaccent($1)) AS s
-            FROM imdb_title_akas a
-            WHERE to_tsvector('simple', public.f_unaccent(a.title))
-                  @@ websearch_to_tsquery('simple', public.f_unaccent($1))
-            ORDER BY s DESC
-            LIMIT $2
-        ),
-        unioned AS (
-            SELECT tconst, s FROM primary_hit
-            UNION ALL
-            SELECT tconst, s FROM original_hit
-            UNION ALL
-            SELECT tconst, s FROM akas_hit
+        ranked AS (
+            SELECT tconst,
+                   max(similarity(title_ua, public.f_unaccent($1))) AS score
+            FROM matched
+            GROUP BY tconst
         )
-        SELECT u.tconst,
-               max(u.s) AS score,
+        SELECT r.tconst,
+               r.score,
                b.primary_title AS name
-        FROM unioned u
-        JOIN imdb_title_basics b ON b.tconst = u.tconst
-        WHERE (cardinality($3::text[]) = 0 OR b.title_type = ANY($3))
-        GROUP BY u.tconst, b.primary_title
-        ORDER BY score DESC, u.tconst ASC
+        FROM ranked r
+        JOIN imdb_title_basics b ON b.tconst = r.tconst
+        ORDER BY r.score DESC, r.tconst ASC
         LIMIT $2
         ";
 
