@@ -36,32 +36,32 @@ pub fn tmdb_poster_url(path: &str) -> String {
     format!("{TMDB_IMAGE_BASE}/{}", path.trim_start_matches('/'))
 }
 
-/// Rewrite an absolute upstream image URL to route through the `caache` proxy.
+/// Rewrite an absolute upstream image URL to route through the `/_ia/` byte proxy.
 ///
-/// - `base` is the externally-reachable caache base (e.g. `https://caache.dorsk.dev`).
-///   When it is empty, rewriting is **disabled** and the original URL is returned
-///   unchanged (graceful no-op).
+/// - `base` is the externally-reachable proxy base (e.g. `https://caache.dorsk.dev`).
+///   When it is **empty**, the URL is rewritten to Shirabe's own **relative**
+///   `/_ia/<host>/<path>` route (the native Cover Art Archive proxy), so bytes are
+///   served by Shirabe itself.
 /// - Only `http(s)` URLs are rewritten; anything else (relative, data:, etc.) is
 ///   passed through untouched.
-/// - A URL already pointing at `base` is passed through unchanged (idempotent).
+/// - A URL already pointing at a non-empty `base` is passed through unchanged
+///   (idempotent).
 #[must_use]
 pub fn rewrite_through_caache(base: &str, upstream_absolute_url: &str) -> String {
     let base = base.trim_end_matches('/');
-    if base.is_empty() {
-        return upstream_absolute_url.to_string();
-    }
-    // Already routed through caache → idempotent passthrough.
-    if upstream_absolute_url.starts_with(base) {
-        return upstream_absolute_url.to_string();
-    }
     let host_and_path = if let Some(rest) = upstream_absolute_url.strip_prefix("https://") {
         rest
     } else if let Some(rest) = upstream_absolute_url.strip_prefix("http://") {
         rest
     } else {
-        // Not an absolute http(s) URL — nothing to rewrite.
         return upstream_absolute_url.to_string();
     };
+    if base.is_empty() {
+        return format!("/_ia/{host_and_path}");
+    }
+    if upstream_absolute_url.starts_with(base) {
+        return upstream_absolute_url.to_string();
+    }
     format!("{base}/_ia/{host_and_path}")
 }
 
@@ -94,11 +94,14 @@ mod tests {
         );
     }
 
-    /// An empty base disables rewriting — the original URL is returned unchanged.
+    /// An empty base rewrites to Shirabe's own relative `/_ia/` route.
     #[test]
-    fn empty_base_is_noop() {
+    fn empty_base_rewrites_to_local_ia() {
         let upstream = "https://image.tmdb.org/t/p/original/abc.jpg";
-        assert_eq!(rewrite_through_caache("", upstream), upstream);
+        assert_eq!(
+            rewrite_through_caache("", upstream),
+            "/_ia/image.tmdb.org/t/p/original/abc.jpg"
+        );
     }
 
     /// A URL already pointing at caache is passed through unchanged (idempotent).

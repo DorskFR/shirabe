@@ -29,6 +29,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::{Cli, Command, Config};
 use crate::db::Pools;
+use crate::facades::coverart::CoverArtState;
 use crate::sources::Registry;
 use crate::sources::tvdb::TokenStore;
 
@@ -43,6 +44,10 @@ pub struct AppState {
     /// Shared in-memory TheTVDB bearer token, minted from the server-side key and
     /// reused by the `/v4` facade and the `tvdb` source.
     pub tvdb_tokens: TokenStore,
+    /// Native Cover Art Archive proxy state (HTTP client + on-disk byte cache +
+    /// single-flight locks) backing the `/release`, `/release-group`, and `/_ia`
+    /// routes.
+    pub coverart: CoverArtState,
 }
 
 impl AppState {
@@ -117,7 +122,8 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let bind = config.bind.clone();
     tracing::info!(bind = %bind, "starting shirabe");
-    let state = Arc::new(AppState { pools, config, registry, tvdb_tokens });
+    let coverart = CoverArtState::new(&config);
+    let state = Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart });
 
     let app = build_router(state);
 
@@ -141,7 +147,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Native-shape provider facades (routing skeletons; 501 until SHIB-4/5).
         // Kusaritoi points `tvdb.base_url` → …/v4 and `tmdb.base_url` → …/3.
         .merge(facades::tvdb::router())
-        .merge(facades::tmdb::router());
+        .merge(facades::tmdb::router())
+        .merge(facades::coverart::router());
 
     // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
     // self-generated `/debug/queries` page + `/debug/run` runner against the pools.

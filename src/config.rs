@@ -152,10 +152,40 @@ pub struct Config {
     /// route through caache's `/_ia/<host>/<path>` passthrough so the bytes are
     /// fetched + cached there (Shirabe stays stateless on image bytes). These URLs
     /// land in the browser/UI, so this is the public host, not the in-cluster svc.
-    /// When unset/empty, rewriting is DISABLED — original upstream URLs are emitted
-    /// unchanged (graceful no-op).
-    #[arg(long, env = "SHIRABE_CAACHE_BASE_URL", default_value = "https://caache.dorsk.dev")]
+    /// When empty, URLs are rewritten to Shirabe's OWN relative `/_ia/<host>/<path>`
+    /// route (the native Cover Art Archive proxy folded in from `caache`), so image
+    /// bytes are fetched + cached by Shirabe itself with no separate proxy.
+    #[arg(long, env = "SHIRABE_CAACHE_BASE_URL", default_value = "")]
     pub caache_base_url: Option<String>,
+
+    /// Filesystem directory backing the native Cover Art Archive byte cache
+    /// (`/_ia/<host>/<path>` passthrough). Should live on a PVC so cached image
+    /// bytes survive restarts; nginx-equivalent to `caache`'s on-disk cache.
+    #[arg(long, env = "SHIRABE_COVERART_CACHE_DIR", default_value = "/var/cache/shirabe/coverart")]
+    pub coverart_cache_dir: String,
+
+    /// Soft upper bound (bytes) on the on-disk Cover Art byte cache. When a write
+    /// pushes the cache over this, the oldest entries (by mtime) are evicted until
+    /// it is back under. Default ~9 GiB.
+    #[arg(long, env = "SHIRABE_COVERART_CACHE_MAX_BYTES", default_value_t = 9_663_676_416)]
+    pub coverart_cache_max_bytes: u64,
+
+    /// Positive-cache TTL (seconds) for 200 image responses. Default 30 days.
+    #[arg(long, env = "SHIRABE_COVERART_POSITIVE_TTL_SECS", default_value_t = 2_592_000)]
+    pub coverart_positive_ttl_secs: u64,
+
+    /// Negative-cache TTL (seconds) for 404 responses. Default 6 hours.
+    #[arg(long, env = "SHIRABE_COVERART_NEGATIVE_TTL_SECS", default_value_t = 21_600)]
+    pub coverart_negative_ttl_secs: u64,
+
+    /// Upstream Cover Art Archive base for the `/release` and `/release-group`
+    /// redirect layer.
+    #[arg(
+        long,
+        env = "SHIRABE_COVERART_UPSTREAM_BASE",
+        default_value = "https://coverartarchive.org"
+    )]
+    pub coverart_upstream_base: String,
 }
 
 impl Config {

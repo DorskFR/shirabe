@@ -7,6 +7,8 @@
 //! - `/ws/2/*` — MusicBrainz ws/2 subset (implemented; see [`crate::handlers`]).
 //! - `/v4/*`   — TheTVDB v4 facade (implemented; see [`tvdb`]).
 //! - `/3/*`    — TMDB v3 facade (implemented; see [`tmdb`]).
+//! - `/release`, `/release-group`, `/_ia/*` — Cover Art Archive proxy (see
+//!   [`coverart`]), the native fold-in of the standalone `caache` image cache.
 //!
 //! Both the TVDB `/v4` (SHIB-7) and TMDB `/3` (SHIB-6) facades are cache-first over
 //! their respective `shirabe.*_cache` tables, with lazy upstream hydration using a
@@ -14,5 +16,6 @@
 //! key + optional PIN). The full contract is documented in
 //! `docs/shirabe-api-contract.md`.
 
+pub mod coverart;
 pub mod tmdb;
 pub mod tvdb;
