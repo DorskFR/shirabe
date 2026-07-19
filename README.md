@@ -29,6 +29,21 @@ All responses are JSON with MB's hyphenated keys (`artist-credit`,
 | `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases` | — | recording + releases |
 | `GET /health`, `GET /ws/2` | — | DB ping, `{"status":"ok"}` |
 
+### Provider prefixes and aliases
+
+Beyond ws/2, shirabe fronts several providers under their native API prefixes.
+Each native prefix is also served under a self-describing provider alias (the same
+handlers); embedded paths in responses stay canonical (native). Existing native
+prefixes remain the canonical form and are unchanged.
+
+| Provider | Native prefix | Alias |
+| --- | --- | --- |
+| MusicBrainz | `/ws/2/*` | `/musicbrainz/ws/2/*` |
+| TMDB | `/3/*` | `/tmdb/3/*` |
+| TheTVDB | `/v4/*` | `/tvdb/v4/*` |
+| fanart.tv | `/v3/*` | `/fanart/v3/*` |
+| Cover Art Archive | `/release`, `/release-group`, `/_ia/*` | `/coverart/...` |
+
 ### Scoring
 
 `score` (0-100) is synthesized from `pg_trgm` `similarity()` (0.0-1.0 scaled to
