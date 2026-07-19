@@ -259,12 +259,15 @@ fn rank_by_popularity(results: &mut Value) {
     }
 }
 
+/// Bump to invalidate stale cached search payloads when the result shape changes.
+const SEARCH_SHAPE_VERSION: u64 = 2;
+
 /// Hash a search query string to a stable cache id (search rows are keyed by id +
 /// kind like detail rows; the query has no numeric id of its own).
 fn search_cache_id(query: &str) -> i64 {
     // FNV-1a 64-bit, folded into the signed range. Deterministic across runs.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in query.as_bytes() {
+    for b in SEARCH_SHAPE_VERSION.to_le_bytes().iter().chain(query.as_bytes()) {
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -298,18 +301,62 @@ fn local_results_payload(hits: &[ScoredHit], kind: &str) -> Value {
     json!({ "results": results })
 }
 
+/// Search-result fields the local index cannot supply (it holds only
+/// id/name/popularity/adult); copied from a live duplicate during merge.
+const LIVE_ENRICH_KEYS: &[&str] = &[
+    "release_date",
+    "first_air_date",
+    "original_title",
+    "original_name",
+    "original_language",
+    "overview",
+    "vote_average",
+    "vote_count",
+    "genre_ids",
+    "video",
+    "backdrop_path",
+    "poster_path",
+];
+
+/// Fill any [`LIVE_ENRICH_KEYS`] missing (absent or `null`) from `local` with the
+/// value from the live `donor`. Local-authoritative fields (id, popularity, title)
+/// are left untouched.
+fn enrich_from_live(local: &mut Value, donor: &Value) {
+    let (Some(dst), Some(src)) = (local.as_object_mut(), donor.as_object()) else {
+        return;
+    };
+    for key in LIVE_ENRICH_KEYS {
+        let Some(v) = src.get(*key) else {
+            continue;
+        };
+        if dst.get(*key).is_none_or(Value::is_null) {
+            dst.insert((*key).to_string(), v.clone());
+        }
+    }
+}
+
 /// Merge a live TMDB `{results:[…]}` payload into an existing results array,
-/// deduping by `id` (local hits take precedence — they are already deployed-local
-/// truth), and re-rank the combined set by popularity.
+/// deduping by `id` (local hits take precedence for ranking truth — popularity,
+/// adult — but are enriched with the live result's richer search fields), and
+/// re-rank the combined set by popularity.
 fn merge_live_results(results: &mut Vec<Value>, live: &Value) {
-    use std::collections::HashSet;
-    let seen: HashSet<i64> =
-        results.iter().filter_map(|r| r.get("id").and_then(Value::as_i64)).collect();
+    use std::collections::HashMap;
+    let mut index: HashMap<i64, usize> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.get("id").and_then(Value::as_i64).map(|id| (id, i)))
+        .collect();
     if let Some(arr) = live.get("results").and_then(Value::as_array) {
         for item in arr {
-            let id = item.get("id").and_then(Value::as_i64);
-            if id.is_none_or(|id| !seen.contains(&id)) {
-                results.push(item.clone());
+            match item.get("id").and_then(Value::as_i64) {
+                Some(id) if index.contains_key(&id) => {
+                    enrich_from_live(&mut results[index[&id]], item);
+                }
+                Some(id) => {
+                    index.insert(id, results.len());
+                    results.push(item.clone());
+                }
+                None => results.push(item.clone()),
             }
         }
     }
@@ -608,6 +655,45 @@ mod tests {
         let ids: Vec<i64> = results.iter().map(|r| r["id"].as_i64().unwrap()).collect();
         assert_eq!(ids, vec![99, 11, 603]); // popularity-ranked, 603 kept its local copy
         assert_eq!(results[2]["title"], "The Matrix"); // local copy retained, not the dup
+    }
+
+    /// A live duplicate of a local hit enriches the local result with the richer
+    /// search fields (release_date &c.) it lacks, without overwriting local truth
+    /// (id, popularity, title) or clobbering fields already present locally.
+    #[test]
+    fn merge_live_results_enriches_local_duplicate() {
+        let mut results = vec![json!({ "id": 603, "title": "The Matrix", "popularity": 52.4 })];
+        let live = json!({ "results": [
+            {
+                "id": 603,
+                "title": "The Matrix (live)",
+                "popularity": 1.0,
+                "release_date": "1999-03-30",
+                "original_title": "The Matrix",
+                "original_language": "en",
+                "vote_average": 8.2,
+                "genre_ids": [28, 878],
+            }
+        ] });
+        merge_live_results(&mut results, &live);
+        assert_eq!(results.len(), 1);
+        let m = &results[0];
+        assert_eq!(m["release_date"], "1999-03-30");
+        assert_eq!(m["original_title"], "The Matrix");
+        assert_eq!(m["vote_average"], 8.2);
+        assert_eq!(m["genre_ids"], json!([28, 878]));
+        assert_eq!(m["title"], "The Matrix"); // local truth kept, not "(live)"
+        assert_eq!(m["popularity"], 52.4); // local popularity kept
+    }
+
+    /// A `null` local field is treated as absent and filled from the live donor.
+    #[test]
+    fn enrich_fills_null_but_keeps_present() {
+        let mut local = json!({ "id": 1, "release_date": null, "overview": "local" });
+        let donor = json!({ "release_date": "2001-01-01", "overview": "live" });
+        enrich_from_live(&mut local, &donor);
+        assert_eq!(local["release_date"], "2001-01-01");
+        assert_eq!(local["overview"], "local"); // present → not overwritten
     }
 
     /// Relative TMDB image paths in nested results are rewritten through caache;
