@@ -65,6 +65,12 @@ pub struct Config {
     #[arg(long, env = "TVDB_DATABASE_URL")]
     pub tvdb_database_url: Option<String>,
 
+    /// Postgres connection string for the writable `fanart` cache database
+    /// (`fanart_cache`). Optional so the API pod still boots when unset; only the
+    /// fanart.tv facade needs it.
+    #[arg(long, env = "FANART_DATABASE_URL")]
+    pub fanart_database_url: Option<String>,
+
     /// Address:port to bind the HTTP server to.
     #[arg(long, env = "SHIRABE_BIND", default_value = "0.0.0.0:8800")]
     pub bind: String,
@@ -136,6 +142,24 @@ pub struct Config {
     /// cache row older than this is treated as stale and re-fetched from upstream.
     #[arg(long, env = "TVDB_CACHE_TTL_DAYS", default_value_t = 7)]
     pub tvdb_cache_ttl_days: i64,
+
+    /// Server-side fanart.tv v3 project API key. Optional: when unset, the `/v3`
+    /// facade degrades gracefully (503-style error / cache-only) rather than
+    /// panicking, and the API server still boots and serves `/ws/2` + other
+    /// facades. Shirabe holds the real key here and never re-exposes it.
+    #[arg(long, env = "FANART_API_KEY")]
+    pub fanart_api_key: Option<String>,
+
+    /// Optional personal fanart.tv API key, sent as the `client_key` query param
+    /// alongside the project `api_key` (fanart.tv's supporter convention). Held
+    /// server-side; never re-exposed to clients.
+    #[arg(long, env = "FANART_PERSONAL_API_KEY")]
+    pub fanart_personal_api_key: Option<String>,
+
+    /// TTL (in days) for cached fanart.tv v3 payloads in the `fanart_cache` table. A
+    /// cache row older than this is treated as stale and re-fetched from upstream.
+    #[arg(long, env = "FANART_CACHE_TTL_DAYS", default_value_t = 7)]
+    pub fanart_cache_ttl_days: i64,
 
     /// Enable the opt-in SQL query explorer at `/debug/queries` (SHIB-21). OFF by
     /// default. When set, shirabe serves a self-generated page listing every SQL

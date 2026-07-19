@@ -32,6 +32,8 @@ const TMDB_SQL: &[&str] = &[
 ];
 /// Embedded migration SQL for the `tvdb` cache DB.
 const TVDB_SQL: &[&str] = &[include_str!("../migrations/tvdb/0001_tvdb_tables.sql")];
+/// Embedded migration SQL for the `fanart` cache DB.
+const FANART_SQL: &[&str] = &[include_str!("../migrations/fanart/0001_fanart_tables.sql")];
 /// Embedded migration SQL for the `musicbrainz` mirror (the pg_trgm GIN + FTS
 /// index layer shirabe adds on top of the replicated MB schema). Applied against
 /// `DATABASE_URL`. Idempotent (`CREATE INDEX IF NOT EXISTS`), so on a mirror that
@@ -47,7 +49,7 @@ const MUSICBRAINZ_SQL: &[&str] = &[
 /// (non-CONCURRENTLY) `CREATE INDEX`, so it is migrated only when named explicitly
 /// (`shirabe migrate musicbrainz`) — never implicitly on every deploy, so a heavy
 /// index build can't lock the live mirror unexpectedly.
-const MIGRATABLE: &[&str] = &["shirabe", "imdb", "tmdb", "tvdb"];
+const MIGRATABLE: &[&str] = &["shirabe", "imdb", "tmdb", "tvdb", "fanart"];
 
 /// Resolve a db id to its embedded migration SQL files (in apply order). Every
 /// file is idempotent DDL, so all files are (re)applied on each run — a fresh DB
@@ -60,6 +62,7 @@ fn embedded_sql(db: &str) -> Option<&'static [&'static str]> {
         "imdb" => Some(IMDB_SQL),
         "tmdb" => Some(TMDB_SQL),
         "tvdb" => Some(TVDB_SQL),
+        "fanart" => Some(FANART_SQL),
         "musicbrainz" => Some(MUSICBRAINZ_SQL),
         _ => None,
     }
@@ -74,6 +77,7 @@ fn db_url<'a>(config: &'a Config, db: &str) -> Option<&'a str> {
         "imdb" => config.imdb_database_url.as_deref(),
         "tmdb" => config.tmdb_database_url.as_deref(),
         "tvdb" => config.tvdb_database_url.as_deref(),
+        "fanart" => config.fanart_database_url.as_deref(),
         "musicbrainz" => Some(&config.database_url),
         _ => None,
     }
@@ -148,6 +152,7 @@ mod tests {
         assert!(joined("imdb").contains("imdb_title_basics"));
         assert!(joined("tmdb").contains("tmdb_id_index"));
         assert!(joined("tvdb").contains("tvdb_cache"));
+        assert!(joined("fanart").contains("fanart_cache"));
         // musicbrainz maps to the mirror index layer (pg_trgm GIN + FTS), but is
         // excluded from `migrate all` (see `MIGRATABLE`).
         assert!(joined("musicbrainz").contains("to_tsvector"));
