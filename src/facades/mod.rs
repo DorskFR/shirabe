@@ -11,6 +11,18 @@
 //! - `/release`, `/release-group`, `/_ia/*` — Cover Art Archive proxy (see
 //!   [`coverart`]), the native fold-in of the standalone `caache` image cache.
 //!
+//! Each native prefix is also served under a self-describing provider alias (the
+//! same router, nested) so operators need not know the upstream's version number.
+//! Both forms hit the same handlers; embedded paths stay canonical (native):
+//!
+//! | native                        | alias                        |
+//! | ----------------------------- | ---------------------------- |
+//! | `/ws/2/*`                     | `/musicbrainz/ws/2/*`        |
+//! | `/3/*`                        | `/tmdb/3/*`                  |
+//! | `/v4/*`                       | `/tvdb/v4/*`                 |
+//! | `/v3/*`                       | `/fanart/v3/*`               |
+//! | `/release`, `/release-group`, `/_ia/*` | `/coverart/…`       |
+//!
 //! Both the TVDB `/v4` (SHIB-7) and TMDB `/3` (SHIB-6) facades are cache-first over
 //! their respective `shirabe.*_cache` tables, with lazy upstream hydration using a
 //! server-side key (TVDB additionally mints its own bearer token from the project

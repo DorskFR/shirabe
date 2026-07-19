@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "shirabe"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1739,6 +1739,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

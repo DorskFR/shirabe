@@ -134,10 +134,10 @@ async fn serve(
     Ok(())
 }
 
-fn build_router(state: Arc<AppState>) -> Router {
-    let app = Router::new()
-        .route("/health", get(handlers::health))
-        .route("/health/sources", get(handlers::health_sources))
+/// MusicBrainz ws/2 routes, mounted both natively and under the `/musicbrainz`
+/// alias. Excludes `/health` and `/health/sources`, which stay at the root only.
+fn ws2_router() -> Router<Arc<AppState>> {
+    Router::new()
         .route("/ws/2", get(handlers::health))
         .route("/ws/2/artist", get(handlers::search_artist))
         .route("/ws/2/artist/{mbid}", get(handlers::lookup_artist))
@@ -145,12 +145,22 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/ws/2/release/{mbid}", get(handlers::lookup_release))
         .route("/ws/2/recording", get(handlers::search_recording))
         .route("/ws/2/recording/{mbid}", get(handlers::lookup_recording))
-        // Native-shape provider facades (routing skeletons; 501 until SHIB-4/5).
-        // Kusaritoi points `tvdb.base_url` → …/v4 and `tmdb.base_url` → …/3.
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    let app = Router::new()
+        .route("/health", get(handlers::health))
+        .route("/health/sources", get(handlers::health_sources))
+        .merge(ws2_router())
+        .nest("/musicbrainz", ws2_router())
         .merge(facades::tvdb::router())
+        .nest("/tvdb", facades::tvdb::router())
         .merge(facades::tmdb::router())
+        .nest("/tmdb", facades::tmdb::router())
         .merge(facades::fanart::router())
-        .merge(facades::coverart::router());
+        .nest("/fanart", facades::fanart::router())
+        .merge(facades::coverart::router())
+        .nest("/coverart", facades::coverart::router());
 
     // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
     // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
@@ -161,4 +171,65 @@ fn build_router(state: Arc<AppState>) -> Router {
         // `tower_http=debug` in RUST_LOG to see every ws/2 call.
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use clap::Parser;
+    use tower::ServiceExt;
+
+    use super::{AppState, build_router};
+    use crate::config::Cli;
+    use crate::db::{Pools, connect_lazy};
+    use crate::facades::coverart::CoverArtState;
+    use crate::sources::Registry;
+    use crate::sources::tvdb::TokenStore;
+
+    fn test_state() -> std::sync::Arc<AppState> {
+        // Lazy pool: never connects, so the router builds without a live DB.
+        let cli = Cli::try_parse_from(["shirabe", "--database-url", "postgres://x/x"]).unwrap();
+        let config = cli.config;
+        let pools = Pools {
+            musicbrainz: connect_lazy("postgres://x/x", 1).unwrap(),
+            shirabe: None,
+            imdb: None,
+            tmdb: None,
+            tvdb: None,
+            fanart: None,
+        };
+        let tvdb_tokens = TokenStore::new();
+        let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
+        let coverart = CoverArtState::new(&config);
+        std::sync::Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+    }
+
+    async fn routes(path: &str) -> StatusCode {
+        let app = build_router(test_state());
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// Every provider alias must reach a handler (non-404), proving the route is
+    /// wired. Handlers may 5xx without a DB; only 404 would mean an unwired alias.
+    #[tokio::test]
+    async fn alias_routes_are_wired() {
+        for path in [
+            "/musicbrainz/ws/2/artist",
+            "/tmdb/3/movie/1",
+            "/tvdb/v4/series/1",
+            "/fanart/v3/movies/1",
+            "/coverart/release/1",
+        ] {
+            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "alias not wired: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prefixes_still_wired() {
+        for path in ["/ws/2/artist", "/3/movie/1", "/v4/series/1", "/v3/movies/1", "/release/1"] {
+            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "native not wired: {path}");
+        }
+    }
 }
