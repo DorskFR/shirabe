@@ -296,7 +296,10 @@ mod tests {
     #[tokio::test]
     async fn cover_release_rejects_unknown_spec() {
         let uuid = "0e52bbb7-26b3-420f-9336-d721b7b801de";
-        assert_eq!(routes(&format!("/cover/release/{uuid}/sideways")).await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            routes(&format!("/cover/release/{uuid}/sideways")).await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
