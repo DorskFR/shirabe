@@ -147,16 +147,30 @@ fn ws2_router() -> Router<Arc<AppState>> {
         .route("/ws/2/recording/{mbid}", get(handlers::lookup_recording))
 }
 
+fn music_alias_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/artist", get(handlers::search_artist))
+        .route("/artist/{mbid}", get(handlers::lookup_artist))
+        .route("/release", get(handlers::search_release))
+        .route("/release/{mbid}", get(handlers::lookup_release))
+        .route("/recording", get(handlers::search_recording))
+        .route("/recording/{mbid}", get(handlers::lookup_recording))
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/health/sources", get(handlers::health_sources))
         .merge(ws2_router())
         .nest("/musicbrainz", ws2_router())
+        .nest("/music", music_alias_router())
         .merge(facades::tvdb::router())
         .nest("/tvdb", facades::tvdb::router())
+        .nest("/tv", facades::tvdb::alias_router())
         .merge(facades::tmdb::router())
         .nest("/tmdb", facades::tmdb::router())
+        .nest("/movie", facades::tmdb::alias_router())
+        .nest("/movies", facades::tmdb::alias_router())
         .merge(facades::fanart::router())
         .nest("/fanart", facades::fanart::router())
         .merge(facades::coverart::router())
@@ -223,6 +237,32 @@ mod tests {
             "/coverart/release/1",
         ] {
             assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "alias not wired: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stripped_alias_roots_are_wired() {
+        for path in [
+            "/music/artist",
+            "/music/artist/1",
+            "/music/release",
+            "/music/release/1",
+            "/music/recording",
+            "/music/recording/1",
+            "/tv/search",
+            "/tv/series/1",
+            "/tv/series/1/extended",
+            "/tv/series/1/episodes/official",
+            "/tv/movies/1",
+            "/movie/search/movie",
+            "/movie/search/tv",
+            "/movie/movie/1",
+            "/movie/tv/1",
+            "/movie/tv/1/season/1",
+            "/movies/search/movie",
+            "/movies/movie/1",
+        ] {
+            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "stripped alias not wired: {path}");
         }
     }
 
