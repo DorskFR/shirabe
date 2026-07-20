@@ -232,6 +232,8 @@ mod tests {
     async fn alias_routes_are_wired() {
         for path in [
             "/musicbrainz/ws/2/artist",
+            "/tmdb/3/configuration",
+            "/movie/configuration",
             "/tmdb/3/movie/1",
             "/tvdb/v4/series/1",
             "/fanart/v3/movies/1",
