@@ -50,8 +50,33 @@ category. The same handlers back both forms; native prefixes and the
 | `/movie` | `/3` | `/movie/search/movie`, `/movie/search/tv`, `/movie/movie/{id}`, `/movie/tv/{id}`, `/movie/tv/{id}/season/{n}` |
 
 `/movie` is primary; `/movies` is mounted as an equivalent alias. Cover Art Archive
-and fanart.tv are **not** mounted under a category root (covers move to a `/cover`
-namespace in SHIB-32).
+and fanart.tv are **not** mounted under a category root — artwork has its own
+`/cover` namespace (§4.1).
+
+### 4.1 Cover namespace (`/cover`) — implemented (SHIB-32)
+
+Covers get their own namespace, decoupled from the metadata category roots. Shirabe
+acts as a proxy cache over **all** artwork sources (Cover Art Archive, fanart.tv,
+Wikimedia via MusicBrainz url-rels), not a per-provider facade: it owns source
+selection, fallback, and caching, and returns image **bytes** (not a redirect).
+
+| Endpoint | Resolution chain |
+|---|---|
+| `GET /cover/artist/{mbid}` | fanart.tv `artistthumb` → `artistbackground`; fallback MusicBrainz `image` url-rel (Wikimedia file page → `Special:FilePath`) |
+| `GET /cover/release/{mbid}` | Cover Art Archive `front-500`; fallback fanart album `albumcover`/`cdart` (`/v3/music/albums/{mbid}`) |
+| `GET /cover/tv/{id}` | fanart.tv `tvposter` → `clearart` → `showbackground` |
+| `GET /cover/movie/{id}` | fanart.tv `movieposter` → `moviebackground` |
+
+- `{mbid}` must be a MusicBrainz UUID (invalid → `400`).
+- Hits: image bytes + `Content-Type` + long-lived `Cache-Control`.
+- Definitive miss (sources reachable, no art): `404` (negative-cached), so
+  consumers render a placeholder.
+- Sources unavailable (no key / upstream / DB error): `5xx`, not negative-cached.
+- Both the chosen upstream URL (per entity) and the fetched bytes are cached on disk
+  through the shared Cover Art byte cache (`SHIRABE_COVERART_*` tunables); the byte
+  fetch follows upstream redirects (CAA → archive.org, Wikimedia `Special:FilePath`)
+  server-side under the same SSRF host guard as `/_ia`. fanart.tv payloads reuse the
+  `fanart_cache` table (TTL `FANART_CACHE_TTL_DAYS`).
 
 ## 2. MusicBrainz ws/2 facade (`/ws/2`) — implemented
 
