@@ -36,6 +36,23 @@ Cross-provider IDs are surfaced **inside** the native shapes (TMDB
 `external_ids.imdb_id`, TVDB `remoteIds`), backed by `shirabe.xref` — so
 Kusaritoi's existing parsing picks them up with no new endpoint.
 
+### 1.1 Category alias roots
+
+Every native prefix is also served under a self-describing **category root** with
+the version segment stripped, so operators can configure one clean base URL per
+category. The same handlers back both forms; native prefixes and the
+`/musicbrainz`, `/tvdb`, `/tmdb` provider aliases stay unchanged.
+
+| Category root | Native prefix | Endpoints |
+|---|---|---|
+| `/music` | `/ws/2` | `/music/artist`, `/music/artist/{mbid}`, `/music/release`, `/music/release/{mbid}`, `/music/recording`, `/music/recording/{mbid}` |
+| `/tv` | `/v4` | `/tv/login` (POST), `/tv/search`, `/tv/series/{id}`, `/tv/series/{id}/extended`, `/tv/series/{id}/episodes/{season_type}`, `/tv/movies/{id}` |
+| `/movie` | `/3` | `/movie/search/movie`, `/movie/search/tv`, `/movie/movie/{id}`, `/movie/tv/{id}`, `/movie/tv/{id}/season/{n}` |
+
+`/movie` is primary; `/movies` is mounted as an equivalent alias. Cover Art Archive
+and fanart.tv are **not** mounted under a category root (covers move to a `/cover`
+namespace in SHIB-32).
+
 ## 2. MusicBrainz ws/2 facade (`/ws/2`) — implemented
 
 Already served from the read-only `musicbrainz` mirror via `pg_trgm`. `score`

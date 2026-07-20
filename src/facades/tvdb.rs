@@ -91,6 +91,16 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v4/movies/{id}", get(movie))
 }
 
+pub fn alias_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/login", post(login))
+        .route("/search", get(search))
+        .route("/series/{id}", get(series))
+        .route("/series/{id}/extended", get(series_extended))
+        .route("/series/{id}/episodes/{season_type}", get(series_episodes))
+        .route("/movies/{id}", get(movie))
+}
+
 /// Is a cache row fresh? `age_secs` is `now - fetched_at`; rows at/under the TTL
 /// (in days) are served, older rows are re-fetched. A non-positive TTL disables
 /// caching (always stale). The live freshness test runs in SQL; this pure mirror

@@ -36,13 +36,18 @@ Each native prefix is also served under a self-describing provider alias (the sa
 handlers); embedded paths in responses stay canonical (native). Existing native
 prefixes remain the canonical form and are unchanged.
 
-| Provider | Native prefix | Alias |
-| --- | --- | --- |
-| MusicBrainz | `/ws/2/*` | `/musicbrainz/ws/2/*` |
-| TMDB | `/3/*` | `/tmdb/3/*` |
-| TheTVDB | `/v4/*` | `/tvdb/v4/*` |
-| fanart.tv | `/v3/*` | `/fanart/v3/*` |
-| Cover Art Archive | `/release`, `/release-group`, `/_ia/*` | `/coverart/...` |
+| Provider | Native prefix | Provider alias | Category root |
+| --- | --- | --- | --- |
+| MusicBrainz | `/ws/2/*` | `/musicbrainz/ws/2/*` | `/music/*` |
+| TMDB | `/3/*` | `/tmdb/3/*` | `/movie/*` (also `/movies/*`) |
+| TheTVDB | `/v4/*` | `/tvdb/v4/*` | `/tv/*` |
+| fanart.tv | `/v3/*` | `/fanart/v3/*` | — |
+| Cover Art Archive | `/release`, `/release-group`, `/_ia/*` | `/coverart/...` | — |
+
+Category roots are self-describing base URLs with the version segment stripped:
+`GET /music/artist`, `GET /tv/series/{id}`, `GET /movie/search/movie`. They map to
+the same handlers as the native prefixes (`/ws/2`, `/v4`, `/3` respectively). CAA
+and fanart are not mounted under a category root.
 
 ### Scoring
 
