@@ -9,12 +9,13 @@
 //! - `/cover/artist/{mbid}` — fanart.tv artist images (prefer `artistthumb`, then
 //!   `artistbackground`), falling back to the MusicBrainz `image` url-relation
 //!   (Wikimedia file pages mapped to `Special:FilePath`).
-//! - `/cover/release/{mbid}` — Cover Art Archive `front-500`, fanart album art
-//!   (`/v3/music/albums/{mbid}` → `albumcover`) as fallback.
-//! - `/cover/tv/{id}` — fanart.tv `/v3/tv/{id}` (`tvposter`, then `clearart` /
-//!   `showbackground`).
-//! - `/cover/movie/{id}` — fanart.tv `/v3/movies/{id}` (`movieposter`, then
-//!   `moviebackground`).
+//! - `/cover/release/{mbid}` (and `/release/{mbid}/{spec}`, spec ∈ [`CAA_SPECS`],
+//!   default `front-500`) — Cover Art Archive, fanart album art
+//!   (`/v3/music/albums/{mbid}` → `albumcover`) as a front-cover fallback.
+//! - `/cover/tv/{id}` — TheTVDB series `image`, fanart.tv `/v3/tv/{id}`
+//!   (`tvposter` / `clearart` / `showbackground`) as fallback.
+//! - `/cover/movie/{id}` — TMDB `poster_path`, fanart.tv `/v3/movies/{id}`
+//!   (`movieposter` / `moviebackground`) as fallback.
 //!
 //! Both the chosen upstream URL (per entity) and the fetched bytes are cached on
 //! disk through [`crate::facades::coverart::CoverArtState`]; misses are
@@ -52,9 +53,14 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/artist/{mbid}", get(artist))
         .route("/release/{mbid}", get(release))
+        .route("/release/{mbid}/{spec}", get(release_spec))
         .route("/tv/{id}", get(tv))
         .route("/movie/{id}", get(movie))
 }
+
+/// Allowed Cover Art Archive size/side specs. `front-500` is the default when the
+/// bare `/release/{mbid}` route is hit.
+const CAA_SPECS: &[&str] = &["front", "front-250", "front-500", "front-1200", "back"];
 
 async fn artist(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) -> Response {
     let Ok(gid) = Uuid::parse_str(&mbid) else {
@@ -69,15 +75,29 @@ async fn artist(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) ->
 }
 
 async fn release(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) -> Response {
-    if Uuid::parse_str(&mbid).is_err() {
+    release_inner(&state, &mbid, "front-500").await
+}
+
+async fn release_spec(
+    State(state): State<Arc<AppState>>,
+    Path((mbid, spec)): Path<(String, String)>,
+) -> Response {
+    if !CAA_SPECS.contains(&spec.as_str()) {
+        return (StatusCode::BAD_REQUEST, "invalid cover spec").into_response();
+    }
+    release_inner(&state, &mbid, &spec).await
+}
+
+async fn release_inner(state: &Arc<AppState>, mbid: &str, spec: &str) -> Response {
+    if Uuid::parse_str(mbid).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid release mbid").into_response();
     }
-    let key = format!("cover:release:{mbid}");
+    let key = format!("cover:release:{mbid}:{spec}");
     if let Some(cached) = state.coverart.resolution_get(&key).await {
-        return respond_cached(&state, cached).await;
+        return respond_cached(state, cached).await;
     }
-    let resolution = resolve_release(&state, &mbid).await;
-    finish(&state, &key, resolution).await
+    let resolution = resolve_release(state, mbid, spec).await;
+    finish(state, &key, resolution).await
 }
 
 async fn tv(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -149,15 +169,17 @@ async fn resolve_artist(state: &Arc<AppState>, mbid: &str, gid: Uuid) -> Resolut
     }
 }
 
-async fn resolve_release(state: &Arc<AppState>, mbid: &str) -> Resolution {
-    let caa = format!("{}/release/{mbid}/front-500", state.coverart.upstream_base());
+async fn resolve_release(state: &Arc<AppState>, mbid: &str, spec: &str) -> Resolution {
+    let caa = format!("{}/release/{mbid}/{spec}", state.coverart.upstream_base());
     match state.coverart.fetch_cover_bytes(&caa).await.0 {
         StatusCode::OK => return Resolution::Found(caa),
         StatusCode::NOT_FOUND => {}
         _ => return Resolution::Unavailable,
     }
-    if let Some(payload) =
-        fanart::fetch_raw(state, mbid, "music_albums", &format!("music/albums/{mbid}")).await
+    // fanart album art is a front-cover fallback only; side/back specs have none.
+    if spec.starts_with("front")
+        && let Some(payload) =
+            fanart::fetch_raw(state, mbid, "music_albums", &format!("music/albums/{mbid}")).await
     {
         return album_cover_url(&payload, mbid).map_or(Resolution::Artless, Resolution::Found);
     }
@@ -165,6 +187,9 @@ async fn resolve_release(state: &Arc<AppState>, mbid: &str) -> Resolution {
 }
 
 async fn resolve_tv(state: &Arc<AppState>, id: &str) -> Resolution {
+    if let Some(url) = crate::facades::tvdb::series_image_url(state, id).await {
+        return Resolution::Found(url);
+    }
     let Some(payload) = fanart::fetch_raw(state, id, "tv", &format!("tv/{id}")).await else {
         return Resolution::Unavailable;
     };
@@ -175,6 +200,9 @@ async fn resolve_tv(state: &Arc<AppState>, id: &str) -> Resolution {
 }
 
 async fn resolve_movie(state: &Arc<AppState>, id: &str) -> Resolution {
+    if let Some(url) = crate::facades::tmdb::movie_poster_url(state, id).await {
+        return Resolution::Found(url);
+    }
     let Some(payload) = fanart::fetch_raw(state, id, "movies", &format!("movies/{id}")).await
     else {
         return Resolution::Unavailable;

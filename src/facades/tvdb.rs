@@ -428,6 +428,23 @@ async fn series_detail(state: &Arc<AppState>, id_raw: &str, extended: bool) -> R
     }
 }
 
+/// Primary poster/artwork URL (absolute `artworks.thetvdb.com`) for a series,
+/// for the `/cover/tv` facade. Reuses the cached series detail; `None` when the
+/// id is invalid, the key is unset, or the series carries no `image`.
+pub async fn series_image_url(state: &Arc<AppState>, id_raw: &str) -> Option<String> {
+    let id = numeric_id(id_raw)?;
+    let payload = if let Some(p) = cache_get(state, id, "series").await {
+        p
+    } else {
+        state.config.tvdb_api_key.as_ref()?;
+        let p = upstream_get(state, &format!("series/{id}"), &[]).await.ok()?;
+        cache_put(state, id, "series", &p).await;
+        self_link_remote_ids(state, id, &p).await;
+        p
+    };
+    payload.get("data")?.get("image")?.as_str().filter(|s| !s.is_empty()).map(ToString::to_string)
+}
+
 /// `GET /v4/series/{id}`.
 async fn series(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     series_detail(&state, &id, false).await
