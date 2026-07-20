@@ -147,6 +147,8 @@ fn ws2_router() -> Router<Arc<AppState>> {
         .route("/ws/2/recording/{mbid}", get(handlers::lookup_recording))
 }
 
+/// `/music`: stripped `/artist|/release|/recording` shortcuts plus the full
+/// `/ws/2` tree, so a ws/2 client can point its base at `/music`.
 fn music_alias_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/artist", get(handlers::search_artist))
@@ -155,6 +157,7 @@ fn music_alias_router() -> Router<Arc<AppState>> {
         .route("/release/{mbid}", get(handlers::lookup_release))
         .route("/recording", get(handlers::search_recording))
         .route("/recording/{mbid}", get(handlers::lookup_recording))
+        .merge(ws2_router())
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
@@ -252,6 +255,10 @@ mod tests {
             "/music/release/1",
             "/music/recording",
             "/music/recording/1",
+            "/music/ws/2/artist",
+            "/music/ws/2/artist/1",
+            "/music/ws/2/release",
+            "/music/ws/2/recording",
             "/tv/search",
             "/tv/series/1",
             "/tv/series/1/extended",
