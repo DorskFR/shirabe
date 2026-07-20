@@ -38,6 +38,12 @@ use crate::config::Config;
 /// Header advertising cache disposition (`HIT` served from disk, `MISS` fetched).
 const CACHE_STATUS: &str = "x-cache-status";
 
+/// Marks a `/cover` resolution-cache entry: the body is the chosen upstream URL
+/// (empty for a negative), not image bytes.
+const RESOLUTION_CT: &str = "application/x-shirabe-cover-resolution";
+
+const MAX_COVER_REDIRECTS: u8 = 6;
+
 /// Runtime state for the Cover Art facade: the redirect-disabled HTTP client, the
 /// on-disk byte cache parameters, and the per-key single-flight lock table.
 pub struct CoverArtState {
@@ -80,6 +86,100 @@ impl CoverArtState {
     fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut map = self.locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key.to_string()).or_default().clone()
+    }
+
+    /// Upstream Cover Art Archive base, for the `/cover/release` resolver.
+    #[must_use]
+    pub fn upstream_base(&self) -> &str {
+        &self.upstream_base
+    }
+
+    /// Fetch a resolved absolute image URL, following redirects (guarding each hop)
+    /// and caching the resulting bytes on disk keyed by `url`. Returns the final
+    /// `(status, content_type, bytes)`; only 200 and 404 are cached.
+    pub async fn fetch_cover_bytes(&self, url: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let key = format!("cover-bytes:{url}");
+        if let Some(hit) = cache_get(self, &key).await {
+            return hit;
+        }
+        let lock = self.lock_for(&key);
+        let _guard = lock.lock().await;
+        if let Some(hit) = cache_get(self, &key).await {
+            return hit;
+        }
+        let (status, ct, body) = self.fetch_following_redirects(url).await;
+        if status == StatusCode::OK || status == StatusCode::NOT_FOUND {
+            cache_put(self, &key, status.as_u16(), ct.as_deref(), &body).await;
+        }
+        (status, ct, body)
+    }
+
+    async fn fetch_following_redirects(&self, url: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut current = url.to_string();
+        for _ in 0..MAX_COVER_REDIRECTS {
+            let Ok(parsed) = reqwest::Url::parse(&current) else {
+                return (StatusCode::BAD_GATEWAY, None, Vec::new());
+            };
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return (StatusCode::BAD_GATEWAY, None, Vec::new());
+            }
+            let Some(host) = parsed.host_str() else {
+                return (StatusCode::BAD_GATEWAY, None, Vec::new());
+            };
+            if let Err(reason) = guard_host(host).await {
+                tracing::warn!(host, reason, "cover fetch host rejected");
+                return (StatusCode::BAD_GATEWAY, None, Vec::new());
+            }
+            let resp = match self.client.get(parsed.clone()).send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::warn!(error = %e, url = %current, "cover fetch upstream failed");
+                    return (StatusCode::BAD_GATEWAY, None, Vec::new());
+                }
+            };
+            let status = to_axum_status(resp.status());
+            if status.is_redirection() {
+                let Some(next) = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|loc| parsed.join(loc).ok())
+                else {
+                    return (status, None, Vec::new());
+                };
+                current = next.into();
+                continue;
+            }
+            let ct = resp_content_type(&resp);
+            let body = match resp.bytes().await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cover fetch body read failed");
+                    return (StatusCode::BAD_GATEWAY, None, Vec::new());
+                }
+            };
+            return (status, ct, body);
+        }
+        (StatusCode::BAD_GATEWAY, None, Vec::new())
+    }
+
+    /// Read a cached `/cover` resolution: `Some(Some(url))` = chosen URL,
+    /// `Some(None)` = cached negative (artless), `None` = must resolve.
+    pub async fn resolution_get(&self, key: &str) -> Option<Option<String>> {
+        let (status, _ct, body) = cache_get(self, key).await?;
+        if status == StatusCode::OK {
+            Some(Some(String::from_utf8_lossy(&body).into_owned()))
+        } else {
+            Some(None)
+        }
+    }
+
+    /// Cache a `/cover` resolution: `Some(url)` positive (30d), `None` negative (6h).
+    pub async fn resolution_put(&self, key: &str, resolved: Option<&str>) {
+        match resolved {
+            Some(url) => cache_put(self, key, 200, Some(RESOLUTION_CT), url.as_bytes()).await,
+            None => cache_put(self, key, 404, Some(RESOLUTION_CT), &[]).await,
+        }
     }
 }
 

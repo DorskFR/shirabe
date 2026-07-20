@@ -174,7 +174,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .merge(facades::fanart::router())
         .nest("/fanart", facades::fanart::router())
         .merge(facades::coverart::router())
-        .nest("/coverart", facades::coverart::router());
+        .nest("/coverart", facades::coverart::router())
+        .nest("/cover", facades::cover::router());
 
     // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
     // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
@@ -262,7 +263,18 @@ mod tests {
             "/movies/search/movie",
             "/movies/movie/1",
         ] {
-            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "stripped alias not wired: {path}");
+            assert_ne!(
+                routes(path).await,
+                StatusCode::NOT_FOUND,
+                "stripped alias not wired: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cover_namespace_is_wired() {
+        for path in ["/cover/artist/1", "/cover/release/1", "/cover/tv/1", "/cover/movie/1"] {
+            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "cover not wired: {path}");
         }
     }
 
