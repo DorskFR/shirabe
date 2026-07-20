@@ -86,6 +86,7 @@ const API_BASE: &str = "https://api.themoviedb.org/3";
 /// Build the `/3` route group.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/3/configuration", get(configuration))
         .route("/3/search/tv", get(search_tv))
         .route("/3/search/movie", get(search_movie))
         .route("/3/tv/{id}", get(tv))
@@ -95,11 +96,29 @@ pub fn router() -> Router<Arc<AppState>> {
 
 pub fn alias_router() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/configuration", get(configuration))
         .route("/search/tv", get(search_tv))
         .route("/search/movie", get(search_movie))
         .route("/tv/{id}", get(tv))
         .route("/tv/{id}/season/{n}", get(tv_season))
         .route("/movie/{id}", get(movie))
+}
+
+/// `GET /3/configuration` → static TMDB image-config block, answered locally.
+async fn configuration() -> Response {
+    Json(json!({
+        "images": {
+            "base_url": "http://image.tmdb.org/t/p/",
+            "secure_base_url": "https://image.tmdb.org/t/p/",
+            "backdrop_sizes": ["w300", "w780", "w1280", "original"],
+            "logo_sizes": ["w45", "w92", "w154", "w185", "w300", "w500", "original"],
+            "poster_sizes": ["w92", "w154", "w185", "w342", "w500", "w780", "original"],
+            "profile_sizes": ["w45", "w185", "h632", "original"],
+            "still_sizes": ["w92", "w185", "w300", "original"]
+        },
+        "change_keys": []
+    }))
+    .into_response()
 }
 
 /// Is a cache row fresh? `age_secs` is `now - fetched_at`; rows at/under the TTL
