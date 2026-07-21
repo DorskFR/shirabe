@@ -169,11 +169,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .nest("/music", music_alias_router())
         .merge(facades::tvdb::router())
         .nest("/tvdb", facades::tvdb::router())
-        .nest("/tv", facades::tvdb::alias_router())
         .merge(facades::tmdb::router())
         .nest("/tmdb", facades::tmdb::router())
-        .nest("/movie", facades::tmdb::alias_router())
-        .nest("/movies", facades::tmdb::alias_router())
         .merge(facades::fanart::router())
         .nest("/fanart", facades::fanart::router())
         .merge(facades::coverart::router())
@@ -235,7 +232,6 @@ mod tests {
         for path in [
             "/musicbrainz/ws/2/artist",
             "/tmdb/3/configuration",
-            "/movie/configuration",
             "/tmdb/3/movie/1",
             "/tvdb/v4/series/1",
             "/fanart/v3/movies/1",
@@ -258,24 +254,19 @@ mod tests {
             "/music/ws/2/artist/1",
             "/music/ws/2/release",
             "/music/ws/2/recording",
-            "/tv/search",
-            "/tv/series/1",
-            "/tv/series/1/extended",
-            "/tv/series/1/episodes/official",
-            "/tv/movies/1",
-            "/movie/search/movie",
-            "/movie/search/tv",
-            "/movie/movie/1",
-            "/movie/tv/1",
-            "/movie/tv/1/season/1",
-            "/movies/search/movie",
-            "/movies/movie/1",
         ] {
             assert_ne!(
                 routes(path).await,
                 StatusCode::NOT_FOUND,
                 "stripped alias not wired: {path}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_media_type_aliases_are_gone() {
+        for path in ["/tv/series/1", "/movie/configuration", "/movie/movie/1", "/movies/movie/1"] {
+            assert_eq!(routes(path).await, StatusCode::NOT_FOUND, "alias should be gone: {path}");
         }
     }
 

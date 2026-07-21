@@ -445,10 +445,7 @@ mod tests {
     #[test]
     fn strips_nest_prefix_only_before_release_paths() {
         assert_eq!(strip_mount_prefix("/coverart/release/m/front-500"), "/release/m/front-500");
-        assert_eq!(
-            strip_mount_prefix("/coverart/release-group/m?x=1"),
-            "/release-group/m?x=1"
-        );
+        assert_eq!(strip_mount_prefix("/coverart/release-group/m?x=1"), "/release-group/m?x=1");
         assert_eq!(strip_mount_prefix("/release/m/front-500"), "/release/m/front-500");
         assert_eq!(strip_mount_prefix("/coverartist/x"), "/coverartist/x");
     }
