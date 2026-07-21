@@ -94,16 +94,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/3/movie/{id}", get(movie))
 }
 
-pub fn alias_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/configuration", get(configuration))
-        .route("/search/tv", get(search_tv))
-        .route("/search/movie", get(search_movie))
-        .route("/tv/{id}", get(tv))
-        .route("/tv/{id}/season/{n}", get(tv_season))
-        .route("/movie/{id}", get(movie))
-}
-
 /// `GET /3/configuration` → static TMDB image-config block, answered locally.
 async fn configuration() -> Response {
     Json(json!({
