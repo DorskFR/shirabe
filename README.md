@@ -47,27 +47,10 @@ prefixes remain the canonical form and are unchanged.
 Category roots are self-describing base URLs with the version segment stripped:
 `GET /music/artist`, `GET /tv/series/{id}`, `GET /movie/search/movie`. They map to
 the same handlers as the native prefixes (`/ws/2`, `/v4`, `/3` respectively). CAA
-and fanart are not mounted under a category root — artwork has its own `/cover`
-namespace (below).
-
-### Cover namespace (`/cover`)
-
-`/cover/*` is a universal artwork proxy cache, decoupled from the metadata category
-roots. Shirabe owns source selection, fallback, and caching across *all* artwork
-sources (Cover Art Archive, fanart.tv, Wikimedia via MusicBrainz url-rels); the
-consumer gets one URL that returns image bytes (never a redirect to upstream).
-
-| Endpoint | Resolution chain |
-| --- | --- |
-| `GET /cover/artist/{mbid}` | fanart.tv `artistthumb` → `artistbackground`, then MusicBrainz `image` url-rel (Wikimedia → `Special:FilePath`) |
-| `GET /cover/release/{mbid}` | Cover Art Archive `front-500`, then fanart album `albumcover` (`/v3/music/albums/{mbid}`) |
-| `GET /cover/tv/{id}` | fanart.tv `tvposter` → `clearart` → `showbackground` |
-| `GET /cover/movie/{id}` | fanart.tv `movieposter` → `moviebackground` |
-
-Hits return the image bytes with a `Content-Type` and a long-lived `Cache-Control`.
-Both the chosen upstream URL (per entity) and the fetched bytes are cached on disk
-(the shared Cover Art byte cache: `SHIRABE_COVERART_*`); definitive misses are
-negative-cached and return `404` so consumers can render a placeholder.
+and fanart are not mounted under a category root — they are consumed through their
+own dialect facades (`/coverart`, `/fanart`), and image URLs in facade payloads are
+rewritten to route through the `/_ia/<host>/<path>` byte proxy (SSRF-guarded,
+on-disk cached), so the consumer never streams large images straight from upstream.
 
 ### Scoring
 
