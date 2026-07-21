@@ -177,8 +177,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .merge(facades::fanart::router())
         .nest("/fanart", facades::fanart::router())
         .merge(facades::coverart::router())
-        .nest("/coverart", facades::coverart::router())
-        .nest("/cover", facades::cover::router());
+        .nest("/coverart", facades::coverart::router());
 
     // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
     // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
@@ -278,28 +277,6 @@ mod tests {
                 "stripped alias not wired: {path}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn cover_namespace_is_wired() {
-        for path in [
-            "/cover/artist/1",
-            "/cover/release/1",
-            "/cover/release/1/front-500",
-            "/cover/tv/1",
-            "/cover/movie/1",
-        ] {
-            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "cover not wired: {path}");
-        }
-    }
-
-    #[tokio::test]
-    async fn cover_release_rejects_unknown_spec() {
-        let uuid = "0e52bbb7-26b3-420f-9336-d721b7b801de";
-        assert_eq!(
-            routes(&format!("/cover/release/{uuid}/sideways")).await,
-            StatusCode::BAD_REQUEST
-        );
     }
 
     #[tokio::test]

@@ -496,22 +496,6 @@ async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str) -> Response {
     }
 }
 
-/// Absolute poster URL for a movie, for the `/cover/movie` facade. Reuses the
-/// cached movie detail; `None` for a non-numeric id, unset key, or no poster.
-pub async fn movie_poster_url(state: &Arc<AppState>, id_raw: &str) -> Option<String> {
-    let id = id_raw.parse::<i64>().ok()?;
-    let payload = if let Some(p) = cache_get(state, id, "movie").await {
-        p
-    } else {
-        let key = state.config.tmdb_api_key.as_deref()?;
-        let p = upstream_get(key, &format!("movie/{id}"), &[]).await.ok()?;
-        cache_put(state, id, "movie", &p).await;
-        p
-    };
-    let path = payload.get("poster_path")?.as_str().filter(|s| !s.is_empty())?;
-    Some(images::tmdb_poster_url(path))
-}
-
 /// `GET /3/search/tv?query=` → `{results:[{id,name,first_air_date,…}]}`.
 async fn search_tv(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
     search(&state, "tv", &params).await

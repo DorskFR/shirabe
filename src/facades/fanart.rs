@@ -217,28 +217,6 @@ async fn cached_fetch(state: &Arc<AppState>, key: &str, kind: &str, path: &str) 
     }
 }
 
-/// Cache-first raw fetch for internal consumers (the `/cover` resolver): serve a
-/// fresh cached row for `(key, kind)`, else fetch `path` once and cache it. Unlike
-/// [`cached_fetch`], asset URLs are NOT rewritten — the caller needs the raw
-/// upstream image URLs to fetch bytes. `None` when unconfigured/uncached or on
-/// upstream error.
-pub async fn fetch_raw(state: &Arc<AppState>, key: &str, kind: &str, path: &str) -> Option<Value> {
-    if let Some(cached) = cache_get(state, key, kind).await {
-        return Some(cached);
-    }
-    state.config.fanart_api_key.as_ref()?;
-    match upstream_get(state, path).await {
-        Ok(payload) => {
-            cache_put(state, key, kind, &payload).await;
-            Some(payload)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, kind, key, "fanart raw fetch failed");
-            None
-        }
-    }
-}
-
 /// `GET /v3/music/{mbid}` → artist artwork (`artistthumb`, `artistbackground`,
 /// `musiclogo`, `hdmusiclogo`, `musicbanner`, …).
 async fn music(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) -> Response {

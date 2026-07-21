@@ -29,7 +29,6 @@
 //! key + optional PIN). The full contract is documented in
 //! `docs/shirabe-api-contract.md`.
 
-pub mod cover;
 pub mod coverart;
 pub mod fanart;
 pub mod tmdb;
