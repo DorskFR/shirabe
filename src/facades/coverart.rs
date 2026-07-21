@@ -114,7 +114,7 @@ async fn release_group(state: State<Arc<AppState>>, uri: OriginalUri) -> Respons
 async fn redirect_layer(state: &AppState, uri: &OriginalUri) -> Response {
     let ca = &state.coverart;
     let pq = uri.path_and_query().map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
-    let url = format!("{}{pq}", ca.upstream_base);
+    let url = format!("{}{}", ca.upstream_base, strip_mount_prefix(pq));
 
     let resp = match ca.client.get(&url).send().await {
         Ok(resp) => resp,
@@ -299,6 +299,15 @@ const fn is_cache_fresh(status: u16, age_secs: u64, positive_ttl: u64, negative_
     age_secs <= ttl
 }
 
+/// `OriginalUri` keeps the `/coverart` nest prefix, which CAA upstream must not see.
+#[must_use]
+fn strip_mount_prefix(path_and_query: &str) -> &str {
+    match path_and_query.strip_prefix("/coverart") {
+        Some(rest) if rest.starts_with("/release") => rest,
+        _ => path_and_query,
+    }
+}
+
 /// Rewrite an absolute upstream redirect `Location` to the local `/_ia/` bounce so
 /// the client fetches the bytes back through this proxy. Non-absolute values pass
 /// through unchanged.
@@ -432,6 +441,17 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[test]
+    fn strips_nest_prefix_only_before_release_paths() {
+        assert_eq!(strip_mount_prefix("/coverart/release/m/front-500"), "/release/m/front-500");
+        assert_eq!(
+            strip_mount_prefix("/coverart/release-group/m?x=1"),
+            "/release-group/m?x=1"
+        );
+        assert_eq!(strip_mount_prefix("/release/m/front-500"), "/release/m/front-500");
+        assert_eq!(strip_mount_prefix("/coverartist/x"), "/coverartist/x");
+    }
 
     #[test]
     fn rewrites_caa_location_to_local_ia() {
