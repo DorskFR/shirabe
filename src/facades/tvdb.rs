@@ -39,7 +39,6 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
-use crate::sources::tvdb::API_BASE;
 use crate::sources::xref;
 use crate::{AppState, images, search};
 
@@ -239,8 +238,9 @@ async fn self_link_remote_ids(state: &AppState, tvdb_id: i64, payload: &Value) {
 }
 
 /// Perform an upstream TheTVDB v4 GET with the in-memory server bearer, returning
-/// the parsed JSON body. `path` is the endpoint path under [`API_BASE`] (no leading
-/// slash); `extra` are query pairs. Refreshes the token once on a 401 and retries.
+/// the parsed JSON body. `path` is the endpoint path under the configured API base
+/// (no leading slash); `extra` are query pairs. Refreshes the token once on a 401
+/// and retries.
 async fn upstream_get(
     state: &Arc<AppState>,
     path: &str,
@@ -250,7 +250,7 @@ async fn upstream_get(
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
-    let url = format!("{API_BASE}/{path}");
+    let url = format!("{}/{path}", state.config.tvdb_api_base.trim_end_matches('/'));
 
     let mut bearer = state.tvdb_tokens.bearer(&state.config).await?;
     for attempt in 0..2 {

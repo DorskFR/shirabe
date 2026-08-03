@@ -1,6 +1,6 @@
 [package]
 name = "shirabe"
-version = "0.4.24"
+version = "0.4.25"
 edition = "2024"
 license = "WTFPL"
 authors = ["DorskFR"]
@@ -17,6 +17,8 @@ cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 module_name_repetitions = "allow"
+too_long_first_doc_paragraph = "allow"
+implicit_hasher = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 doc_markdown = "allow"
@@ -44,3 +46,5 @@ tokio-util = { version = "0.7", features = ["io", "io-util"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
+tempfile = "3"

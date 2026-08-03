@@ -210,6 +210,34 @@ pub struct Config {
         default_value = "https://coverartarchive.org"
     )]
     pub coverart_upstream_base: String,
+
+    /// Upstream TMDB v3 API base. Override only for tests against a mock upstream.
+    #[arg(
+        long,
+        env = "TMDB_API_BASE",
+        default_value = "https://api.themoviedb.org/3",
+        hide = true
+    )]
+    pub tmdb_api_base: String,
+
+    /// Upstream TheTVDB v4 API base. Override only for tests against a mock upstream.
+    #[arg(long, env = "TVDB_API_BASE", default_value = "https://api4.thetvdb.com/v4", hide = true)]
+    pub tvdb_api_base: String,
+
+    /// Upstream fanart.tv v3 API base. Override only for tests against a mock upstream.
+    #[arg(
+        long,
+        env = "FANART_API_BASE",
+        default_value = "https://webservice.fanart.tv/v3",
+        hide = true
+    )]
+    pub fanart_api_base: String,
+
+    /// Test-only escape hatch for the `/_ia` byte layer: allow private/loopback
+    /// hosts and fetch over plain http, so a local mock upstream is reachable.
+    /// MUST stay off in any real deployment (disables the SSRF guard).
+    #[arg(long, env = "SHIRABE_COVERART_INSECURE_IA", default_value_t = false, hide = true)]
+    pub coverart_insecure_ia: bool,
 }
 
 impl Config {

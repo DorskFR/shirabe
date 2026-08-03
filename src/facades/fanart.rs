@@ -44,9 +44,6 @@ use sqlx::{PgPool, Row};
 
 use crate::{AppState, images};
 
-/// Upstream fanart.tv v3 API base.
-const API_BASE: &str = "https://webservice.fanart.tv/v3";
-
 /// fanart.tv JSON keys whose values are ABSOLUTE image URLs (on `assets.fanart.tv`).
 /// Every artwork entry exposes its bytes under a `url` field, with an optional
 /// smaller `preview`. When a caache base is configured each is rewritten to route
@@ -187,7 +184,7 @@ fn upstream_query(api_key: &str, client_key: Option<&str>) -> Vec<(&'static str,
 }
 
 /// Perform an upstream fanart.tv v3 GET, returning the parsed JSON body. `path` is
-/// the endpoint path under [`API_BASE`] (no leading slash). The held project
+/// the endpoint path under the configured API base (no leading slash). The held project
 /// `api_key` (and optional personal `client_key`) are appended as query params.
 async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamError> {
     let Some(api_key) = state.config.fanart_api_key.as_deref() else {
@@ -198,7 +195,7 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamErr
         .build()
         .map_err(|e| UpstreamError::Other(format!("http client: {e}")))?;
     let query = upstream_query(api_key, state.config.fanart_personal_api_key.as_deref());
-    let url = format!("{API_BASE}/{path}");
+    let url = format!("{}/{path}", state.config.fanart_api_base.trim_end_matches('/'));
     let resp = client
         .get(&url)
         .query(&query)
