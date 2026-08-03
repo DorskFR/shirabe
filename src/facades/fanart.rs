@@ -16,6 +16,13 @@
 //! stores the payload, and returns it. A second identical call is served from cache
 //! and never hits upstream.
 //!
+//! Client-supplied credentials (an `api-key` header or an `?api_key=` query param)
+//! are accepted and ignored: they never cause an error and never reach the upstream
+//! request or the cache key — Shirabe always uses its own server-side key.
+//!
+//! An upstream 404 passes through as 404 (authoritative "no artwork for this id",
+//! safe for consumers to negative-cache); other upstream failures surface as 502.
+//!
 //! Graceful degradation: when `FANART_API_KEY` is unset, a request that would need
 //! upstream returns a clean 503 in fanart.tv's `{status:"error", error message}`
 //! shape — never a panic — while cached rows are still served. The API server still
@@ -164,32 +171,72 @@ async fn cache_put(state: &AppState, key: &str, kind: &str, payload: &Value) {
     }
 }
 
+enum UpstreamError {
+    NotFound(Value),
+    Other(String),
+}
+
+/// The upstream query string, built ONLY from server-side config — client-supplied
+/// credentials never reach it.
+fn upstream_query(api_key: &str, client_key: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut query = vec![("api_key", api_key.to_string())];
+    if let Some(client_key) = client_key {
+        query.push(("client_key", client_key.to_string()));
+    }
+    query
+}
+
 /// Perform an upstream fanart.tv v3 GET, returning the parsed JSON body. `path` is
 /// the endpoint path under [`API_BASE`] (no leading slash). The held project
 /// `api_key` (and optional personal `client_key`) are appended as query params.
-async fn upstream_get(state: &AppState, path: &str) -> Result<Value, String> {
+async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamError> {
     let Some(api_key) = state.config.fanart_api_key.as_deref() else {
-        return Err("fanart.tv api key not configured".to_string());
+        return Err(UpstreamError::Other("fanart.tv api key not configured".to_string()));
     };
     let client = reqwest::Client::builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let mut query: Vec<(&str, String)> = vec![("api_key", api_key.to_string())];
-    if let Some(client_key) = state.config.fanart_personal_api_key.as_deref() {
-        query.push(("client_key", client_key.to_string()));
-    }
+        .map_err(|e| UpstreamError::Other(format!("http client: {e}")))?;
+    let query = upstream_query(api_key, state.config.fanart_personal_api_key.as_deref());
     let url = format!("{API_BASE}/{path}");
     let resp = client
         .get(&url)
         .query(&query)
         .send()
         .await
-        .map_err(|e| format!("upstream request: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("upstream status: {e}"))?;
-    let bytes = resp.bytes().await.map_err(|e| format!("upstream body: {e}"))?;
-    serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("upstream json: {e}"))
+        .map_err(|e| UpstreamError::Other(format!("upstream request: {e}")))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        let body = resp
+            .bytes()
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or_else(|| json!({ "status": "error", "error message": "not found" }));
+        return Err(UpstreamError::NotFound(body));
+    }
+    if !status.is_success() {
+        return Err(UpstreamError::Other(format!("upstream status: {status}")));
+    }
+    let bytes =
+        resp.bytes().await.map_err(|e| UpstreamError::Other(format!("upstream body: {e}")))?;
+    serde_json::from_slice::<Value>(&bytes)
+        .map_err(|e| UpstreamError::Other(format!("upstream json: {e}")))
+}
+
+fn upstream_failure_response(kind: &str, key: &str, err: UpstreamError) -> Response {
+    match err {
+        UpstreamError::NotFound(body) => (StatusCode::NOT_FOUND, Json(body)).into_response(),
+        UpstreamError::Other(e) => {
+            tracing::warn!(error = %e, kind, key, "fanart upstream failed");
+            fanart_error(StatusCode::BAD_GATEWAY, "fanart.tv upstream error")
+        }
+    }
+}
+
+fn success_response(caache_base: Option<&str>, mut payload: Value) -> Response {
+    rewrite_image_urls(caache_base, &mut payload);
+    Json(payload).into_response()
 }
 
 /// Shared cache-first handler: serve a fresh cached row for `(key, kind)`, else
@@ -197,23 +244,18 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, String> {
 /// URLs through caache. Degrades to a clean 503 when no key is configured and the
 /// row is not cached.
 async fn cached_fetch(state: &Arc<AppState>, key: &str, kind: &str, path: &str) -> Response {
-    if let Some(mut cached) = cache_get(state, key, kind).await {
-        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
-        return Json(cached).into_response();
+    if let Some(cached) = cache_get(state, key, kind).await {
+        return success_response(state.config.caache_base_url.as_deref(), cached);
     }
     if state.config.fanart_api_key.is_none() {
         return not_configured();
     }
     match upstream_get(state, path).await {
-        Ok(mut payload) => {
+        Ok(payload) => {
             cache_put(state, key, kind, &payload).await;
-            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
-            Json(payload).into_response()
+            success_response(state.config.caache_base_url.as_deref(), payload)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, kind, key, "fanart upstream failed");
-            fanart_error(StatusCode::BAD_GATEWAY, "fanart.tv upstream error")
-        }
+        Err(err) => upstream_failure_response(kind, key, err),
     }
 }
 
@@ -241,7 +283,40 @@ async fn tv(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use clap::Parser;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::config::Cli;
+    use crate::db::{Pools, connect_lazy};
+    use crate::facades::coverart::CoverArtState;
+    use crate::sources::Registry;
+    use crate::sources::tvdb::TokenStore;
+
+    fn test_state() -> Arc<AppState> {
+        let cli = Cli::try_parse_from(["shirabe", "--database-url", "postgres://x/x"]).unwrap();
+        let mut config = cli.config;
+        config.fanart_api_key = None;
+        let pools = Pools {
+            musicbrainz: connect_lazy("postgres://x/x", 1).unwrap(),
+            shirabe: None,
+            imdb: None,
+            tmdb: None,
+            tvdb: None,
+            fanart: None,
+        };
+        let tvdb_tokens = TokenStore::new();
+        let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
+        let coverart = CoverArtState::new(&config);
+        Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     /// TTL staleness: rows within the window are fresh; older or future-skewed rows
     /// are not; a non-positive TTL disables caching.
@@ -304,6 +379,90 @@ mod tests {
         assert_eq!(
             original["artistthumb"][0]["url"],
             "https://assets.fanart.tv/fanart/music/a/x.jpg"
+        );
+    }
+
+    /// A client-sent `api-key` header or `?api_key=` query param is accepted and
+    /// ignored: same clean response as a bare request, never a 4xx. With no
+    /// server-side key configured every variant degrades to the same 503.
+    #[tokio::test]
+    async fn client_credentials_accepted_and_ignored() {
+        let state = test_state();
+        let requests = [
+            Request::builder().uri("/v3/music/abc").body(Body::empty()).unwrap(),
+            Request::builder()
+                .uri("/v3/music/abc?api_key=client-supplied-key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/v3/music/abc")
+                .header("api-key", "client-supplied-key")
+                .body(Body::empty())
+                .unwrap(),
+        ];
+        for req in requests {
+            let app = router().with_state(state.clone());
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = body_json(resp).await;
+            assert_eq!(body["status"], "error");
+        }
+    }
+
+    /// The upstream query string comes only from server-side config.
+    #[test]
+    fn upstream_query_uses_only_server_side_keys() {
+        assert_eq!(upstream_query("server-key", None), vec![("api_key", "server-key".to_string())]);
+        assert_eq!(
+            upstream_query("server-key", Some("personal")),
+            vec![("api_key", "server-key".to_string()), ("client_key", "personal".to_string())]
+        );
+    }
+
+    /// An upstream 404 passes through as 404 with the upstream body, so consumers
+    /// can negative-cache the miss instead of retrying a transient-looking 502.
+    #[tokio::test]
+    async fn upstream_404_passes_through_as_404() {
+        let upstream_body = json!({ "status": "error", "error message": "id not found" });
+        let resp = upstream_failure_response(
+            "music",
+            "abc",
+            UpstreamError::NotFound(upstream_body.clone()),
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await, upstream_body);
+    }
+
+    /// Non-404 upstream failures stay 502 with the fanart-shaped error body.
+    #[tokio::test]
+    async fn other_upstream_failures_are_502() {
+        let resp =
+            upstream_failure_response("music", "abc", UpstreamError::Other("boom".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["error message"], "fanart.tv upstream error");
+    }
+
+    /// The upstream payload passes through verbatim: top-level `name` / `mbid_id`
+    /// survive response building (only asset URLs are rewritten).
+    #[tokio::test]
+    async fn success_response_passes_through_name_and_mbid_id() {
+        let payload = json!({
+            "name": "Radiohead",
+            "mbid_id": "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+            "artistthumb": [
+                { "url": "https://assets.fanart.tv/fanart/music/a74b/artistthumb/x.jpg" }
+            ]
+        });
+        let resp = success_response(Some("https://img.example"), payload);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Radiohead");
+        assert_eq!(body["mbid_id"], "a74b1b7f-71a5-4011-9441-d0b5e4122711");
+        assert_eq!(
+            body["artistthumb"][0]["url"],
+            "https://img.example/_ia/assets.fanart.tv/fanart/music/a74b/artistthumb/x.jpg"
         );
     }
 }

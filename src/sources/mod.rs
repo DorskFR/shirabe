@@ -11,6 +11,7 @@
 //! Adding a provider later (IMDb `BulkDump`, TMDB `EnumerateLazyHydrate`, TVDB
 //! `LazyScrape`) is just: implement `Source`, register it.
 
+pub mod fanart;
 pub mod imdb;
 pub mod imdb_index;
 pub mod musicbrainz;
@@ -169,6 +170,7 @@ impl Registry {
         let imdb_pool = pools.imdb.clone();
         let tmdb_pool = pools.tmdb.clone();
         let tvdb_pool = pools.tvdb.clone();
+        let fanart_pool = pools.fanart.clone();
         let mut registry = Self { pools, sources: BTreeMap::new() };
         registry.register(Arc::new(musicbrainz::MusicBrainzSource::new(mb_pool)));
         registry.register(Arc::new(imdb::ImdbSource::new(imdb_pool.clone())));
@@ -181,6 +183,7 @@ impl Registry {
             imdb_index::IndexSet::Trgm,
         )));
         registry.register(Arc::new(tmdb::TmdbSource::new(tmdb_pool)));
+        registry.register(Arc::new(fanart::FanartSource::new(fanart_pool, config.clone())));
         registry.register(Arc::new(tvdb::TvdbSource::new(tvdb_pool, tvdb_tokens, config)));
         registry
     }

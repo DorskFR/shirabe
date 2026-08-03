@@ -105,6 +105,13 @@ pub const SEARCH_RELEASES: &str = r"
                     UNION ALL
                     SELECT 1 FROM musicbrainz.release_unknown_country ruc
                     WHERE ruc.release = r.id AND ruc.date_year = $3))
+              AND ($5::text IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_group rg
+                    JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+                    WHERE rg.id = r.release_group AND lower(rgpt.name) = lower($5)))
+              AND ($6::text IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_status rs
+                    WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
         ) c
         ORDER BY (similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))
                   + CASE WHEN $2::text IS NULL THEN 0::real
@@ -134,6 +141,13 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
                     UNION ALL
                     SELECT 1 FROM musicbrainz.release_unknown_country ruc
                     WHERE ruc.release = r.id AND ruc.date_year = $3))
+              AND ($5::text IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_group rg
+                    JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+                    WHERE rg.id = r.release_group AND lower(rgpt.name) = lower($5)))
+              AND ($6::text IS NULL OR EXISTS (
+                    SELECT 1 FROM musicbrainz.release_status rs
+                    WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
         ) c
         ORDER BY (similarity(c.name, $1)
                   + CASE WHEN $2::text IS NULL THEN 0::real
@@ -184,6 +198,25 @@ pub const SEARCH_RECORDINGS_FUZZY: &str = r"
                                         WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $3
+        ";
+
+pub const BROWSE_RELEASES_BY_ARTIST: &str = r"
+        SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+               1.0::real AS title_score
+        FROM musicbrainz.release r
+        WHERE EXISTS (
+            SELECT 1 FROM musicbrainz.artist_credit_name acn
+            JOIN musicbrainz.artist a ON a.id = acn.artist
+            WHERE acn.artist_credit = r.artist_credit AND a.gid = $1)
+          AND ($2::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_group rg
+                JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+                WHERE rg.id = r.release_group AND lower(rgpt.name) = lower($2)))
+          AND ($3::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_status rs
+                WHERE rs.id = r.status AND lower(rs.name) = lower($3)))
+        ORDER BY r.id ASC
+        LIMIT $4
         ";
 
 // MusicBrainz mirror — release-group browse
@@ -641,6 +674,8 @@ pub fn catalog() -> Vec<QuerySpec> {
                 pn("artist", Text, ""),
                 pn("year", Int, ""),
                 p("limit", BigInt, "25"),
+                pn("primarytype", Text, ""),
+                pn("status", Text, ""),
             ],
         },
         QuerySpec {
@@ -655,6 +690,8 @@ pub fn catalog() -> Vec<QuerySpec> {
                 pn("artist", Text, ""),
                 pn("year", Int, ""),
                 p("limit", BigInt, "25"),
+                pn("primarytype", Text, ""),
+                pn("status", Text, ""),
             ],
         },
         QuerySpec {
@@ -736,6 +773,20 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         // ── browse ──
+        QuerySpec {
+            id: "browse_releases_by_artist",
+            title: "Release search by artist MBID (arid:)",
+            endpoint: "GET /ws/2/release?query=arid:",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: BROWSE_RELEASES_BY_ARTIST,
+            params: vec![
+                p("artist_gid", Uuid, "a74b1b7f-71a5-4011-9441-d0b5e4122711"),
+                pn("primarytype", Text, "album"),
+                pn("status", Text, "official"),
+                p("limit", BigInt, "100"),
+            ],
+        },
         QuerySpec {
             id: "browse_release_groups_count",
             title: "Release-group browse: total count for an artist",

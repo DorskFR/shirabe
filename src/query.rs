@@ -10,6 +10,8 @@
 //!
 //! Fields may be wrapped in `(...)` or `"..."`. The `date:` field may carry a
 //! trailing `*` wildcard (`date:(1973*)`), which we treat as a year prefix.
+//! The Lucene fuzzy suffix (`term~` / `term~N`) is stripped: the trigram search
+//! is already fuzzy.
 
 /// Extracted, normalised fields from a search query.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -19,12 +21,16 @@ pub struct ParsedQuery {
     pub recording: Option<String>,
     /// Year prefix from `date:(YYYY*)`, digits only.
     pub date_year: Option<String>,
+    pub arid: Option<String>,
+    pub primary_type: Option<String>,
+    pub status: Option<String>,
     /// Whole-string fallback for bare queries with no field markers.
     pub bare: Option<String>,
 }
 
 /// The fields shirabe understands. Anything else is ignored.
-const KNOWN_FIELDS: &[&str] = &["release", "artist", "recording", "date"];
+const KNOWN_FIELDS: &[&str] =
+    &["release", "artist", "recording", "date", "arid", "primarytype", "status"];
 
 /// Parse a Lucene-subset query string into known fields.
 ///
@@ -39,7 +45,7 @@ pub fn parse(input: &str) -> ParsedQuery {
     }
 
     if !has_known_field(trimmed) {
-        out.bare = Some(unescape(trimmed));
+        out.bare = Some(strip_fuzzy(&unescape(trimmed)));
         return out;
     }
 
@@ -52,10 +58,13 @@ pub fn parse(input: &str) -> ParsedQuery {
         };
         i = next;
         match field.as_str() {
-            "release" => out.release = non_empty(unescape(&value)),
-            "artist" => out.artist = non_empty(unescape(&value)),
-            "recording" => out.recording = non_empty(unescape(&value)),
+            "release" => out.release = non_empty(strip_fuzzy(&unescape(&value))),
+            "artist" => out.artist = non_empty(strip_fuzzy(&unescape(&value))),
+            "recording" => out.recording = non_empty(strip_fuzzy(&unescape(&value))),
             "date" => out.date_year = non_empty(extract_year(&value)),
+            "arid" => out.arid = non_empty(strip_fuzzy(&unescape(&value))),
+            "primarytype" => out.primary_type = non_empty(strip_fuzzy(&unescape(&value))),
+            "status" => out.status = non_empty(strip_fuzzy(&unescape(&value))),
             _ => {}
         }
     }
@@ -182,6 +191,28 @@ fn unescape(value: &str) -> String {
     out.trim().to_string()
 }
 
+/// Drop word-final `~` / `~N` fuzzy suffixes; a mid-word `~` is literal text.
+fn strip_fuzzy(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '~' && i > 0 && !chars[i - 1].is_whitespace() {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                j += 1;
+            }
+            if j >= chars.len() || chars[j].is_whitespace() {
+                i = j;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -265,6 +296,96 @@ mod tests {
     fn date_year_month_day() {
         let q = parse("release:(X) AND date:(1973-03-01)");
         assert_eq!(q.date_year.as_deref(), Some("1973"));
+    }
+
+    #[test]
+    fn arid_primarytype_status() {
+        let q = parse(
+            "arid:a74b1b7f-71a5-4011-9441-d0b5e4122711 AND primarytype:album AND status:official",
+        );
+        assert_eq!(q.arid.as_deref(), Some("a74b1b7f-71a5-4011-9441-d0b5e4122711"));
+        assert_eq!(q.primary_type.as_deref(), Some("album"));
+        assert_eq!(q.status.as_deref(), Some("official"));
+        assert!(q.bare.is_none());
+        assert!(q.release.is_none());
+    }
+
+    #[test]
+    fn arid_only() {
+        let q = parse("arid:a74b1b7f-71a5-4011-9441-d0b5e4122711");
+        assert_eq!(q.arid.as_deref(), Some("a74b1b7f-71a5-4011-9441-d0b5e4122711"));
+        assert!(q.primary_type.is_none());
+        assert!(q.status.is_none());
+        assert!(q.bare.is_none());
+    }
+
+    #[test]
+    fn primarytype_status_quoted_and_parens() {
+        let q = parse("primarytype:\"Album\" AND status:(Official)");
+        assert_eq!(q.primary_type.as_deref(), Some("Album"));
+        assert_eq!(q.status.as_deref(), Some("Official"));
+    }
+
+    #[test]
+    fn arid_with_release_title() {
+        let q = parse("release:(The Wall) AND arid:83d91898-7763-47d7-b03b-b92132375c47");
+        assert_eq!(q.release.as_deref(), Some("The Wall"));
+        assert_eq!(q.arid.as_deref(), Some("83d91898-7763-47d7-b03b-b92132375c47"));
+    }
+
+    #[test]
+    fn fuzzy_suffix_stripped_from_fields() {
+        let q = parse("release:(Nevermind~) AND artist:(Nirvana~2)");
+        assert_eq!(q.release.as_deref(), Some("Nevermind"));
+        assert_eq!(q.artist.as_deref(), Some("Nirvana"));
+    }
+
+    #[test]
+    fn fuzzy_suffix_with_decimal_stripped() {
+        let q = parse("recording:\"Time~0.7\" AND artist:\"Pink Floyd~\"");
+        assert_eq!(q.recording.as_deref(), Some("Time"));
+        assert_eq!(q.artist.as_deref(), Some("Pink Floyd"));
+    }
+
+    #[test]
+    fn fuzzy_suffix_stripped_from_bare_query() {
+        let q = parse("Radiohead~");
+        assert_eq!(q.bare.as_deref(), Some("Radiohead"));
+    }
+
+    #[test]
+    fn fuzzy_suffix_stripped_per_word() {
+        let q = parse("release:(dark~ side~1 moon~0.5)");
+        assert_eq!(q.release.as_deref(), Some("dark side moon"));
+    }
+
+    #[test]
+    fn mid_word_tilde_kept() {
+        let q = parse("artist:(A~B) AND release:(~leading)");
+        assert_eq!(q.artist.as_deref(), Some("A~B"));
+        assert_eq!(q.release.as_deref(), Some("~leading"));
+    }
+
+    #[test]
+    fn unknown_fields_still_skipped() {
+        let q = parse("country:GB AND release:(Animals) AND tag:rock");
+        assert_eq!(q.release.as_deref(), Some("Animals"));
+        assert!(q.arid.is_none());
+        assert!(q.bare.is_none());
+    }
+
+    #[test]
+    fn unknown_field_between_known_filters() {
+        let q = parse("arid:83d91898-7763-47d7-b03b-b92132375c47 AND reid:x AND primarytype:album");
+        assert_eq!(q.arid.as_deref(), Some("83d91898-7763-47d7-b03b-b92132375c47"));
+        assert_eq!(q.primary_type.as_deref(), Some("album"));
+    }
+
+    #[test]
+    fn fuzzy_value_reduced_to_nothing_is_none() {
+        let q = parse("release:(Animals) AND artist:()");
+        assert_eq!(q.release.as_deref(), Some("Animals"));
+        assert!(q.artist.is_none());
     }
 
     #[test]

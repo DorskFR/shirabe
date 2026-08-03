@@ -22,6 +22,8 @@
 //! `name`, `aliases`, and `translations` are preserved verbatim in the cached
 //! payload so non-latin names survive (Kusaritoi scores against these).
 //!
+//! `/v4/search` drops the upstream `links` block (consumers don't page search).
+//!
 //! Graceful degradation: when `TVDB_API_KEY` is unset, a request that would need
 //! upstream returns a clean failure in TheTVDB's `{status:"failure", message}` shape
 //! (HTTP 503) — never a panic — while cached rows are still served. The API server
@@ -460,16 +462,22 @@ async fn series_episodes(
     }
     let path = format!("series/{id}/episodes/{season_type}");
     match upstream_get(&state, &path, &extra).await {
-        Ok(mut payload) => {
+        Ok(payload) => {
             cache_put(&state, cache_id, cache_kind, &payload).await;
-            rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
-            Json(payload).into_response()
+            episodes_response(state.config.caache_base_url.as_deref(), payload)
         }
         Err(e) => {
             tracing::warn!(error = %e, id, "tvdb episodes upstream failed");
             tvdb_failure(StatusCode::BAD_GATEWAY, "TheTVDB upstream error")
         }
     }
+}
+
+/// Must stay a passthrough: `links.next` (null/absent on the last page) is the
+/// consumer's only pagination stop signal.
+fn episodes_response(caache_base: Option<&str>, mut payload: Value) -> Response {
+    rewrite_image_urls(caache_base, &mut payload);
+    Json(payload).into_response()
 }
 
 /// Read a query param that may arrive as a JSON string or number into a string.
@@ -510,7 +518,140 @@ async fn movie(State(state): State<Arc<AppState>>, Path(id_raw): Path<String>) -
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use clap::Parser;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::config::Cli;
+    use crate::db::{Pools, connect_lazy};
+    use crate::facades::coverart::CoverArtState;
+    use crate::sources::Registry;
+    use crate::sources::tvdb::TokenStore;
+
+    fn test_state(tvdb_api_key: Option<&str>) -> Arc<AppState> {
+        let mut args = vec!["shirabe", "--database-url", "postgres://x/x"];
+        if let Some(key) = tvdb_api_key {
+            args.extend(["--tvdb-api-key", key]);
+        }
+        let config = Cli::try_parse_from(args).unwrap().config;
+        let pools = Pools {
+            musicbrainz: connect_lazy("postgres://x/x", 1).unwrap(),
+            shirabe: None,
+            imdb: None,
+            tmdb: None,
+            tvdb: None,
+            fanart: None,
+        };
+        let tvdb_tokens = TokenStore::new();
+        let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
+        let coverart = CoverArtState::new(&config);
+        Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+    }
+
+    async fn post_login(state: Arc<AppState>, content_type: Option<&str>, body: Body) -> Response {
+        let mut req = Request::builder().method("POST").uri("/v4/login");
+        if let Some(ct) = content_type {
+            req = req.header("content-type", ct);
+        }
+        router().with_state(state).oneshot(req.body(body).unwrap()).await.unwrap()
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `/v4/login` accepts any body — empty `{}`, real-looking creds, malformed
+    /// JSON, or no body at all — and mints `{data:{token}}`.
+    #[tokio::test]
+    async fn login_accepts_any_body() {
+        let cases: [(Option<&str>, &str); 4] = [
+            (Some("application/json"), "{}"),
+            (Some("application/json"), r#"{"apikey":"client-key","pin":"1234"}"#),
+            (Some("application/json"), "not json at all"),
+            (None, ""),
+        ];
+        for (ct, body) in cases {
+            let resp = post_login(test_state(Some("real-key")), ct, Body::from(body)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "body {body:?}");
+            let json = body_json(resp).await;
+            assert_eq!(json["data"]["token"], SHIRABE_TOKEN, "body {body:?}");
+        }
+    }
+
+    /// Without a server-side key `/v4/login` is 503 in TheTVDB failure shape.
+    #[tokio::test]
+    async fn login_503_when_key_unset() {
+        let resp = post_login(test_state(None), Some("application/json"), Body::from("{}")).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "failure");
+    }
+
+    /// The episodes response is a passthrough: a non-null `links.next` survives, and
+    /// on the last page `links.next` stays null — the consumer's only stop signal.
+    #[tokio::test]
+    async fn episodes_response_preserves_links() {
+        let mid_page = json!({
+            "status": "success",
+            "data": { "episodes": [ { "id": 1, "image":
+                "https://artworks.thetvdb.com/banners/episodes/e.jpg" } ] },
+            "links": {
+                "prev": null,
+                "self": "https://api4.thetvdb.com/v4/series/81797/episodes/default?page=0",
+                "next": "https://api4.thetvdb.com/v4/series/81797/episodes/default?page=1",
+                "total_items": 120, "page_size": 100
+            }
+        });
+        let resp = episodes_response(Some("https://img.example"), mid_page);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["links"]["next"],
+            "https://api4.thetvdb.com/v4/series/81797/episodes/default?page=1"
+        );
+        assert_eq!(json["links"]["total_items"], 120);
+        assert_eq!(
+            json["data"]["episodes"][0]["image"],
+            "https://img.example/_ia/artworks.thetvdb.com/banners/episodes/e.jpg"
+        );
+
+        let last_page = json!({
+            "status": "success",
+            "data": { "episodes": [ { "id": 2 } ] },
+            "links": { "prev": null, "next": null, "total_items": 1 }
+        });
+        let json = body_json(episodes_response(None, last_page)).await;
+        assert!(json["links"].get("next").is_some_and(Value::is_null));
+    }
+
+    /// `artworks[]` entries keep `type` (int and numeric-string forms; 1=banner,
+    /// 3=background) and `score` intact while their image URLs are rewritten.
+    #[tokio::test]
+    async fn artworks_type_and_score_survive_rewrite() {
+        let mut payload = json!({ "data": { "artworks": [
+            { "id": 10, "type": 1, "score": 100_005,
+              "image": "https://artworks.thetvdb.com/banners/graphical/b.jpg" },
+            { "id": 11, "type": "3", "score": 99_998,
+              "image": "https://artworks.thetvdb.com/banners/fanart/original/f.jpg",
+              "thumbnail": "https://artworks.thetvdb.com/banners/fanart/original/f_t.jpg" }
+        ] } });
+        rewrite_image_urls(Some("https://img.example"), &mut payload);
+        let arts = payload["data"]["artworks"].as_array().unwrap();
+        assert_eq!(arts[0]["type"], 1);
+        assert_eq!(arts[0]["score"], 100_005);
+        assert_eq!(
+            arts[0]["image"],
+            "https://img.example/_ia/artworks.thetvdb.com/banners/graphical/b.jpg"
+        );
+        assert_eq!(arts[1]["type"], "3");
+        assert_eq!(arts[1]["score"], 99_998);
+        assert_eq!(
+            arts[1]["thumbnail"],
+            "https://img.example/_ia/artworks.thetvdb.com/banners/fanart/original/f_t.jpg"
+        );
+    }
 
     /// TTL staleness: rows within the window are fresh; older or future-skewed rows
     /// are not; a non-positive TTL disables caching.

@@ -528,12 +528,19 @@ async fn release_date(pool: &PgPool, release_id: i32) -> Result<String, sqlx::Er
 
 // ── Release search ────────────────────────────────────────
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReleaseFilters<'a> {
+    pub artist: Option<&'a str>,
+    pub year: Option<&'a str>,
+    pub primary_type: Option<&'a str>,
+    pub status: Option<&'a str>,
+}
+
 /// `GET /ws/2/release?query=release:(..) AND artist:(..) [AND date:(YYYY*)]`
 pub async fn search_releases(
     pool: &PgPool,
     title: &str,
-    artist: Option<&str>,
-    year: Option<&str>,
+    filters: ReleaseFilters<'_>,
     limit: i64,
     threshold: f64,
     work_mem: &str,
@@ -544,29 +551,57 @@ pub async fn search_releases(
     // nothing (typo'd / partial query).
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let year_i32 = year.and_then(|y| y.parse::<i32>().ok());
+    let year_i32 = filters.year.and_then(|y| y.parse::<i32>().ok());
     // FTS fast path (whole-word match); fall back to the trigram `%` scan only when
     // FTS finds nothing (typo'd / partial query), so recall never regresses.
     let mut rows = sqlx::query(queries::SEARCH_RELEASES)
         .bind(title)
-        .bind(artist)
+        .bind(filters.artist)
         .bind(year_i32)
         .bind(limit)
+        .bind(filters.primary_type)
+        .bind(filters.status)
         .fetch_all(&mut *conn)
         .await?;
     if rows.is_empty() {
         rows = fetch_fuzzy(
             sqlx::query(queries::SEARCH_RELEASES_FUZZY)
                 .bind(title)
-                .bind(artist)
+                .bind(filters.artist)
                 .bind(year_i32)
-                .bind(limit),
+                .bind(limit)
+                .bind(filters.primary_type)
+                .bind(filters.status),
             &mut conn,
         )
         .await?;
     }
     drop(conn);
+    hydrate_release_search_rows(pool, rows).await
+}
 
+/// `GET /ws/2/release?query=arid:{mbid} [AND primarytype:.. AND status:..]`
+pub async fn browse_releases_by_artist(
+    pool: &PgPool,
+    artist_gid: Uuid,
+    primary_type: Option<&str>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Release>, sqlx::Error> {
+    let rows = sqlx::query(queries::BROWSE_RELEASES_BY_ARTIST)
+        .bind(artist_gid)
+        .bind(primary_type)
+        .bind(status)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    hydrate_release_search_rows(pool, rows).await
+}
+
+async fn hydrate_release_search_rows(
+    pool: &PgPool,
+    rows: Vec<PgRow>,
+) -> Result<Vec<Release>, sqlx::Error> {
     // SHIB-17: collect keys across all rows and batch every per-release load into
     // one set-based query each (credits, groups, dates, statuses, comments,
     // track-counts) rather than ~6 round-trips per row. Rows are then re-emitted

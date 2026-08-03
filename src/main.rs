@@ -184,7 +184,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
     let app = if state.config.debug_ui { app.merge(debug_ui::router()) } else { app };
 
-    app
+    app.fallback(error::no_such_route)
+        .method_not_allowed_fallback(error::method_not_allowed)
         // Per-request access log (method, path, status, latency). Enable with
         // `tower_http=debug` in RUST_LOG to see every ws/2 call.
         .layer(TraceLayer::new_for_http())
@@ -299,6 +300,48 @@ mod tests {
     async fn native_prefixes_still_wired() {
         for path in ["/ws/2/artist", "/3/movie/1", "/v4/series/1", "/v3/movies/1", "/release/1"] {
             assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "native not wired: {path}");
+        }
+    }
+
+    async fn error_body(method: &str, path: &str) -> (StatusCode, String) {
+        let app = build_router(test_state());
+        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unknown_path_gets_json_404() {
+        let (status, body) = error_body("GET", "/ws/2/nonexistent").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "shirabe: no such route: GET /ws/2/nonexistent");
+    }
+
+    #[tokio::test]
+    async fn wrong_method_gets_json_405() {
+        let (status, body) = error_body("POST", "/health").await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"], "shirabe: method not allowed: POST /health");
+    }
+
+    #[tokio::test]
+    async fn nested_mount_misses_get_json_404() {
+        for path in [
+            "/tvdb/v4/nonexistent",
+            "/tmdb/3/nonexistent",
+            "/coverart/nonexistent",
+            "/fanart/v3/nonexistent",
+            "/musicbrainz/ws/2/nonexistent",
+            "/music/nonexistent",
+        ] {
+            let (status, body) = error_body("GET", path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "expected 404: {path}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"], format!("shirabe: no such route: GET {path}"), "body: {path}");
         }
     }
 }
