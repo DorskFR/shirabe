@@ -268,3 +268,22 @@ VALUES
     (2, '88888888-8888-4888-8888-888888888888', 1, 2, '2', 'Lighthouse Keeper', 1, 2);
 
 INSERT INTO musicbrainz.l_release_release (id, link, entity0, entity1) VALUES (1, 2, 1, 2);
+
+-- Second artist/group covering the remaining partial-date shapes: a YYYY-MM
+-- release and a release with no date events at all (serialized as "").
+INSERT INTO musicbrainz.artist (id, gid, name, sort_name, comment, type) VALUES
+    (2, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'Moorland Echoes', 'Moorland Echoes', '', 1);
+INSERT INTO musicbrainz.artist_credit (id, name) VALUES (2, 'Moorland Echoes');
+INSERT INTO musicbrainz.artist_credit_name (artist_credit, position, artist, name) VALUES
+    (2, 0, 2, 'Moorland Echoes');
+INSERT INTO musicbrainz.release_group (id, gid, name, comment, artist_credit, type) VALUES
+    (2, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'Peat and Heather', '', 2, 1);
+INSERT INTO musicbrainz.release_group_meta
+    (id, first_release_date_year, first_release_date_month, first_release_date_day) VALUES
+    (2, 2003, 4, NULL);
+INSERT INTO musicbrainz.release (id, gid, name, artist_credit, release_group, status, comment)
+VALUES
+    (3, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'Peat and Heather', 2, 2, 1, ''),
+    (4, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'Peat and Heather', 2, 2, 1, '');
+INSERT INTO musicbrainz.release_unknown_country (release, date_year, date_month, date_day) VALUES
+    (3, 2003, 4, NULL);

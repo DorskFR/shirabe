@@ -422,6 +422,241 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("annotation"));
     }
 
+    fn full_release() -> Release {
+        Release {
+            id: "b1392450-e666-3926-a536-22c65f834433".into(),
+            title: "Homogenic".into(),
+            date: "1997-09-20".into(),
+            score: Some(100),
+            status: Some("Official".into()),
+            disambiguation: Some("UK edition".into()),
+            artist_credit: vec![ArtistCredit {
+                artist: ArtistRef {
+                    id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+                    name: "Björk".into(),
+                    aliases: vec![],
+                },
+            }],
+            track_count: Some(10),
+            release_group: Some(ReleaseGroup {
+                id: "0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd".into(),
+                primary_type: Some("Album".into()),
+            }),
+            media: vec![Medium {
+                id: "42".into(),
+                position: 1,
+                track_count: 10,
+                title: Some("Disc One".into()),
+                format: Some("CD".into()),
+                tracks: vec![Track {
+                    id: "d6de70d0-3b96-4bf6-8438-8bbf6a2a2c38".into(),
+                    title: "Jóga".into(),
+                    position: 3,
+                    number: "A3".into(),
+                    recording: RecordingRef {
+                        id: "ffb598b9-8f14-4b30-be0d-6cca4d1a565a".into(),
+                        title: "Jóga".into(),
+                        length: Some(305_000),
+                    },
+                    artist_credit: vec![],
+                }],
+            }],
+            relations: vec![Relation {
+                direction: "forward".into(),
+                release: Some(ReleaseStub {
+                    id: "0f61a2ac-4382-31a0-8cc1-b5197f6ce2cf".into(),
+                    title: "Homogenic (vinyl)".into(),
+                }),
+                recording: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn release_full_shape_uses_hyphenated_keys() {
+        let v = serde_json::to_value(full_release()).unwrap();
+        assert_eq!(v["date"], json!("1997-09-20"));
+        assert_eq!(v["track-count"], json!(10));
+        assert_eq!(v["release-group"]["primary-type"], json!("Album"));
+        assert_eq!(v["disambiguation"], json!("UK edition"));
+        assert_eq!(v["artist-credit"][0]["artist"]["name"], json!("Björk"));
+        assert!(v.get("track_count").is_none());
+        assert!(v.get("artist_credit").is_none());
+        assert!(v.get("release_group").is_none());
+
+        let m = &v["media"][0];
+        assert_eq!(m["id"], json!("42"));
+        assert_eq!(m["position"], json!(1));
+        assert_eq!(m["track-count"], json!(10));
+        assert_eq!(m["title"], json!("Disc One"));
+        assert_eq!(m["format"], json!("CD"));
+
+        let t = &m["tracks"][0];
+        assert_eq!(t["position"], json!(3));
+        assert_eq!(t["number"], json!("A3"));
+        assert_eq!(t["recording"]["id"], json!("ffb598b9-8f14-4b30-be0d-6cca4d1a565a"));
+        assert_eq!(t["recording"]["length"], json!(305_000));
+        assert!(t.get("artist-credit").is_none(), "empty track credit omitted");
+
+        let rel = &v["relations"][0];
+        assert_eq!(rel["direction"], json!("forward"));
+        assert_eq!(rel["release"]["title"], json!("Homogenic (vinyl)"));
+        assert!(rel.get("recording").is_none());
+    }
+
+    #[test]
+    fn release_empty_optionals_are_omitted_but_date_stays() {
+        let v = serde_json::to_value(Release {
+            id: "b1392450-e666-3926-a536-22c65f834433".into(),
+            title: "Homogenic".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["date"], json!(""), "unknown date is an empty string, never absent");
+        for absent in [
+            "score",
+            "status",
+            "disambiguation",
+            "artist-credit",
+            "track-count",
+            "release-group",
+            "media",
+            "relations",
+        ] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted when empty/None");
+        }
+    }
+
+    #[test]
+    fn medium_without_tracks_omits_tracks_key() {
+        let v = serde_json::to_value(Medium {
+            id: "42".into(),
+            position: 1,
+            track_count: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["track-count"], json!(10));
+        assert!(v.get("tracks").is_none(), "trackless medium (no inc=recordings) omits tracks");
+        assert!(v.get("title").is_none());
+        assert!(v.get("format").is_none());
+    }
+
+    #[test]
+    fn recording_ref_omits_null_length() {
+        let v = serde_json::to_value(RecordingRef {
+            id: "ffb598b9-8f14-4b30-be0d-6cca4d1a565a".into(),
+            title: "Jóga".into(),
+            length: None,
+        })
+        .unwrap();
+        assert!(v.get("length").is_none());
+    }
+
+    #[test]
+    fn relation_recording_stub_shape() {
+        let v = serde_json::to_value(Relation {
+            direction: "backward".into(),
+            release: None,
+            recording: Some(RecordingStub {
+                id: "ffb598b9-8f14-4b30-be0d-6cca4d1a565a".into(),
+                title: "Jóga".into(),
+            }),
+        })
+        .unwrap();
+        assert!(v.get("release").is_none());
+        assert_eq!(v["recording"]["title"], json!("Jóga"));
+    }
+
+    #[test]
+    fn recording_shape() {
+        let v = serde_json::to_value(Recording {
+            id: "ffb598b9-8f14-4b30-be0d-6cca4d1a565a".into(),
+            title: "Jóga".into(),
+            length: Some(305_000),
+            score: Some(98),
+            artist_credit: vec![ArtistCredit {
+                artist: ArtistRef {
+                    id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+                    name: "Björk".into(),
+                    aliases: vec![Alias {
+                        name: "ビョーク".into(),
+                        sort_name: Some("Björk".into()),
+                    }],
+                },
+            }],
+            releases: vec![full_release()],
+        })
+        .unwrap();
+        assert_eq!(v["length"], json!(305_000));
+        assert_eq!(v["score"], json!(98));
+        let alias = &v["artist-credit"][0]["artist"]["aliases"][0];
+        assert_eq!(alias["name"], json!("ビョーク"));
+        assert_eq!(alias["sort-name"], json!("Björk"));
+        assert_eq!(v["releases"][0]["title"], json!("Homogenic"));
+
+        let bare = serde_json::to_value(Recording {
+            id: "x".into(),
+            title: "y".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        for absent in ["length", "score", "artist-credit", "releases"] {
+            assert!(bare.get(absent).is_none());
+        }
+    }
+
+    #[test]
+    fn artist_shape() {
+        let v = serde_json::to_value(Artist {
+            id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+            name: "Björk".into(),
+            score: Some(100),
+            aliases: vec![Alias { name: "Björk Guðmundsdóttir".into(), sort_name: None }],
+        })
+        .unwrap();
+        assert_eq!(v["score"], json!(100));
+        assert_eq!(v["aliases"][0]["name"], json!("Björk Guðmundsdóttir"));
+        assert!(v["aliases"][0].get("sort-name").is_none());
+
+        let bare = serde_json::to_value(Artist {
+            id: "x".into(),
+            name: "y".into(),
+            score: None,
+            aliases: vec![],
+        })
+        .unwrap();
+        assert!(bare.get("score").is_none());
+        assert!(bare.get("aliases").is_none());
+    }
+
+    #[test]
+    fn artist_lookup_top_level_keys() {
+        let v = serde_json::to_value(ArtistLookup {
+            id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+            name: "Björk".into(),
+            sort_name: "Björk".into(),
+            artist_type: Some("Person".into()),
+            disambiguation: Some("Icelandic".into()),
+            relations: vec![UrlRelation {
+                rel_type: "image".into(),
+                direction: "forward".into(),
+                url: UrlResource { resource: "https://example.org/bjork.jpg".into() },
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["sort-name"], json!("Björk"));
+        assert_eq!(v["type"], json!("Person"));
+        assert_eq!(v["disambiguation"], json!("Icelandic"));
+        let rel = &v["relations"][0];
+        assert_eq!(rel["type"], json!("image"));
+        assert_eq!(rel["direction"], json!("forward"));
+        assert_eq!(rel["url"]["resource"], json!("https://example.org/bjork.jpg"));
+        assert!(v.get("sort_name").is_none());
+        assert!(v.get("artist_type").is_none());
+    }
+
     #[test]
     fn lookup_release_entry_shape() {
         let mut d = detail();
