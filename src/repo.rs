@@ -11,7 +11,8 @@ use uuid::Uuid;
 use crate::date::{DateEvent, select_release_date};
 use crate::models::{
     Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Medium, Recording, RecordingRef,
-    Relation, Release, ReleaseGroup, ReleaseStub, Track, UrlRelation, UrlResource,
+    Relation, Release, ReleaseGroup, ReleaseGroupDetail, ReleaseGroupRelease, ReleaseStub, Track,
+    UrlRelation, UrlResource,
 };
 use crate::queries;
 use crate::search::configure_search_session;
@@ -132,6 +133,26 @@ async fn batch_release_groups(
             id,
             ReleaseGroup { id: gid.to_string(), primary_type: r.try_get("primary_type").ok() },
         );
+    }
+    Ok(map)
+}
+
+/// Secondary-type names for many release groups at once, keyed by rg id.
+async fn batch_release_group_secondary_types(
+    pool: &PgPool,
+    rg_ids: &[i32],
+) -> Result<HashMap<i32, Vec<String>>, sqlx::Error> {
+    let mut map: HashMap<i32, Vec<String>> = HashMap::new();
+    if rg_ids.is_empty() {
+        return Ok(map);
+    }
+    let rows = sqlx::query(queries::BATCH_RELEASE_GROUP_SECONDARY_TYPES)
+        .bind(rg_ids)
+        .fetch_all(pool)
+        .await?;
+    for r in rows {
+        let rg: i32 = r.try_get("rg")?;
+        map.entry(rg).or_default().push(r.get("name"));
     }
     Ok(map)
 }
@@ -744,6 +765,111 @@ async fn load_release_relations(
             }
         })
         .collect())
+}
+
+// ── Release-group browse / lookup ─────────────────────────
+
+fn first_release_date(row: &PgRow) -> String {
+    DateEvent {
+        year: row.try_get("y").ok(),
+        month: row.try_get("m").ok(),
+        day: row.try_get("d").ok(),
+        is_xw: false,
+    }
+    .render()
+}
+
+async fn hydrate_release_groups(
+    pool: &PgPool,
+    rows: Vec<PgRow>,
+) -> Result<Vec<ReleaseGroupDetail>, sqlx::Error> {
+    let rg_ids: Vec<i32> = rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
+    let ac_ids: Vec<i32> =
+        rows.iter().filter_map(|r| r.try_get::<i32, _>("artist_credit").ok()).collect();
+    let ac_map = batch_artist_credits(pool, &ac_ids, false).await?;
+    let mut st_map = batch_release_group_secondary_types(pool, &rg_ids).await?;
+
+    let mut groups = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i32 = row.try_get("id")?;
+        let gid: Uuid = row.try_get("gid")?;
+        let ac_id: i32 = row.try_get("artist_credit")?;
+        groups.push(ReleaseGroupDetail {
+            id: gid.to_string(),
+            title: row.try_get("name")?,
+            primary_type: row.try_get("primary_type").ok(),
+            secondary_types: st_map.remove(&id).unwrap_or_default(),
+            first_release_date: first_release_date(&row),
+            disambiguation: row.try_get("comment").unwrap_or_default(),
+            artist_credit: ac_map.get(&ac_id).cloned().unwrap_or_default(),
+            releases: None,
+        });
+    }
+    Ok(groups)
+}
+
+/// `GET /ws/2/release-group?artist={mbid}&limit=&offset=`
+///
+/// Returns `(total, page)`: the full count for the artist plus one stable page
+/// ordered by first-release-date then gid.
+pub async fn browse_release_groups(
+    pool: &PgPool,
+    artist_gid: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<(i64, Vec<ReleaseGroupDetail>), sqlx::Error> {
+    let total: i64 = sqlx::query(queries::BROWSE_RELEASE_GROUPS_COUNT)
+        .bind(artist_gid)
+        .fetch_one(pool)
+        .await?
+        .try_get("total")?;
+    let rows = sqlx::query(queries::BROWSE_RELEASE_GROUPS)
+        .bind(artist_gid)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    let groups = hydrate_release_groups(pool, rows).await?;
+    Ok((total, groups))
+}
+
+/// `GET /ws/2/release-group/{mbid}?inc=artist-credits+releases`
+pub async fn lookup_release_group(
+    pool: &PgPool,
+    gid: Uuid,
+) -> Result<Option<ReleaseGroupDetail>, sqlx::Error> {
+    let Some(row) =
+        sqlx::query(queries::LOOKUP_RELEASE_GROUP).bind(gid).fetch_optional(pool).await?
+    else {
+        return Ok(None);
+    };
+    let rg_id: i32 = row.try_get("id")?;
+    let mut group = hydrate_release_groups(pool, vec![row]).await?.remove(0);
+    group.releases = Some(load_release_group_releases(pool, rg_id).await?);
+    Ok(Some(group))
+}
+
+async fn load_release_group_releases(
+    pool: &PgPool,
+    rg_id: i32,
+) -> Result<Vec<ReleaseGroupRelease>, sqlx::Error> {
+    let rows =
+        sqlx::query(queries::LOAD_RELEASE_GROUP_RELEASES).bind(rg_id).fetch_all(pool).await?;
+    let release_ids: Vec<i32> =
+        rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
+    let date_map = batch_release_dates(pool, &release_ids).await?;
+
+    let mut releases = Vec::with_capacity(rows.len());
+    for r in rows {
+        let id: i32 = r.try_get("id")?;
+        let gid: Uuid = r.try_get("gid")?;
+        releases.push(ReleaseGroupRelease {
+            id: gid.to_string(),
+            date: date_map.get(&id).cloned().unwrap_or_default(),
+            status: r.try_get("status").ok(),
+        });
+    }
+    Ok(releases)
 }
 
 // ── Recording search ──────────────────────────────────────

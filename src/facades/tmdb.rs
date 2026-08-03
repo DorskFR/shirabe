@@ -18,8 +18,9 @@
 //! [`xref::upsert_xref`]. A second identical call is served from cache and
 //! never hits upstream.
 //!
-//! Detail lookups honour `append_to_response=external_ids` so `imdb_id` is
-//! present; search ranking ties are broken by `popularity`.
+//! Detail lookups union the client's `append_to_response` with the facade's own
+//! per-kind set; a cached payload is served only when it carries every append
+//! section the client asked for. Search ranking ties are broken by `popularity`.
 //!
 //! Graceful degradation: when `TMDB_API_KEY` is unset, a request that would need
 //! upstream returns a clean 503 in TMDB's error shape
@@ -195,6 +196,41 @@ async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
     }
 }
 
+/// Batch [`cache_get`]: fresh cached payloads for many ids of one `kind`.
+async fn cache_get_many(
+    state: &AppState,
+    ids: &[i64],
+    kind: &str,
+) -> std::collections::HashMap<i64, Value> {
+    let mut found = std::collections::HashMap::new();
+    let Some(pool) = tmdb_pool(state) else {
+        return found;
+    };
+    let ttl_days = state.config.tmdb_cache_ttl_days;
+    if ttl_days <= 0 || ids.is_empty() {
+        return found;
+    }
+    let rows = sqlx::query(
+        "SELECT id, payload FROM tmdb_cache
+         WHERE kind = $1 AND id = ANY($2)
+           AND fetched_at >= now() - ($3 || ' days')::interval",
+    )
+    .bind(kind)
+    .bind(ids)
+    .bind(ttl_days.to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for row in rows {
+        if let (Ok(id), Ok(payload)) =
+            (row.try_get::<i64, _>("id"), row.try_get::<Value, _>("payload"))
+        {
+            found.insert(id, payload);
+        }
+    }
+    found
+}
+
 /// Self-link any external ids found in a hydrated detail payload into
 /// `shirabe.xref`, so a TMDB id resolves to its sibling provider ids. Reads both a
 /// top-level `imdb_id` and an `external_ids` object. Best-effort.
@@ -278,7 +314,7 @@ fn rank_by_popularity(results: &mut Value) {
 }
 
 /// Bump to invalidate stale cached search payloads when the result shape changes.
-const SEARCH_SHAPE_VERSION: u64 = 2;
+const SEARCH_SHAPE_VERSION: u64 = 3;
 
 /// Hash a search query string to a stable cache id (search rows are keyed by id +
 /// kind like detail rows; the query has no numeric id of its own).
@@ -311,12 +347,29 @@ fn local_hit_to_result(hit: &ScoredHit, kind: &str) -> Option<Value> {
     Some(obj)
 }
 
-/// Build a TMDB v3 `{results:[…]}` payload from local hits, ranked by popularity.
+/// Wrap a `results` array in the standard TMDB search envelope
+/// `{page, results, total_pages, total_results}` (single-page semantics).
+fn envelope(results: Value) -> Value {
+    let total = results.as_array().map_or(0, Vec::len);
+    let mut payload = json!({ "page": 1, "total_pages": 1, "total_results": total });
+    payload["results"] = results;
+    payload
+}
+
+/// Recompute the envelope counters after the `results` array changed.
+fn finalize_envelope(payload: &mut Value) {
+    let total = payload.get("results").and_then(Value::as_array).map_or(0, Vec::len);
+    payload["page"] = json!(1);
+    payload["total_pages"] = json!(1);
+    payload["total_results"] = json!(total);
+}
+
+/// Build an enveloped TMDB v3 search payload from local hits, ranked by popularity.
 fn local_results_payload(hits: &[ScoredHit], kind: &str) -> Value {
     let mut results: Value =
         json!(hits.iter().filter_map(|h| local_hit_to_result(h, kind)).collect::<Vec<_>>());
     rank_by_popularity(&mut results);
-    json!({ "results": results })
+    envelope(results)
 }
 
 /// Search-result fields the local index cannot supply (it holds only
@@ -349,6 +402,77 @@ fn enrich_from_live(local: &mut Value, donor: &Value) {
         };
         if dst.get(*key).is_none_or(Value::is_null) {
             dst.insert((*key).to_string(), v.clone());
+        }
+    }
+}
+
+/// Search-result fields consumers score on; every served result must carry them.
+fn required_search_fields(kind: &str) -> [&'static str; 3] {
+    match kind {
+        "movie" => ["original_title", "release_date", "overview"],
+        _ => ["original_name", "first_air_date", "overview"],
+    }
+}
+
+fn has_required_fields(result: &Value, kind: &str) -> bool {
+    required_search_fields(kind).iter().all(|k| result.get(*k).is_some_and(|v| !v.is_null()))
+}
+
+fn any_result_missing_fields(payload: &Value, kind: &str) -> bool {
+    payload
+        .get("results")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|r| !has_required_fields(r, kind)))
+}
+
+/// Last-resort fill so the required fields are always present: `original_*`
+/// falls back to the display title (TMDB's own value when untranslated), dates
+/// and overview to `""` (the shape TMDB emits for unknowns).
+fn ensure_result_fields(payload: &mut Value, kind: &str) {
+    let (orig_key, name_key, date_key) = match kind {
+        "movie" => ("original_title", "title", "release_date"),
+        _ => ("original_name", "name", "first_air_date"),
+    };
+    let Some(arr) = payload.get_mut("results").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for r in arr {
+        let Some(obj) = r.as_object_mut() else {
+            continue;
+        };
+        if obj.get(orig_key).is_none_or(Value::is_null) {
+            let fallback = obj.get(name_key).cloned().unwrap_or_else(|| json!(""));
+            obj.insert(orig_key.to_string(), fallback);
+        }
+        for key in [date_key, "overview"] {
+            if obj.get(key).is_none_or(Value::is_null) {
+                obj.insert(key.to_string(), json!(""));
+            }
+        }
+    }
+}
+
+/// Fill missing required fields on local search results from already-hydrated
+/// detail payloads in `tmdb_cache`, avoiding a live call when the answer is local.
+async fn enrich_from_cached_details(state: &AppState, kind: &str, payload: &mut Value) {
+    let Some(arr) = payload.get("results").and_then(Value::as_array) else {
+        return;
+    };
+    let ids: Vec<i64> = arr
+        .iter()
+        .filter(|r| !has_required_fields(r, kind))
+        .filter_map(|r| r.get("id").and_then(Value::as_i64))
+        .collect();
+    let details = cache_get_many(state, &ids, kind).await;
+    if details.is_empty() {
+        return;
+    }
+    if let Some(arr) = payload.get_mut("results").and_then(Value::as_array_mut) {
+        for r in arr {
+            if let Some(donor) = r.get("id").and_then(Value::as_i64).and_then(|id| details.get(&id))
+            {
+                enrich_from_live(r, donor);
+            }
         }
     }
 }
@@ -423,9 +547,11 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
         local_hits.iter().filter(|h| h.tmdb_id().is_some()).cloned().collect();
 
     let mut payload = local_results_payload(&renderable, kind);
+    enrich_from_cached_details(state, kind, &mut payload).await;
 
-    // 2) Fall through to the live API on a thin/miss local result and merge.
-    if search::is_thin_result(&renderable) {
+    // 2) Fall through to the live API and merge on a thin/miss local result, or
+    //    when local results still lack fields consumers score on.
+    if search::is_thin_result(&renderable) || any_result_missing_fields(&payload, kind) {
         if let Some(key) = state.config.tmdb_api_key.as_deref() {
             let path = format!("search/{kind}");
             match upstream_get(key, &path, &[("query", query)]).await {
@@ -450,29 +576,79 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
         }
     }
 
+    ensure_result_fields(&mut payload, kind);
+    finalize_envelope(&mut payload);
     cache_put(state, cache_id, &cache_kind, &payload).await;
     rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
     Json(payload).into_response()
 }
 
-/// Shared detail handler for `tv` / `movie`, honouring
-/// `append_to_response=external_ids` so `external_ids.imdb_id` is present.
-async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str) -> Response {
+/// Append sections the facade itself always needs per detail `kind`, over and
+/// above whatever the client asks for.
+fn facade_appends(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "movie" => &["external_ids", "release_dates"],
+        _ => &["external_ids", "content_ratings"],
+    }
+}
+
+fn client_appends(params: &Value) -> Vec<String> {
+    params
+        .get("append_to_response")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Union of the facade's per-kind appends and the client's, deduped and sorted
+/// so the upstream query string is deterministic.
+fn union_appends(kind: &str, client: &[String]) -> String {
+    let mut set: std::collections::BTreeSet<&str> = facade_appends(kind).iter().copied().collect();
+    set.extend(client.iter().map(String::as_str));
+    set.into_iter().collect::<Vec<_>>().join(",")
+}
+
+/// Each appended section lands as a top-level key named after its path, so a
+/// cached payload satisfies the request iff every client-requested key exists.
+fn cached_satisfies(payload: &Value, client: &[String]) -> bool {
+    client.iter().all(|k| payload.get(k).is_some())
+}
+
+/// Shared detail handler for `tv` / `movie`. The upstream fetch always requests
+/// the union of the client's `append_to_response` and the facade's per-kind set,
+/// stored under the base `kind` cache key: richer payloads are supersets, so one
+/// cache row serves every append combination once hydrated. A cached row lacking
+/// a requested section forces a re-fetch instead of shadowing the richer request.
+async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str, params: &Value) -> Response {
     let Ok(id) = id_raw.parse::<i64>() else {
         return tmdb_error(StatusCode::BAD_REQUEST, 34, "invalid id");
     };
+    let appends = client_appends(params);
 
-    if let Some(mut cached) = cache_get(state, id, kind).await {
-        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
-        return Json(cached).into_response();
+    let cached = cache_get(state, id, kind).await;
+    if let Some(payload) = &cached
+        && cached_satisfies(payload, &appends)
+    {
+        let mut payload = payload.clone();
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
+        return Json(payload).into_response();
     }
 
+    let serve_degraded = |mut payload: Value| {
+        rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
+        Json(payload).into_response()
+    };
+
     let Some(key) = state.config.tmdb_api_key.as_deref() else {
-        return not_configured();
+        return cached.map_or_else(not_configured, serve_degraded);
     };
 
     let path = format!("{kind}/{id}");
-    match upstream_get(key, &path, &[("append_to_response", "external_ids".to_string())]).await {
+    match upstream_get(key, &path, &[("append_to_response", union_appends(kind, &appends))]).await {
         Ok(mut payload) => {
             cache_put(state, id, kind, &payload).await;
             self_link_external_ids(state, kind, id, &payload).await;
@@ -481,7 +657,10 @@ async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str) -> Response {
         }
         Err(e) => {
             tracing::warn!(error = %e, kind, id, "tmdb detail upstream failed");
-            tmdb_error(StatusCode::BAD_GATEWAY, 11, "TMDB upstream error")
+            cached.map_or_else(
+                || tmdb_error(StatusCode::BAD_GATEWAY, 11, "TMDB upstream error"),
+                serve_degraded,
+            )
         }
     }
 }
@@ -496,19 +675,24 @@ async fn search_movie(State(state): State<Arc<AppState>>, Query(params): Query<V
     search(&state, "movie", &params).await
 }
 
-/// `GET /3/tv/{id}` → `{name,first_air_date,seasons:[…],external_ids:{imdb_id}}`.
-async fn tv(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    detail(&state, "tv", &id).await
+/// `GET /3/tv/{id}?append_to_response=content_ratings` →
+/// `{name,first_air_date,seasons:[…],external_ids:{imdb_id},content_ratings:{…}}`.
+async fn tv(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<Value>,
+) -> Response {
+    detail(&state, "tv", &id, &params).await
 }
 
-/// `GET /3/movie/{id}?append_to_response=external_ids` →
-/// `{title,release_date,runtime,imdb_id,external_ids:{imdb_id},overview}`.
+/// `GET /3/movie/{id}?append_to_response=external_ids,release_dates` →
+/// `{title,release_date,runtime,imdb_id,external_ids:{imdb_id},release_dates:{…}}`.
 async fn movie(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Query(_params): Query<Value>,
+    Query(params): Query<Value>,
 ) -> Response {
-    detail(&state, "movie", &id).await
+    detail(&state, "movie", &id, &params).await
 }
 
 /// `GET /3/tv/{id}/season/{n}` → `{episodes:[{episode_number,name,runtime}]}`.
@@ -712,6 +896,146 @@ mod tests {
         enrich_from_live(&mut local, &donor);
         assert_eq!(local["release_date"], "2001-01-01");
         assert_eq!(local["overview"], "local"); // present → not overwritten
+    }
+
+    /// Local search payloads carry the full TMDB envelope, counters included.
+    #[test]
+    fn local_payload_has_search_envelope() {
+        let hits = [ScoredHit {
+            id: "603".into(),
+            name: "The Matrix".into(),
+            score: 95,
+            popularity: Some(52.4),
+            adult: Some(false),
+        }];
+        let payload = local_results_payload(&hits, "movie");
+        assert_eq!(payload["page"], 1);
+        assert_eq!(payload["total_pages"], 1);
+        assert_eq!(payload["total_results"], 1);
+        assert_eq!(payload["results"].as_array().unwrap().len(), 1);
+
+        let empty = local_results_payload(&[], "tv");
+        assert_eq!(empty["page"], 1);
+        assert_eq!(empty["total_pages"], 1);
+        assert_eq!(empty["total_results"], 0);
+        assert_eq!(empty["results"], json!([]));
+    }
+
+    /// After a live merge changes `results`, the envelope counters are recomputed.
+    #[test]
+    fn finalize_envelope_recounts_results() {
+        let mut payload = envelope(json!([]));
+        payload["results"] = json!([{"id": 1}, {"id": 2}, {"id": 3}]);
+        finalize_envelope(&mut payload);
+        assert_eq!(payload["total_results"], 3);
+        assert_eq!(payload["total_pages"], 1);
+        assert_eq!(payload["page"], 1);
+    }
+
+    /// The upstream append set is the facade's per-kind needs unioned with the
+    /// client's, deduped and deterministic.
+    #[test]
+    fn append_union_covers_facade_and_client() {
+        let none: Vec<String> = vec![];
+        assert_eq!(union_appends("movie", &none), "external_ids,release_dates");
+        assert_eq!(union_appends("tv", &none), "content_ratings,external_ids");
+        let client = vec!["release_dates".to_string(), "credits".to_string()];
+        assert_eq!(union_appends("movie", &client), "credits,external_ids,release_dates");
+        let client = vec!["content_ratings".to_string()];
+        assert_eq!(union_appends("tv", &client), "content_ratings,external_ids");
+    }
+
+    /// Client `append_to_response` parsing: split on commas, trimmed, empties
+    /// dropped; absent param yields an empty set.
+    #[test]
+    fn client_appends_parses_param() {
+        let params = json!({ "append_to_response": " external_ids , release_dates ,, " });
+        assert_eq!(client_appends(&params), vec!["external_ids", "release_dates"]);
+        assert!(client_appends(&json!({})).is_empty());
+        assert!(client_appends(&json!({ "append_to_response": "" })).is_empty());
+    }
+
+    /// A cached payload satisfies a request only when every client-requested
+    /// append section is present — a basic cached row must not shadow a richer
+    /// request, while a richer row serves a basic one.
+    #[test]
+    fn cached_payload_must_cover_requested_appends() {
+        let basic = json!({ "id": 603, "external_ids": { "imdb_id": "tt0133093" } });
+        let rich = json!({
+            "id": 603,
+            "external_ids": { "imdb_id": "tt0133093" },
+            "release_dates": { "results": [] }
+        });
+        let wants_certs = vec!["external_ids".to_string(), "release_dates".to_string()];
+        assert!(!cached_satisfies(&basic, &wants_certs));
+        assert!(cached_satisfies(&rich, &wants_certs));
+        assert!(cached_satisfies(&basic, &[]));
+        assert!(cached_satisfies(&rich, &["external_ids".to_string()]));
+    }
+
+    /// Results missing the score-bearing fields are detected per kind; `null`
+    /// counts as missing.
+    #[test]
+    fn detects_results_missing_required_fields() {
+        let complete = json!({ "results": [{
+            "id": 603, "title": "The Matrix",
+            "original_title": "The Matrix", "release_date": "1999-03-30", "overview": "…"
+        }] });
+        assert!(!any_result_missing_fields(&complete, "movie"));
+
+        let bare = json!({ "results": [{ "id": 603, "title": "The Matrix" }] });
+        assert!(any_result_missing_fields(&bare, "movie"));
+
+        let null_date = json!({ "results": [{
+            "id": 1, "name": "X", "original_name": "X", "first_air_date": null, "overview": ""
+        }] });
+        assert!(any_result_missing_fields(&null_date, "tv"));
+        assert!(!any_result_missing_fields(&json!({ "results": [] }), "tv"));
+    }
+
+    /// The last-resort fill guarantees the required fields on every result:
+    /// `original_*` falls back to the display title, dates/overview to `""`;
+    /// values already present are untouched.
+    #[test]
+    fn ensure_fields_fills_missing_and_keeps_present() {
+        let mut payload = json!({ "results": [
+            { "id": 1, "title": "Local Only" },
+            { "id": 2, "title": "Rich", "original_title": "Riche",
+              "release_date": "2001-01-01", "overview": "kept" }
+        ] });
+        ensure_result_fields(&mut payload, "movie");
+        let r = &payload["results"];
+        assert_eq!(r[0]["original_title"], "Local Only");
+        assert_eq!(r[0]["release_date"], "");
+        assert_eq!(r[0]["overview"], "");
+        assert_eq!(r[1]["original_title"], "Riche");
+        assert_eq!(r[1]["release_date"], "2001-01-01");
+        assert_eq!(r[1]["overview"], "kept");
+
+        let mut tv = json!({ "results": [{ "id": 3, "name": "銀魂", "first_air_date": null }] });
+        ensure_result_fields(&mut tv, "tv");
+        assert_eq!(tv["results"][0]["original_name"], "銀魂");
+        assert_eq!(tv["results"][0]["first_air_date"], "");
+        assert_eq!(tv["results"][0]["overview"], "");
+        assert!(!any_result_missing_fields(&tv, "tv"));
+    }
+
+    /// A cached detail payload donates the required search fields to a bare
+    /// local result via the same enrichment path live merges use.
+    #[test]
+    fn detail_payload_enriches_bare_local_result() {
+        let mut local = json!({ "id": 603, "title": "The Matrix", "popularity": 52.4 });
+        let detail = json!({
+            "id": 603, "title": "The Matrix", "original_title": "The Matrix",
+            "release_date": "1999-03-30", "overview": "A hacker…", "runtime": 136,
+            "external_ids": { "imdb_id": "tt0133093" }
+        });
+        enrich_from_live(&mut local, &detail);
+        assert!(has_required_fields(&local, "movie"));
+        assert_eq!(local["release_date"], "1999-03-30");
+        assert_eq!(local["overview"], "A hacker…");
+        assert!(local.get("runtime").is_none());
+        assert!(local.get("external_ids").is_none());
     }
 
     /// Relative TMDB image paths in nested results are rewritten through caache;

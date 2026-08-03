@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::models::{ArtistSearchResponse, RecordingSearchResponse, ReleaseSearchResponse};
+use crate::models::{
+    ArtistSearchResponse, RecordingSearchResponse, ReleaseGroupBrowseResponse,
+    ReleaseSearchResponse,
+};
 use crate::{AppState, query, repo};
 
 /// Common query string for the search endpoints.
@@ -21,6 +24,18 @@ pub struct SearchParams {
     // are fixed per endpoint. `inc` is honoured by the artist lookup (url-rels).
     #[allow(dead_code)]
     pub fmt: Option<String>,
+    pub inc: Option<String>,
+}
+
+/// Query string for the release-group browse endpoint (`?artist=<mbid>`).
+#[derive(Debug, Deserialize)]
+pub struct BrowseParams {
+    pub artist: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    #[allow(dead_code)]
+    pub fmt: Option<String>,
+    #[allow(dead_code)]
     pub inc: Option<String>,
 }
 
@@ -138,6 +153,35 @@ pub async fn lookup_recording(
     let gid = parse_mbid(&mbid)?;
     let recording = repo::lookup_recording(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(recording).expect("recording serializes")))
+}
+
+/// `GET /ws/2/release-group?artist={mbid}`
+pub async fn browse_release_group(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BrowseParams>,
+) -> ApiResult<Json<ReleaseGroupBrowseResponse>> {
+    let artist =
+        params.artist.as_deref().ok_or_else(|| ApiError::BadRequest("missing artist".into()))?;
+    let gid = parse_mbid(artist)?;
+    let limit = state.config.resolve_limit(params.limit);
+    let offset = params.offset.unwrap_or(0).max(0);
+    let (total, release_groups) =
+        repo::browse_release_groups(state.pool(), gid, limit, offset).await?;
+    Ok(Json(ReleaseGroupBrowseResponse {
+        release_group_count: total,
+        release_group_offset: offset,
+        release_groups,
+    }))
+}
+
+/// `GET /ws/2/release-group/{mbid}`
+pub async fn lookup_release_group(
+    State(state): State<Arc<AppState>>,
+    Path(mbid): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let gid = parse_mbid(&mbid)?;
+    let group = repo::lookup_release_group(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
+    Ok(Json(serde_json::to_value(group).expect("release group serializes")))
 }
 
 /// `GET /health` and `GET /ws/2` ping.
