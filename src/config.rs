@@ -247,3 +247,51 @@ impl Config {
         requested.unwrap_or(self.default_limit).clamp(1, self.max_limit)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(default_limit: i64, max_limit: i64) -> Config {
+        Cli::parse_from([
+            "shirabe",
+            "--database-url",
+            "postgres://unit-test",
+            "--default-limit",
+            &default_limit.to_string(),
+            "--max-limit",
+            &max_limit.to_string(),
+        ])
+        .config
+    }
+
+    #[test]
+    fn missing_limit_uses_default() {
+        assert_eq!(cfg(25, 100).resolve_limit(None), 25);
+    }
+
+    #[test]
+    fn in_range_limit_passes_through() {
+        assert_eq!(cfg(25, 100).resolve_limit(Some(50)), 50);
+        assert_eq!(cfg(25, 100).resolve_limit(Some(1)), 1);
+        assert_eq!(cfg(25, 100).resolve_limit(Some(100)), 100);
+    }
+
+    #[test]
+    fn over_max_limit_clamps_to_max() {
+        assert_eq!(cfg(25, 100).resolve_limit(Some(101)), 100);
+        assert_eq!(cfg(25, 100).resolve_limit(Some(i64::MAX)), 100);
+    }
+
+    #[test]
+    fn zero_or_negative_limit_clamps_to_one() {
+        assert_eq!(cfg(25, 100).resolve_limit(Some(0)), 1);
+        assert_eq!(cfg(25, 100).resolve_limit(Some(-5)), 1);
+        assert_eq!(cfg(25, 100).resolve_limit(Some(i64::MIN)), 1);
+    }
+
+    #[test]
+    fn default_is_also_clamped_to_max() {
+        assert_eq!(cfg(200, 100).resolve_limit(None), 100);
+    }
+}

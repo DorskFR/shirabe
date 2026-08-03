@@ -30,6 +30,12 @@ fn total_from(rows: &[PgRow]) -> i64 {
     rows.first().and_then(|r| r.try_get("total").ok()).unwrap_or(0)
 }
 
+fn dedup_ids(mut ids: Vec<i32>) -> Vec<i32> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
 /// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
 /// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
@@ -96,10 +102,8 @@ async fn batch_artist_credits(
     let rows = sqlx::query(queries::BATCH_ARTIST_CREDITS).bind(ac_ids).fetch_all(pool).await?;
 
     let aliases_map = if with_aliases {
-        let mut aids: Vec<i32> =
-            rows.iter().filter_map(|r| r.try_get::<i32, _>("artist_id").ok()).collect();
-        aids.sort_unstable();
-        aids.dedup();
+        let aids =
+            dedup_ids(rows.iter().filter_map(|r| r.try_get::<i32, _>("artist_id").ok()).collect());
         batch_artist_aliases(pool, &aids).await?
     } else {
         HashMap::new()
@@ -184,10 +188,12 @@ async fn batch_release_dates(
             is_xw: r.try_get("is_xw").unwrap_or(false),
         });
     }
-    for (rel, evs) in events {
-        map.insert(rel, select_release_date(&evs));
-    }
+    map.extend(collapse_dates(events));
     Ok(map)
+}
+
+fn collapse_dates(events: HashMap<i32, Vec<DateEvent>>) -> HashMap<i32, String> {
+    events.into_iter().map(|(rel, evs)| (rel, select_release_date(&evs))).collect()
 }
 
 /// Release status names for many releases at once, keyed by release id (absent
@@ -316,10 +322,8 @@ async fn batch_tracks(
     }
     let rows = sqlx::query(queries::BATCH_TRACKS).bind(medium_ids).fetch_all(pool).await?;
 
-    let mut ac_ids: Vec<i32> =
-        rows.iter().filter_map(|r| r.try_get::<i32, _>("track_ac").ok()).collect();
-    ac_ids.sort_unstable();
-    ac_ids.dedup();
+    let ac_ids =
+        dedup_ids(rows.iter().filter_map(|r| r.try_get::<i32, _>("track_ac").ok()).collect());
     let ac_map = batch_artist_credits(pool, &ac_ids, false).await?;
 
     for r in rows {
@@ -655,6 +659,45 @@ pub async fn browse_releases_by_artist(
     Ok((total, hydrate_release_search_rows(pool, rows).await?))
 }
 
+struct ReleaseMaps {
+    artist_credits: HashMap<i32, Vec<ArtistCredit>>,
+    release_groups: HashMap<i32, ReleaseGroup>,
+    dates: HashMap<i32, String>,
+    statuses: HashMap<i32, String>,
+    comments: HashMap<i32, String>,
+    track_counts: HashMap<i32, u32>,
+}
+
+struct ReleaseSeed {
+    id: i32,
+    gid: Uuid,
+    title: String,
+    score: Option<i32>,
+    artist_credit_id: i32,
+    release_group_id: Option<i32>,
+}
+
+fn assemble_release(seed: ReleaseSeed, media: Vec<Medium>, maps: &ReleaseMaps) -> Release {
+    let track_count = if media.is_empty() {
+        maps.track_counts.get(&seed.id).copied()
+    } else {
+        Some(media.iter().map(|m| m.track_count).sum())
+    };
+    Release {
+        id: seed.gid.to_string(),
+        title: seed.title,
+        date: maps.dates.get(&seed.id).cloned().unwrap_or_default(),
+        score: seed.score,
+        status: maps.statuses.get(&seed.id).cloned(),
+        disambiguation: maps.comments.get(&seed.id).cloned(),
+        artist_credit: maps.artist_credits.get(&seed.artist_credit_id).cloned().unwrap_or_default(),
+        track_count,
+        release_group: seed.release_group_id.and_then(|r| maps.release_groups.get(&r).cloned()),
+        media,
+        relations: Vec::new(),
+    }
+}
+
 async fn hydrate_release_search_rows(
     pool: &PgPool,
     rows: Vec<PgRow>,
@@ -670,41 +713,27 @@ async fn hydrate_release_search_rows(
     let rg_ids: Vec<i32> =
         rows.iter().filter_map(|r| r.try_get::<i32, _>("release_group").ok()).collect();
 
-    let ac_map = batch_artist_credits(pool, &ac_ids, false).await?;
-    let rg_map = batch_release_groups(pool, &rg_ids).await?;
-    let date_map = batch_release_dates(pool, &release_ids).await?;
-    let status_map = batch_release_statuses(pool, &release_ids).await?;
-    let comment_map = batch_release_comments(pool, &release_ids).await?;
-    let tc_map = batch_release_track_counts(pool, &release_ids).await?;
+    let maps = ReleaseMaps {
+        artist_credits: batch_artist_credits(pool, &ac_ids, false).await?,
+        release_groups: batch_release_groups(pool, &rg_ids).await?,
+        dates: batch_release_dates(pool, &release_ids).await?,
+        statuses: batch_release_statuses(pool, &release_ids).await?,
+        comments: batch_release_comments(pool, &release_ids).await?,
+        track_counts: batch_release_track_counts(pool, &release_ids).await?,
+    };
 
     let mut releases = Vec::with_capacity(rows.len());
     for row in rows {
-        let id: i32 = row.try_get("id")?;
-        let gid: Uuid = row.try_get("gid")?;
         let title_score: f32 = row.try_get("title_score")?;
-        let artist_credit_id: i32 = row.try_get("artist_credit")?;
-        let rg_id: Option<i32> = row.try_get("release_group").ok();
-
-        let artist_credit = ac_map.get(&artist_credit_id).cloned().unwrap_or_default();
-        let release_group = rg_id.and_then(|r| rg_map.get(&r).cloned());
-        let date = date_map.get(&id).cloned().unwrap_or_default();
-        let status = status_map.get(&id).cloned();
-        let disambiguation = comment_map.get(&id).cloned();
-        let track_count = tc_map.get(&id).copied();
-
-        releases.push(Release {
-            id: gid.to_string(),
+        let seed = ReleaseSeed {
+            id: row.try_get("id")?,
+            gid: row.try_get("gid")?,
             title: row.try_get("name")?,
-            date,
             score: Some(to_score(title_score)),
-            status,
-            disambiguation,
-            artist_credit,
-            track_count,
-            release_group,
-            media: Vec::new(),
-            relations: Vec::new(),
-        });
+            artist_credit_id: row.try_get("artist_credit")?,
+            release_group_id: row.try_get("release_group").ok(),
+        };
+        releases.push(assemble_release(seed, Vec::new(), &maps));
     }
     Ok(releases)
 }
@@ -1086,62 +1115,43 @@ async fn batch_recording_releases(
         sqlx::query(queries::BATCH_RECORDING_RELEASES).bind(recording_ids).fetch_all(pool).await?;
 
     // Distinct keys across every recording's releases, hydrated once.
-    let mut release_ids: Vec<i32> =
-        rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
-    release_ids.sort_unstable();
-    release_ids.dedup();
+    let release_ids =
+        dedup_ids(rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect());
     let ac_ids: Vec<i32> =
         rows.iter().filter_map(|r| r.try_get::<i32, _>("artist_credit").ok()).collect();
     let rg_ids: Vec<i32> =
         rows.iter().filter_map(|r| r.try_get::<i32, _>("release_group").ok()).collect();
 
-    let ac_map = batch_artist_credits(pool, &ac_ids, false).await?;
-    let rg_map = batch_release_groups(pool, &rg_ids).await?;
-    let date_map = batch_release_dates(pool, &release_ids).await?;
-    let status_map = batch_release_statuses(pool, &release_ids).await?;
-    let comment_map = batch_release_comments(pool, &release_ids).await?;
     let media_map =
         if with_media { batch_media(pool, &release_ids).await? } else { HashMap::new() };
     // track-count derives from media when present; media-less releases (and the
     // no-media lookup path) fall back to the summed medium track-counts.
-    let tc_map = batch_release_track_counts(pool, &release_ids).await?;
+    let maps = ReleaseMaps {
+        artist_credits: batch_artist_credits(pool, &ac_ids, false).await?,
+        release_groups: batch_release_groups(pool, &rg_ids).await?,
+        dates: batch_release_dates(pool, &release_ids).await?,
+        statuses: batch_release_statuses(pool, &release_ids).await?,
+        comments: batch_release_comments(pool, &release_ids).await?,
+        track_counts: batch_release_track_counts(pool, &release_ids).await?,
+    };
 
     for row in rows {
         let rec: i32 = row.try_get("rec")?;
         let id: i32 = row.try_get("id")?;
-        let gid: Uuid = row.try_get("gid")?;
-        let artist_credit_id: i32 = row.try_get("artist_credit")?;
-        let rg_id: Option<i32> = row.try_get("release_group").ok();
-
-        let artist_credit = ac_map.get(&artist_credit_id).cloned().unwrap_or_default();
-        let release_group = rg_id.and_then(|r| rg_map.get(&r).cloned());
-        let date = date_map.get(&id).cloned().unwrap_or_default();
-        let status = status_map.get(&id).cloned();
-        let disambiguation = comment_map.get(&id).cloned();
+        let seed = ReleaseSeed {
+            id,
+            gid: row.try_get("gid")?,
+            title: row.try_get("name")?,
+            score: None,
+            artist_credit_id: row.try_get("artist_credit")?,
+            release_group_id: row.try_get("release_group").ok(),
+        };
         let media = if with_media {
             media_to_model(media_map.get(&id).cloned().unwrap_or_default())
         } else {
             Vec::new()
         };
-        let track_count = if media.is_empty() {
-            tc_map.get(&id).copied()
-        } else {
-            Some(media.iter().map(|m| m.track_count).sum())
-        };
-
-        result.entry(rec).or_default().push(Release {
-            id: gid.to_string(),
-            title: row.try_get("name")?,
-            date,
-            score: None,
-            status,
-            disambiguation,
-            artist_credit,
-            track_count,
-            release_group,
-            media,
-            relations: Vec::new(),
-        });
+        result.entry(rec).or_default().push(assemble_release(seed, media, &maps));
     }
     Ok(result)
 }
@@ -1149,4 +1159,234 @@ async fn batch_recording_releases(
 /// Cheap connectivity probe used by the health endpoint.
 pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(queries::PING).execute(pool).await.map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uuid(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn credit(name: &str) -> ArtistCredit {
+        ArtistCredit {
+            artist: ArtistRef { id: uuid(9).to_string(), name: name.into(), aliases: Vec::new() },
+        }
+    }
+
+    fn empty_maps() -> ReleaseMaps {
+        ReleaseMaps {
+            artist_credits: HashMap::new(),
+            release_groups: HashMap::new(),
+            dates: HashMap::new(),
+            statuses: HashMap::new(),
+            comments: HashMap::new(),
+            track_counts: HashMap::new(),
+        }
+    }
+
+    fn seed(id: i32, ac_id: i32, rg_id: Option<i32>) -> ReleaseSeed {
+        ReleaseSeed {
+            id,
+            gid: uuid(u128::try_from(id).unwrap()),
+            title: format!("release {id}"),
+            score: None,
+            artist_credit_id: ac_id,
+            release_group_id: rg_id,
+        }
+    }
+
+    fn track(name: &str, position: i32) -> TrackData {
+        TrackData {
+            track_gid: uuid(100),
+            track_name: name.into(),
+            position,
+            number: position.to_string(),
+            rec_gid: uuid(200),
+            rec_name: format!("{name} (recording)"),
+            rec_length: Some(215_000),
+            artist_credit: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn to_score_scales_and_clamps() {
+        assert_eq!(to_score(0.0), 0);
+        assert_eq!(to_score(1.0), 100);
+        assert_eq!(to_score(0.456), 46);
+        assert_eq!(to_score(0.995), 100);
+        assert_eq!(to_score(1.7), 100);
+        assert_eq!(to_score(-0.3), 0);
+    }
+
+    #[test]
+    fn dedup_ids_sorts_and_dedups() {
+        assert_eq!(dedup_ids(vec![]), Vec::<i32>::new());
+        assert_eq!(dedup_ids(vec![3, 1, 3, 2, 1]), vec![1, 2, 3]);
+        assert_eq!(dedup_ids(vec![5]), vec![5]);
+    }
+
+    #[test]
+    fn collapse_dates_picks_earliest_per_release() {
+        let mut events = HashMap::new();
+        events.insert(
+            1,
+            vec![
+                DateEvent { year: Some(1999), month: Some(6), day: None, is_xw: false },
+                DateEvent { year: Some(1997), month: Some(9), day: Some(20), is_xw: false },
+            ],
+        );
+        events.insert(2, vec![DateEvent { year: None, month: Some(3), day: None, is_xw: false }]);
+
+        let map = collapse_dates(events);
+        assert_eq!(map[&1], "1997-09-20");
+        assert_eq!(map[&2], "");
+    }
+
+    #[test]
+    fn collapse_dates_empty() {
+        assert!(collapse_dates(HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn media_to_model_empty() {
+        assert!(media_to_model(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn media_to_model_preserves_order_and_maps_fields() {
+        let data = vec![
+            MediaData {
+                id: 11,
+                position: 1,
+                track_count: 2,
+                title: Some("Disc One".into()),
+                format: Some("CD".into()),
+                tracks: vec![track("Alpha", 1), track("Beta", 2)],
+            },
+            MediaData {
+                id: 12,
+                position: 2,
+                track_count: 0,
+                title: None,
+                format: None,
+                tracks: vec![],
+            },
+        ];
+
+        let media = media_to_model(data);
+        assert_eq!(media.len(), 2);
+
+        let first = &media[0];
+        assert_eq!(first.id, "11");
+        assert_eq!(first.position, 1);
+        assert_eq!(first.track_count, 2);
+        assert_eq!(first.title.as_deref(), Some("Disc One"));
+        assert_eq!(first.format.as_deref(), Some("CD"));
+        assert_eq!(first.tracks.len(), 2);
+        assert_eq!(first.tracks[0].title, "Alpha");
+        assert_eq!(first.tracks[0].position, 1);
+        assert_eq!(first.tracks[0].number, "1");
+        assert_eq!(first.tracks[0].id, uuid(100).to_string());
+        assert_eq!(first.tracks[0].recording.id, uuid(200).to_string());
+        assert_eq!(first.tracks[0].recording.title, "Alpha (recording)");
+        assert_eq!(first.tracks[0].recording.length, Some(215_000));
+        assert_eq!(first.tracks[1].title, "Beta");
+
+        let second = &media[1];
+        assert_eq!(second.id, "12");
+        assert_eq!(second.position, 2);
+        assert!(second.title.is_none());
+        assert!(second.format.is_none());
+        assert!(second.tracks.is_empty());
+    }
+
+    #[test]
+    fn assemble_release_defaults_on_empty_maps() {
+        let rel = assemble_release(seed(7, 70, None), Vec::new(), &empty_maps());
+        assert_eq!(rel.id, uuid(7).to_string());
+        assert_eq!(rel.title, "release 7");
+        assert_eq!(rel.date, "");
+        assert!(rel.score.is_none());
+        assert!(rel.status.is_none());
+        assert!(rel.disambiguation.is_none());
+        assert!(rel.artist_credit.is_empty());
+        assert!(rel.track_count.is_none());
+        assert!(rel.release_group.is_none());
+        assert!(rel.media.is_empty());
+        assert!(rel.relations.is_empty());
+    }
+
+    #[test]
+    fn assemble_release_pulls_from_maps_by_key() {
+        let mut maps = empty_maps();
+        maps.artist_credits.insert(70, vec![credit("Björk"), credit("Thom Yorke")]);
+        maps.release_groups.insert(
+            5,
+            ReleaseGroup { id: uuid(5).to_string(), primary_type: Some("Album".into()) },
+        );
+        maps.dates.insert(7, "1997-09-20".into());
+        maps.statuses.insert(7, "Official".into());
+        maps.comments.insert(7, "UK edition".into());
+        maps.track_counts.insert(7, 10);
+
+        let rel = assemble_release(seed(7, 70, Some(5)), Vec::new(), &maps);
+        assert_eq!(rel.date, "1997-09-20");
+        assert_eq!(rel.status.as_deref(), Some("Official"));
+        assert_eq!(rel.disambiguation.as_deref(), Some("UK edition"));
+        assert_eq!(rel.track_count, Some(10));
+        assert_eq!(rel.release_group.as_ref().unwrap().id, uuid(5).to_string());
+        let names: Vec<&str> = rel.artist_credit.iter().map(|c| c.artist.name.as_str()).collect();
+        assert_eq!(names, ["Björk", "Thom Yorke"], "credit position order preserved");
+    }
+
+    #[test]
+    fn assemble_release_ignores_other_releases_keys() {
+        let mut maps = empty_maps();
+        maps.dates.insert(8, "2001".into());
+        maps.statuses.insert(8, "Bootleg".into());
+        maps.track_counts.insert(8, 3);
+
+        let rel = assemble_release(seed(7, 70, Some(5)), Vec::new(), &maps);
+        assert_eq!(rel.date, "");
+        assert!(rel.status.is_none());
+        assert!(rel.track_count.is_none());
+        assert!(rel.release_group.is_none(), "rg id 5 absent from map");
+    }
+
+    #[test]
+    fn assemble_release_track_count_prefers_media_sum() {
+        let mut maps = empty_maps();
+        maps.track_counts.insert(7, 99);
+        let media = media_to_model(vec![
+            MediaData {
+                id: 1,
+                position: 1,
+                track_count: 8,
+                title: None,
+                format: None,
+                tracks: vec![],
+            },
+            MediaData {
+                id: 2,
+                position: 2,
+                track_count: 5,
+                title: None,
+                format: None,
+                tracks: vec![],
+            },
+        ]);
+
+        let rel = assemble_release(seed(7, 70, None), media, &maps);
+        assert_eq!(rel.track_count, Some(13), "media sum wins over batched fallback");
+    }
+
+    #[test]
+    fn assemble_release_track_count_falls_back_without_media() {
+        let mut maps = empty_maps();
+        maps.track_counts.insert(7, 99);
+        let rel = assemble_release(seed(7, 70, None), Vec::new(), &maps);
+        assert_eq!(rel.track_count, Some(99));
+    }
 }
