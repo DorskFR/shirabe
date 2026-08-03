@@ -10,9 +10,9 @@ use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
 use crate::models::{
-    Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Medium, Recording, RecordingRef,
-    Relation, Release, ReleaseGroup, ReleaseGroupDetail, ReleaseGroupRelease, ReleaseStub, Track,
-    UrlRelation, UrlResource,
+    Alias, Artist, ArtistCredit, ArtistLookup, ArtistRef, Genre, Medium, Recording, RecordingRef,
+    Relation, Release, ReleaseGroup, ReleaseGroupDetail, ReleaseGroupRelease, ReleaseStub, Tag,
+    Track, UrlRelation, UrlResource,
 };
 use crate::queries;
 use crate::search::configure_search_session;
@@ -23,6 +23,11 @@ use crate::search::configure_search_session;
 /// `f32`; we widen to `f64` only for the arithmetic here.
 fn to_score(similarity: f32) -> i32 {
     (f64::from(similarity) * 100.0).round().clamp(0.0, 100.0) as i32
+}
+
+/// `COUNT(*) OVER ()` total; 0 on an empty page (past-the-end offsets).
+fn total_from(rows: &[PgRow]) -> i64 {
+    rows.first().and_then(|r| r.try_get("total").ok()).unwrap_or(0)
 }
 
 /// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
@@ -381,9 +386,10 @@ pub async fn search_artists(
     pool: &PgPool,
     name: &str,
     limit: i64,
+    offset: i64,
     threshold: f64,
     work_mem: &str,
-) -> Result<Vec<Artist>, sqlx::Error> {
+) -> Result<(i64, Vec<Artist>), sqlx::Error> {
     // SHIB-23: FTS + f_unaccent whole-word fast path across artist.name /
     // sort_name / artist_alias.name (3 UNION branches, de-duped by id with MAX
     // score so a name/sort_name/alias hit all compete). Accent-folded, so 'bjork'
@@ -392,16 +398,21 @@ pub async fn search_artists(
     // / alternate names), previously loaded per-row by FK but never searched.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let mut rows =
-        sqlx::query(queries::SEARCH_ARTISTS).bind(name).bind(limit).fetch_all(&mut *conn).await?;
+    let mut rows = sqlx::query(queries::SEARCH_ARTISTS)
+        .bind(name)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *conn)
+        .await?;
     if rows.is_empty() {
         rows = fetch_fuzzy(
-            sqlx::query(queries::SEARCH_ARTISTS_FUZZY).bind(name).bind(limit),
+            sqlx::query(queries::SEARCH_ARTISTS_FUZZY).bind(name).bind(limit).bind(offset),
             &mut conn,
         )
         .await?;
     }
     drop(conn);
+    let total = total_from(&rows);
 
     // SHIB-17: batch all artists' aliases in one query instead of one per row.
     let ids: Vec<i32> = rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
@@ -420,19 +431,25 @@ pub async fn search_artists(
             aliases,
         });
     }
-    Ok(artists)
+    Ok((total, artists))
 }
 
 // ── Artist lookup ─────────────────────────────────────────
 
-/// `GET /ws/2/artist/{mbid}[?inc=url-rels]`
-///
-/// Loads the core artist row by MBID; when `with_url_rels` is set, also attaches
-/// the artist's URL relationships (e.g. the `image` link).
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArtistIncludes {
+    pub url_rels: bool,
+    pub genres: bool,
+    pub tags: bool,
+    pub annotation: bool,
+}
+
+/// `GET /ws/2/artist/{mbid}[?inc=url-rels+genres+tags+annotation]`
 pub async fn lookup_artist(
     pool: &PgPool,
     gid: Uuid,
-    with_url_rels: bool,
+    inc: ArtistIncludes,
 ) -> Result<Option<ArtistLookup>, sqlx::Error> {
     let Some(row) = sqlx::query(queries::LOOKUP_ARTIST).bind(gid).fetch_optional(pool).await?
     else {
@@ -442,7 +459,11 @@ pub async fn lookup_artist(
     let id: i32 = row.try_get("id")?;
     let comment: String = row.try_get("comment").unwrap_or_default();
     let relations =
-        if with_url_rels { load_artist_url_relations(pool, id).await? } else { Vec::new() };
+        if inc.url_rels { load_artist_url_relations(pool, id).await? } else { Vec::new() };
+    let genres = if inc.genres { Some(load_artist_genres(pool, id).await?) } else { None };
+    let tags = if inc.tags { Some(load_artist_tags(pool, id).await?) } else { None };
+    let annotation =
+        if inc.annotation { Some(load_artist_annotation(pool, id).await?) } else { None };
 
     Ok(Some(ArtistLookup {
         id: gid.to_string(),
@@ -451,12 +472,15 @@ pub async fn lookup_artist(
         artist_type: row.try_get("type_name").ok(),
         disambiguation: if comment.is_empty() { None } else { Some(comment) },
         relations,
+        genres,
+        tags,
+        annotation,
     }))
 }
 
 /// artist-url relations (`l_artist_url`) for an artist lookup. Maps
 /// `link_type.name` to the ws/2 relation `type` and `url.url` to
-/// `relation.url.resource`. These are always `forward` (artist -> url).
+/// `relation.url.resource`.
 async fn load_artist_url_relations(
     pool: &PgPool,
     artist_id: i32,
@@ -468,10 +492,36 @@ async fn load_artist_url_relations(
         .into_iter()
         .map(|r| UrlRelation {
             rel_type: r.get("rel_type"),
-            direction: "forward".to_string(),
+            direction: r.get("direction"),
             url: UrlResource { resource: r.get("resource") },
         })
         .collect())
+}
+
+async fn load_artist_genres(pool: &PgPool, artist_id: i32) -> Result<Vec<Genre>, sqlx::Error> {
+    let rows = sqlx::query(queries::LOAD_ARTIST_GENRES).bind(artist_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| {
+            let gid: Uuid = r.try_get("gid")?;
+            Ok(Genre { id: gid.to_string(), name: r.try_get("name")?, count: r.try_get("count")? })
+        })
+        .collect()
+}
+
+async fn load_artist_tags(pool: &PgPool, artist_id: i32) -> Result<Vec<Tag>, sqlx::Error> {
+    let rows = sqlx::query(queries::LOAD_ARTIST_TAGS).bind(artist_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| Ok(Tag { name: r.try_get("name")?, count: r.try_get("count")? }))
+        .collect()
+}
+
+async fn load_artist_annotation(
+    pool: &PgPool,
+    artist_id: i32,
+) -> Result<Option<String>, sqlx::Error> {
+    let row =
+        sqlx::query(queries::LOAD_ARTIST_ANNOTATION).bind(artist_id).fetch_optional(pool).await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("text").ok().flatten()))
 }
 
 async fn load_artist_aliases(pool: &PgPool, artist_id: i32) -> Result<Vec<Alias>, sqlx::Error> {
@@ -542,9 +592,10 @@ pub async fn search_releases(
     title: &str,
     filters: ReleaseFilters<'_>,
     limit: i64,
+    offset: i64,
     threshold: f64,
     work_mem: &str,
-) -> Result<Vec<Release>, sqlx::Error> {
+) -> Result<(i64, Vec<Release>), sqlx::Error> {
     // SHIB-22: FTS whole-word fast path (0.4ms warm vs ~350ms for the trigram `%`
     // scan), ranked by similarity() with an optional artist-credit similarity bonus
     // so title stays the dominant signal; trigram `%` fallback only when FTS matches
@@ -561,6 +612,7 @@ pub async fn search_releases(
         .bind(limit)
         .bind(filters.primary_type)
         .bind(filters.status)
+        .bind(offset)
         .fetch_all(&mut *conn)
         .await?;
     if rows.is_empty() {
@@ -571,13 +623,15 @@ pub async fn search_releases(
                 .bind(year_i32)
                 .bind(limit)
                 .bind(filters.primary_type)
-                .bind(filters.status),
+                .bind(filters.status)
+                .bind(offset),
             &mut conn,
         )
         .await?;
     }
     drop(conn);
-    hydrate_release_search_rows(pool, rows).await
+    let total = total_from(&rows);
+    Ok((total, hydrate_release_search_rows(pool, rows).await?))
 }
 
 /// `GET /ws/2/release?query=arid:{mbid} [AND primarytype:.. AND status:..]`
@@ -587,15 +641,18 @@ pub async fn browse_releases_by_artist(
     primary_type: Option<&str>,
     status: Option<&str>,
     limit: i64,
-) -> Result<Vec<Release>, sqlx::Error> {
+    offset: i64,
+) -> Result<(i64, Vec<Release>), sqlx::Error> {
     let rows = sqlx::query(queries::BROWSE_RELEASES_BY_ARTIST)
         .bind(artist_gid)
         .bind(primary_type)
         .bind(status)
         .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?;
-    hydrate_release_search_rows(pool, rows).await
+    let total = total_from(&rows);
+    Ok((total, hydrate_release_search_rows(pool, rows).await?))
 }
 
 async fn hydrate_release_search_rows(
@@ -915,9 +972,10 @@ pub async fn search_recordings(
     title: &str,
     artist: Option<&str>,
     limit: i64,
+    offset: i64,
     threshold: f64,
     work_mem: &str,
-) -> Result<Vec<Recording>, sqlx::Error> {
+) -> Result<(i64, Vec<Recording>), sqlx::Error> {
     // SHIB-22: FTS whole-word fast path, ranked by similarity(); trigram `%`
     // fallback only when FTS matches nothing. Recording is 36M rows, where the old
     // trigram-`%`-primary scan timed out — FTS reduces the candidate set to the
@@ -928,16 +986,22 @@ pub async fn search_recordings(
         .bind(title)
         .bind(artist)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&mut *conn)
         .await?;
     if rows.is_empty() {
         rows = fetch_fuzzy(
-            sqlx::query(queries::SEARCH_RECORDINGS_FUZZY).bind(title).bind(artist).bind(limit),
+            sqlx::query(queries::SEARCH_RECORDINGS_FUZZY)
+                .bind(title)
+                .bind(artist)
+                .bind(limit)
+                .bind(offset),
             &mut conn,
         )
         .await?;
     }
     drop(conn);
+    let total = total_from(&rows);
 
     // SHIB-17: batch the artist-credits (with aliases) for every recording in one
     // query, and batch-hydrate the nested recording→releases fan-out (media +
@@ -969,7 +1033,7 @@ pub async fn search_recordings(
             releases,
         });
     }
-    Ok(recordings)
+    Ok((total, recordings))
 }
 
 // ── Recording lookup ──────────────────────────────────────

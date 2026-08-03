@@ -21,7 +21,8 @@
 // MAX score. Trigram `%` fallback (SEARCH_ARTISTS_FUZZY) runs only when FTS
 // matches nothing (typo'd / partial query).
 pub const SEARCH_ARTISTS: &str = r"
-        SELECT c.id, c.gid, c.name, MAX(c.score) AS score
+        SELECT c.id, c.gid, c.name, MAX(c.score) AS score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             ( SELECT a.id, a.gid, a.name,
                      GREATEST(similarity(musicbrainz.f_unaccent(a.name), musicbrainz.f_unaccent($1)),
@@ -46,39 +47,41 @@ pub const SEARCH_ARTISTS: &str = r"
         ) c
         GROUP BY c.id, c.gid, c.name
         ORDER BY score DESC, c.id ASC
-        LIMIT $2
+        LIMIT $2 OFFSET $3
         ";
 
 // Trigram fallback for SEARCH_ARTISTS: used only when FTS matches nothing. The
-// per-branch KNN `<->`/`%` bounds each candidate set to $2 (gin_trgm_ops); trigram
-// is naturally accent-tolerant, so no f_unaccent here.
+// per-branch KNN `<->`/`%` bounds each candidate set to $2 + $3 (gin_trgm_ops) so
+// offset paging can reach past the first page; trigram is naturally
+// accent-tolerant, so no f_unaccent here.
 pub const SEARCH_ARTISTS_FUZZY: &str = r"
-        SELECT c.id, c.gid, c.name, MAX(c.score) AS score
+        SELECT c.id, c.gid, c.name, MAX(c.score) AS score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             ( SELECT a.id, a.gid, a.name,
                      GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
               FROM musicbrainz.artist a
               WHERE a.name % $1
               ORDER BY a.name <-> $1
-              LIMIT $2 )
+              LIMIT $2 + $3 )
             UNION ALL
             ( SELECT a.id, a.gid, a.name,
                      GREATEST(similarity(a.name, $1), similarity(a.sort_name, $1)) AS score
               FROM musicbrainz.artist a
               WHERE a.sort_name % $1
               ORDER BY a.sort_name <-> $1
-              LIMIT $2 )
+              LIMIT $2 + $3 )
             UNION ALL
             ( SELECT a.id, a.gid, a.name, similarity(aa.name, $1) AS score
               FROM musicbrainz.artist_alias aa
               JOIN musicbrainz.artist a ON a.id = aa.artist
               WHERE aa.name % $1
               ORDER BY aa.name <-> $1
-              LIMIT $2 )
+              LIMIT $2 + $3 )
         ) c
         GROUP BY c.id, c.gid, c.name
         ORDER BY score DESC, c.id ASC
-        LIMIT $2
+        LIMIT $2 OFFSET $3
         ";
 
 // SHIB-23: FTS + f_unaccent fast path. `to_tsvector(f_unaccent(name)) @@
@@ -90,7 +93,8 @@ pub const SEARCH_ARTISTS_FUZZY: &str = r"
 // whole candidate set (that join was O(candidates): 8s for 'over the rainbow').
 pub const SEARCH_RELEASES: &str = r"
         SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
-               similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score
+               similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
             FROM musicbrainz.release r
@@ -119,7 +123,7 @@ pub const SEARCH_RELEASES: &str = r"
                                         FROM musicbrainz.artist_credit ac
                                         WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
                  c.id ASC
-        LIMIT $4
+        LIMIT $4 OFFSET $7
         ";
 
 // Trigram fallback for SEARCH_RELEASES: used only when FTS matches nothing (a
@@ -127,7 +131,8 @@ pub const SEARCH_RELEASES: &str = r"
 // filter — slower, but the rare path — so recall never regresses vs pure FTS.
 pub const SEARCH_RELEASES_FUZZY: &str = r"
         SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
-               similarity(c.name, $1)::real AS title_score
+               similarity(c.name, $1)::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
             FROM musicbrainz.release r
@@ -155,12 +160,13 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
                                         FROM musicbrainz.artist_credit ac
                                         WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
                  c.id ASC
-        LIMIT $4
+        LIMIT $4 OFFSET $7
         ";
 
 pub const SEARCH_RECORDINGS: &str = r"
         SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
-               similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score
+               similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
             FROM musicbrainz.recording rec
@@ -176,13 +182,14 @@ pub const SEARCH_RECORDINGS: &str = r"
                                         FROM musicbrainz.artist_credit ac
                                         WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
                  c.id ASC
-        LIMIT $3
+        LIMIT $3 OFFSET $4
         ";
 
 // Trigram fallback for SEARCH_RECORDINGS (see SEARCH_RELEASES_FUZZY).
 pub const SEARCH_RECORDINGS_FUZZY: &str = r"
         SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
-               similarity(c.name, $1)::real AS title_score
+               similarity(c.name, $1)::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
         FROM (
             SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
             FROM musicbrainz.recording rec
@@ -197,12 +204,13 @@ pub const SEARCH_RECORDINGS_FUZZY: &str = r"
                                         FROM musicbrainz.artist_credit ac
                                         WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
                  c.id ASC
-        LIMIT $3
+        LIMIT $3 OFFSET $4
         ";
 
 pub const BROWSE_RELEASES_BY_ARTIST: &str = r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
-               1.0::real AS title_score
+               1.0::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
         FROM musicbrainz.release r
         WHERE EXISTS (
             SELECT 1 FROM musicbrainz.artist_credit_name acn
@@ -216,7 +224,7 @@ pub const BROWSE_RELEASES_BY_ARTIST: &str = r"
                 SELECT 1 FROM musicbrainz.release_status rs
                 WHERE rs.id = r.status AND lower(rs.name) = lower($3)))
         ORDER BY r.id ASC
-        LIMIT $4
+        LIMIT $4 OFFSET $5
         ";
 
 // MusicBrainz mirror — release-group browse
@@ -372,14 +380,42 @@ pub const BATCH_RECORDING_RELEASES: &str = r"
         ";
 
 // MusicBrainz mirror — per-row loaders (lookup path)
+// l_artist_url stores the artist as entity0 (MB link tables order entity types
+// alphabetically), so the artist-side direction is always forward.
 pub const LOAD_ARTIST_URL_RELATIONS: &str = r"
-        SELECT lt.name AS rel_type, u.url AS resource
+        SELECT lt.name AS rel_type, 'forward' AS direction, u.url AS resource
         FROM musicbrainz.l_artist_url l
         JOIN musicbrainz.link lk ON lk.id = l.link
         JOIN musicbrainz.link_type lt ON lt.id = lk.link_type
         JOIN musicbrainz.url u ON u.id = l.entity1
         WHERE l.entity0 = $1
         ORDER BY l.id ASC
+        ";
+
+pub const LOAD_ARTIST_GENRES: &str = r"
+        SELECT g.gid, g.name, at.count
+        FROM musicbrainz.artist_tag at
+        JOIN musicbrainz.tag t ON t.id = at.tag
+        JOIN musicbrainz.genre g ON g.name = t.name
+        WHERE at.artist = $1 AND at.count > 0
+        ORDER BY g.name ASC
+        ";
+
+pub const LOAD_ARTIST_TAGS: &str = r"
+        SELECT t.name, at.count
+        FROM musicbrainz.artist_tag at
+        JOIN musicbrainz.tag t ON t.id = at.tag
+        WHERE at.artist = $1 AND at.count > 0
+        ORDER BY t.name ASC
+        ";
+
+pub const LOAD_ARTIST_ANNOTATION: &str = r"
+        SELECT a.text
+        FROM musicbrainz.artist_annotation aa
+        JOIN musicbrainz.annotation a ON a.id = aa.annotation
+        WHERE aa.artist = $1
+        ORDER BY a.created DESC
+        LIMIT 1
         ";
 
 pub const LOAD_ARTIST_ALIASES: &str = r"
@@ -651,7 +687,11 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: true,
             sql: SEARCH_ARTISTS,
-            params: vec![p("name", Text, "björk"), p("limit", BigInt, "25")],
+            params: vec![
+                p("name", Text, "björk"),
+                p("limit", BigInt, "25"),
+                p("offset", BigInt, "0"),
+            ],
         },
         QuerySpec {
             id: "search_artists_fuzzy",
@@ -660,7 +700,11 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: true,
             sql: SEARCH_ARTISTS_FUZZY,
-            params: vec![p("name", Text, "björk"), p("limit", BigInt, "25")],
+            params: vec![
+                p("name", Text, "björk"),
+                p("limit", BigInt, "25"),
+                p("offset", BigInt, "0"),
+            ],
         },
         QuerySpec {
             id: "search_releases",
@@ -676,6 +720,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("limit", BigInt, "25"),
                 pn("primarytype", Text, ""),
                 pn("status", Text, ""),
+                p("offset", BigInt, "0"),
             ],
         },
         QuerySpec {
@@ -692,6 +737,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("limit", BigInt, "25"),
                 pn("primarytype", Text, ""),
                 pn("status", Text, ""),
+                p("offset", BigInt, "0"),
             ],
         },
         QuerySpec {
@@ -705,6 +751,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("title", Text, "paranoid android"),
                 pn("artist", Text, ""),
                 p("limit", BigInt, "25"),
+                p("offset", BigInt, "0"),
             ],
         },
         QuerySpec {
@@ -718,6 +765,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("title", Text, "paranoid android"),
                 pn("artist", Text, ""),
                 p("limit", BigInt, "25"),
+                p("offset", BigInt, "0"),
             ],
         },
         QuerySpec {
@@ -785,6 +833,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 pn("primarytype", Text, "album"),
                 pn("status", Text, "official"),
                 p("limit", BigInt, "100"),
+                p("offset", BigInt, "0"),
             ],
         },
         QuerySpec {
@@ -954,6 +1003,33 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: false,
             sql: LOAD_ARTIST_URL_RELATIONS,
+            params: vec![p("artist_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_artist_genres",
+            title: "Load: artist genres",
+            endpoint: "GET /ws/2/artist/{mbid}?inc=genres",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_ARTIST_GENRES,
+            params: vec![p("artist_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_artist_tags",
+            title: "Load: artist tags",
+            endpoint: "GET /ws/2/artist/{mbid}?inc=tags",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_ARTIST_TAGS,
+            params: vec![p("artist_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_artist_annotation",
+            title: "Load: artist annotation (latest)",
+            endpoint: "GET /ws/2/artist/{mbid}?inc=annotation",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_ARTIST_ANNOTATION,
             params: vec![p("artist_id", Int, "1")],
         },
         QuerySpec {
