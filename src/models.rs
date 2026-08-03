@@ -252,6 +252,29 @@ mod tests {
     }
 
     #[test]
+    fn release_search_result_carries_release_group_id() {
+        let v = serde_json::to_value(ReleaseSearchResponse {
+            releases: vec![Release {
+                id: "b1392450-e666-3926-a536-22c65f834433".into(),
+                title: "Homogenic".into(),
+                date: "1997-09-20".into(),
+                score: Some(100),
+                status: Some("Official".into()),
+                release_group: Some(ReleaseGroup {
+                    id: "0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd".into(),
+                    primary_type: Some("Album".into()),
+                }),
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        let rel = &v["releases"][0];
+        assert_eq!(rel["release-group"]["id"], json!("0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd"));
+        assert_eq!(rel["release-group"]["primary-type"], json!("Album"));
+        assert_eq!(rel["status"], json!("Official"));
+    }
+
+    #[test]
     fn browse_response_shape() {
         let v = serde_json::to_value(ReleaseGroupBrowseResponse {
             release_group_count: 342,

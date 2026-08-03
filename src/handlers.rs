@@ -70,16 +70,32 @@ pub async fn search_release(
 ) -> ApiResult<Json<ReleaseSearchResponse>> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
+    let limit = state.config.resolve_limit(params.limit);
+    if let Some(arid) = parsed.arid.as_deref() {
+        let gid = parse_mbid(arid)?;
+        let releases = repo::browse_releases_by_artist(
+            state.pool(),
+            gid,
+            parsed.primary_type.as_deref(),
+            parsed.status.as_deref(),
+            limit,
+        )
+        .await?;
+        return Ok(Json(ReleaseSearchResponse { releases }));
+    }
     let title = parsed
         .release
         .or_else(|| parsed.bare.clone())
         .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
-    let limit = state.config.resolve_limit(params.limit);
     let releases = repo::search_releases(
         state.pool(),
         &title,
-        parsed.artist.as_deref(),
-        parsed.date_year.as_deref(),
+        repo::ReleaseFilters {
+            artist: parsed.artist.as_deref(),
+            year: parsed.date_year.as_deref(),
+            primary_type: parsed.primary_type.as_deref(),
+            status: parsed.status.as_deref(),
+        },
         limit,
         state.config.similarity_threshold,
         &state.config.search_work_mem,
