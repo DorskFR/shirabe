@@ -5,15 +5,18 @@
 
 use serde::Serialize;
 
-/// `GET /ws/2/artist?query=` response.
+/// `GET /ws/2/artist?query=` response. `count` is the total number of matches,
+/// not the page size.
 #[derive(Debug, Serialize)]
 pub struct ArtistSearchResponse {
+    pub count: i64,
+    pub offset: i64,
     pub artists: Vec<Artist>,
 }
 
-/// `GET /ws/2/artist/{mbid}` lookup payload. Carries the core artist fields and,
-/// when `inc=url-rels` is requested, the artist's URL relationships (notably the
-/// `image` link the consumer reads for artwork fallback).
+/// `GET /ws/2/artist/{mbid}` lookup payload. inc-gated blocks are `None` when
+/// their token was not requested (absent from the JSON); requested-but-empty
+/// serializes as `[]` (or `null` for annotation), matching upstream MB.
 #[derive(Debug, Serialize, Default)]
 pub struct ArtistLookup {
     pub id: String,
@@ -26,6 +29,27 @@ pub struct ArtistLookup {
     pub disambiguation: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub relations: Vec<UrlRelation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres: Option<Vec<Genre>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<Tag>>,
+    #[allow(clippy::option_option)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<Option<String>>,
+}
+
+/// `id` is the genre entity's gid.
+#[derive(Debug, Serialize)]
+pub struct Genre {
+    pub id: String,
+    pub name: String,
+    pub count: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Tag {
+    pub name: String,
+    pub count: i32,
 }
 
 /// A URL relationship in the ws/2 `relations[]` shape: `{ type, direction, url:
@@ -122,6 +146,8 @@ pub struct ReleaseGroupRelease {
 /// `GET /ws/2/release?query=` response.
 #[derive(Debug, Serialize)]
 pub struct ReleaseSearchResponse {
+    pub count: i64,
+    pub offset: i64,
     pub releases: Vec<Release>,
 }
 
@@ -209,6 +235,8 @@ pub struct RecordingStub {
 /// `GET /ws/2/recording?query=` response.
 #[derive(Debug, Serialize)]
 pub struct RecordingSearchResponse {
+    pub count: i64,
+    pub offset: i64,
     pub recordings: Vec<Recording>,
 }
 
@@ -254,6 +282,8 @@ mod tests {
     #[test]
     fn release_search_result_carries_release_group_id() {
         let v = serde_json::to_value(ReleaseSearchResponse {
+            count: 1,
+            offset: 0,
             releases: vec![Release {
                 id: "b1392450-e666-3926-a536-22c65f834433".into(),
                 title: "Homogenic".into(),
@@ -272,6 +302,34 @@ mod tests {
         assert_eq!(rel["release-group"]["id"], json!("0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd"));
         assert_eq!(rel["release-group"]["primary-type"], json!("Album"));
         assert_eq!(rel["status"], json!("Official"));
+    }
+
+    #[test]
+    fn search_envelopes_carry_count_and_offset() {
+        let v =
+            serde_json::to_value(ArtistSearchResponse { count: 342, offset: 25, artists: vec![] })
+                .unwrap();
+        assert_eq!(v["count"], json!(342));
+        assert_eq!(v["offset"], json!(25));
+        assert_eq!(v["artists"], json!([]));
+        assert!(v.get("created").is_none());
+
+        let v =
+            serde_json::to_value(ReleaseSearchResponse { count: 7, offset: 0, releases: vec![] })
+                .unwrap();
+        assert_eq!(v["count"], json!(7));
+        assert_eq!(v["offset"], json!(0));
+        assert_eq!(v["releases"], json!([]));
+
+        let v = serde_json::to_value(RecordingSearchResponse {
+            count: 0,
+            offset: 100,
+            recordings: vec![],
+        })
+        .unwrap();
+        assert_eq!(v["count"], json!(0));
+        assert_eq!(v["offset"], json!(100));
+        assert_eq!(v["recordings"], json!([]));
     }
 
     #[test]
@@ -305,6 +363,63 @@ mod tests {
         d.releases = Some(vec![]);
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["releases"], json!([]));
+    }
+
+    #[test]
+    fn artist_lookup_omits_blocks_unless_requested() {
+        let v = serde_json::to_value(ArtistLookup {
+            id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+            name: "Björk".into(),
+            sort_name: "Björk".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(v.get("genres").is_none());
+        assert!(v.get("tags").is_none());
+        assert!(v.get("annotation").is_none());
+        assert!(v.get("relations").is_none());
+    }
+
+    #[test]
+    fn artist_lookup_requested_blocks_shapes() {
+        let v = serde_json::to_value(ArtistLookup {
+            id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+            name: "Björk".into(),
+            sort_name: "Björk".into(),
+            genres: Some(vec![Genre {
+                id: "89255676-1f14-4dd8-bbad-fca839d6aff4".into(),
+                name: "electronic".into(),
+                count: 7,
+            }]),
+            tags: Some(vec![Tag { name: "icelandic".into(), count: 3 }]),
+            annotation: Some(Some("Icelandic singer.".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            v["genres"][0],
+            json!({ "id": "89255676-1f14-4dd8-bbad-fca839d6aff4", "name": "electronic", "count": 7 })
+        );
+        assert_eq!(v["tags"][0], json!({ "name": "icelandic", "count": 3 }));
+        assert_eq!(v["annotation"], json!("Icelandic singer."));
+    }
+
+    #[test]
+    fn artist_lookup_requested_but_empty_blocks() {
+        let v = serde_json::to_value(ArtistLookup {
+            id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+            name: "Björk".into(),
+            sort_name: "Björk".into(),
+            genres: Some(vec![]),
+            tags: Some(vec![]),
+            annotation: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["genres"], json!([]));
+        assert_eq!(v["tags"], json!([]));
+        assert_eq!(v["annotation"], Value::Null);
+        assert!(v.as_object().unwrap().contains_key("annotation"));
     }
 
     #[test]

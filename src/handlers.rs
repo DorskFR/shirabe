@@ -20,8 +20,10 @@ use crate::{AppState, query, repo};
 pub struct SearchParams {
     pub query: Option<String>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     // `fmt` is accepted for compatibility but not acted on structurally — shapes
-    // are fixed per endpoint. `inc` is honoured by the artist lookup (url-rels).
+    // are fixed per endpoint. `inc` is honoured by the artist lookup
+    // (url-rels, genres, tags, annotation).
     #[allow(dead_code)]
     pub fmt: Option<String>,
     pub inc: Option<String>,
@@ -52,15 +54,17 @@ pub async fn search_artist(
         .or(parsed.artist)
         .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
     let limit = state.config.resolve_limit(params.limit);
-    let artists = repo::search_artists(
+    let offset = resolve_offset(params.offset);
+    let (count, artists) = repo::search_artists(
         state.pool(),
         &name,
         limit,
+        offset,
         state.config.similarity_threshold,
         &state.config.search_work_mem,
     )
     .await?;
-    Ok(Json(ArtistSearchResponse { artists }))
+    Ok(Json(ArtistSearchResponse { count, offset, artists }))
 }
 
 /// `GET /ws/2/release`
@@ -71,23 +75,25 @@ pub async fn search_release(
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
     let limit = state.config.resolve_limit(params.limit);
+    let offset = resolve_offset(params.offset);
     if let Some(arid) = parsed.arid.as_deref() {
         let gid = parse_mbid(arid)?;
-        let releases = repo::browse_releases_by_artist(
+        let (count, releases) = repo::browse_releases_by_artist(
             state.pool(),
             gid,
             parsed.primary_type.as_deref(),
             parsed.status.as_deref(),
             limit,
+            offset,
         )
         .await?;
-        return Ok(Json(ReleaseSearchResponse { releases }));
+        return Ok(Json(ReleaseSearchResponse { count, offset, releases }));
     }
     let title = parsed
         .release
         .or_else(|| parsed.bare.clone())
         .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
-    let releases = repo::search_releases(
+    let (count, releases) = repo::search_releases(
         state.pool(),
         &title,
         repo::ReleaseFilters {
@@ -97,11 +103,12 @@ pub async fn search_release(
             status: parsed.status.as_deref(),
         },
         limit,
+        offset,
         state.config.similarity_threshold,
         &state.config.search_work_mem,
     )
     .await?;
-    Ok(Json(ReleaseSearchResponse { releases }))
+    Ok(Json(ReleaseSearchResponse { count, offset, releases }))
 }
 
 /// `GET /ws/2/recording`
@@ -116,16 +123,22 @@ pub async fn search_recording(
         .or_else(|| parsed.bare.clone())
         .ok_or_else(|| ApiError::BadRequest("missing recording title".into()))?;
     let limit = state.config.resolve_limit(params.limit);
-    let recordings = repo::search_recordings(
+    let offset = resolve_offset(params.offset);
+    let (count, recordings) = repo::search_recordings(
         state.pool(),
         &title,
         parsed.artist.as_deref(),
         limit,
+        offset,
         state.config.similarity_threshold,
         &state.config.search_work_mem,
     )
     .await?;
-    Ok(Json(RecordingSearchResponse { recordings }))
+    Ok(Json(RecordingSearchResponse { count, offset, recordings }))
+}
+
+fn resolve_offset(offset: Option<i64>) -> i64 {
+    offset.unwrap_or(0).max(0)
 }
 
 /// Parse a path MBID, mapping malformed UUIDs to 400.
@@ -138,6 +151,15 @@ fn inc_has(inc: Option<&str>, token: &str) -> bool {
     inc.is_some_and(|s| s.split([' ', '+']).any(|t| t == token))
 }
 
+fn artist_includes(inc: Option<&str>) -> repo::ArtistIncludes {
+    repo::ArtistIncludes {
+        url_rels: inc_has(inc, "url-rels"),
+        genres: inc_has(inc, "genres"),
+        tags: inc_has(inc, "tags"),
+        annotation: inc_has(inc, "annotation"),
+    }
+}
+
 /// `GET /ws/2/artist/{mbid}`
 pub async fn lookup_artist(
     State(state): State<Arc<AppState>>,
@@ -145,9 +167,8 @@ pub async fn lookup_artist(
     Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
-    let with_url_rels = inc_has(params.inc.as_deref(), "url-rels");
-    let artist =
-        repo::lookup_artist(state.pool(), gid, with_url_rels).await?.ok_or(ApiError::NotFound)?;
+    let inc = artist_includes(params.inc.as_deref());
+    let artist = repo::lookup_artist(state.pool(), gid, inc).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(artist).expect("artist serializes")))
 }
 
@@ -180,7 +201,7 @@ pub async fn browse_release_group(
         params.artist.as_deref().ok_or_else(|| ApiError::BadRequest("missing artist".into()))?;
     let gid = parse_mbid(artist)?;
     let limit = state.config.resolve_limit(params.limit);
-    let offset = params.offset.unwrap_or(0).max(0);
+    let offset = resolve_offset(params.offset);
     let (total, release_groups) =
         repo::browse_release_groups(state.pool(), gid, limit, offset).await?;
     Ok(Json(ReleaseGroupBrowseResponse {
@@ -221,7 +242,16 @@ pub async fn health_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::inc_has;
+    use super::{artist_includes, inc_has, resolve_offset};
+
+    #[test]
+    fn resolve_offset_defaults_and_clamps() {
+        assert_eq!(resolve_offset(None), 0);
+        assert_eq!(resolve_offset(Some(0)), 0);
+        assert_eq!(resolve_offset(Some(50)), 50);
+        assert_eq!(resolve_offset(Some(-1)), 0);
+        assert_eq!(resolve_offset(Some(i64::MIN)), 0);
+    }
 
     #[test]
     fn inc_has_matches_tokens() {
@@ -231,5 +261,21 @@ mod tests {
         assert!(!inc_has(Some("url-rels-extra"), "url-rels"));
         assert!(!inc_has(Some("aliases"), "url-rels"));
         assert!(!inc_has(None, "url-rels"));
+    }
+
+    #[test]
+    fn artist_includes_requires_each_token() {
+        let inc = artist_includes(Some("genres+tags+url-rels+annotation"));
+        assert!(inc.url_rels && inc.genres && inc.tags && inc.annotation);
+
+        let inc = artist_includes(Some("genres"));
+        assert!(inc.genres);
+        assert!(!inc.url_rels && !inc.tags && !inc.annotation);
+
+        let inc = artist_includes(Some("aliases"));
+        assert!(!inc.url_rels && !inc.genres && !inc.tags && !inc.annotation);
+
+        let inc = artist_includes(None);
+        assert!(!inc.url_rels && !inc.genres && !inc.tags && !inc.annotation);
     }
 }
