@@ -82,6 +82,43 @@ pub struct ReleaseGroup {
     pub primary_type: Option<String>,
 }
 
+/// `GET /ws/2/release-group?artist=` response.
+#[derive(Debug, Serialize)]
+pub struct ReleaseGroupBrowseResponse {
+    #[serde(rename = "release-group-count")]
+    pub release_group_count: i64,
+    #[serde(rename = "release-group-offset")]
+    pub release_group_offset: i64,
+    #[serde(rename = "release-groups")]
+    pub release_groups: Vec<ReleaseGroupDetail>,
+}
+
+/// A release-group in the browse/lookup shape. `releases` is `Some` only on the
+/// lookup path (serialized even when the group has none, matching upstream MB).
+#[derive(Debug, Serialize)]
+pub struct ReleaseGroupDetail {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "primary-type")]
+    pub primary_type: Option<String>,
+    #[serde(rename = "secondary-types")]
+    pub secondary_types: Vec<String>,
+    #[serde(rename = "first-release-date")]
+    pub first_release_date: String,
+    pub disambiguation: String,
+    #[serde(rename = "artist-credit")]
+    pub artist_credit: Vec<ArtistCredit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases: Option<Vec<ReleaseGroupRelease>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReleaseGroupRelease {
+    pub id: String,
+    pub date: String,
+    pub status: Option<String>,
+}
+
 /// `GET /ws/2/release?query=` response.
 #[derive(Debug, Serialize)]
 pub struct ReleaseSearchResponse {
@@ -187,4 +224,82 @@ pub struct Recording {
     pub artist_credit: Vec<ArtistCredit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub releases: Vec<Release>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn detail() -> ReleaseGroupDetail {
+        ReleaseGroupDetail {
+            id: "0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd".into(),
+            title: "Homogenic".into(),
+            primary_type: Some("Album".into()),
+            secondary_types: vec![],
+            first_release_date: "1997-09-20".into(),
+            disambiguation: String::new(),
+            artist_credit: vec![ArtistCredit {
+                artist: ArtistRef {
+                    id: "87c5dedd-371d-4a53-9f7f-80522fb7f3cb".into(),
+                    name: "Björk".into(),
+                    aliases: vec![],
+                },
+            }],
+            releases: None,
+        }
+    }
+
+    #[test]
+    fn browse_response_shape() {
+        let v = serde_json::to_value(ReleaseGroupBrowseResponse {
+            release_group_count: 342,
+            release_group_offset: 100,
+            release_groups: vec![detail()],
+        })
+        .unwrap();
+        assert_eq!(v["release-group-count"], json!(342));
+        assert_eq!(v["release-group-offset"], json!(100));
+        let rg = &v["release-groups"][0];
+        assert_eq!(rg["id"], json!("0b0c25f4-f31c-46a5-a4fb-ccbf53d663bd"));
+        assert_eq!(rg["title"], json!("Homogenic"));
+        assert_eq!(rg["primary-type"], json!("Album"));
+        assert_eq!(rg["secondary-types"], json!([]));
+        assert_eq!(rg["first-release-date"], json!("1997-09-20"));
+        assert_eq!(rg["disambiguation"], json!(""));
+        assert_eq!(
+            rg["artist-credit"][0]["artist"]["id"],
+            json!("87c5dedd-371d-4a53-9f7f-80522fb7f3cb")
+        );
+        assert_eq!(rg["artist-credit"][0]["artist"]["name"], json!("Björk"));
+        assert!(rg.get("releases").is_none(), "browse entries must not carry releases");
+    }
+
+    #[test]
+    fn lookup_shape_serializes_releases_even_when_empty() {
+        let mut d = detail();
+        d.releases = Some(vec![]);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["releases"], json!([]));
+    }
+
+    #[test]
+    fn lookup_release_entry_shape() {
+        let mut d = detail();
+        d.primary_type = None;
+        d.secondary_types = vec!["Live".into(), "Compilation".into()];
+        d.releases = Some(vec![ReleaseGroupRelease {
+            id: "b1392450-e666-3926-a536-22c65f834433".into(),
+            date: "1997".into(),
+            status: None,
+        }]);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["primary-type"], Value::Null);
+        assert_eq!(v["secondary-types"], json!(["Live", "Compilation"]));
+        let rel = &v["releases"][0];
+        assert_eq!(rel["id"], json!("b1392450-e666-3926-a536-22c65f834433"));
+        assert_eq!(rel["date"], json!("1997"));
+        assert_eq!(rel["status"], Value::Null);
+    }
 }

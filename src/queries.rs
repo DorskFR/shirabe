@@ -186,6 +186,36 @@ pub const SEARCH_RECORDINGS_FUZZY: &str = r"
         LIMIT $3
         ";
 
+// MusicBrainz mirror — release-group browse
+pub const BROWSE_RELEASE_GROUPS_COUNT: &str = r"
+        SELECT COUNT(*)::bigint AS total
+        FROM musicbrainz.release_group rg
+        WHERE EXISTS (
+            SELECT 1 FROM musicbrainz.artist_credit_name acn
+            JOIN musicbrainz.artist a ON a.id = acn.artist
+            WHERE acn.artist_credit = rg.artist_credit AND a.gid = $1)
+        ";
+
+pub const BROWSE_RELEASE_GROUPS: &str = r"
+        SELECT rg.id, rg.gid, rg.name, rg.comment, rg.artist_credit,
+               rgpt.name AS primary_type,
+               rgm.first_release_date_year::int AS y,
+               rgm.first_release_date_month::int AS m,
+               rgm.first_release_date_day::int AS d
+        FROM musicbrainz.release_group rg
+        LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+        LEFT JOIN musicbrainz.release_group_meta rgm ON rgm.id = rg.id
+        WHERE EXISTS (
+            SELECT 1 FROM musicbrainz.artist_credit_name acn
+            JOIN musicbrainz.artist a ON a.id = acn.artist
+            WHERE acn.artist_credit = rg.artist_credit AND a.gid = $1)
+        ORDER BY rgm.first_release_date_year ASC NULLS LAST,
+                 rgm.first_release_date_month ASC NULLS LAST,
+                 rgm.first_release_date_day ASC NULLS LAST,
+                 rg.gid ASC
+        LIMIT $2 OFFSET $3
+        ";
+
 // MusicBrainz mirror — lookups
 pub const LOOKUP_ARTIST: &str = r"
         SELECT a.id, a.gid, a.name, a.sort_name, a.comment, at.name AS type_name
@@ -198,6 +228,18 @@ pub const LOOKUP_RELEASE: &str = r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
         FROM musicbrainz.release r
         WHERE r.gid = $1
+        ";
+
+pub const LOOKUP_RELEASE_GROUP: &str = r"
+        SELECT rg.id, rg.gid, rg.name, rg.comment, rg.artist_credit,
+               rgpt.name AS primary_type,
+               rgm.first_release_date_year::int AS y,
+               rgm.first_release_date_month::int AS m,
+               rgm.first_release_date_day::int AS d
+        FROM musicbrainz.release_group rg
+        LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+        LEFT JOIN musicbrainz.release_group_meta rgm ON rgm.id = rg.id
+        WHERE rg.gid = $1
         ";
 
 pub const LOOKUP_RECORDING: &str = r"
@@ -228,6 +270,14 @@ pub const BATCH_RELEASE_GROUPS: &str = r"
         FROM musicbrainz.release_group rg
         LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
         WHERE rg.id = ANY($1)
+        ";
+
+pub const BATCH_RELEASE_GROUP_SECONDARY_TYPES: &str = r"
+        SELECT j.release_group AS rg, st.name
+        FROM musicbrainz.release_group_secondary_type_join j
+        JOIN musicbrainz.release_group_secondary_type st ON st.id = j.secondary_type
+        WHERE j.release_group = ANY($1)
+        ORDER BY j.release_group, st.name ASC
         ";
 
 pub const BATCH_RELEASE_DATES: &str = r"
@@ -331,6 +381,14 @@ pub const LOAD_RELEASE_GROUP: &str = r"
         FROM musicbrainz.release_group rg
         LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
         WHERE rg.id = $1
+        ";
+
+pub const LOAD_RELEASE_GROUP_RELEASES: &str = r"
+        SELECT r.id, r.gid, rs.name AS status
+        FROM musicbrainz.release r
+        LEFT JOIN musicbrainz.release_status rs ON rs.id = r.status
+        WHERE r.release_group = $1
+        ORDER BY r.id ASC
         ";
 
 pub const LOAD_RELEASE_STATUS: &str = r"
@@ -677,6 +735,29 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("title_types", TextArray, "movie,tvMovie,short,video"),
             ],
         },
+        // ── browse ──
+        QuerySpec {
+            id: "browse_release_groups_count",
+            title: "Release-group browse: total count for an artist",
+            endpoint: "GET /ws/2/release-group?artist=",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: BROWSE_RELEASE_GROUPS_COUNT,
+            params: vec![p("artist_gid", Uuid, "a74b1b7f-71a5-4011-9441-d0b5e4122711")],
+        },
+        QuerySpec {
+            id: "browse_release_groups",
+            title: "Release-group browse by artist (paged)",
+            endpoint: "GET /ws/2/release-group?artist=",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: BROWSE_RELEASE_GROUPS,
+            params: vec![
+                p("artist_gid", Uuid, "a74b1b7f-71a5-4011-9441-d0b5e4122711"),
+                p("limit", BigInt, "100"),
+                p("offset", BigInt, "0"),
+            ],
+        },
         // ── lookups ──
         QuerySpec {
             id: "lookup_artist",
@@ -705,6 +786,15 @@ pub fn catalog() -> Vec<QuerySpec> {
             sql: LOOKUP_RECORDING,
             params: vec![p("gid", Uuid, "b1a9c0e9-d987-4042-ae91-78d6a3267d69")],
         },
+        QuerySpec {
+            id: "lookup_release_group",
+            title: "Release-group lookup by MBID",
+            endpoint: "GET /ws/2/release-group/{mbid}",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOOKUP_RELEASE_GROUP,
+            params: vec![p("gid", Uuid, "b1392450-e666-3926-a536-22c65f834433")],
+        },
         // ── batched hydration ──
         QuerySpec {
             id: "batch_artist_aliases",
@@ -731,6 +821,15 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: false,
             sql: BATCH_RELEASE_GROUPS,
+            params: vec![p("rg_ids", IntArray, "1,2,3")],
+        },
+        QuerySpec {
+            id: "batch_release_group_secondary_types",
+            title: "Batch: release-group secondary types",
+            endpoint: "(hydration)",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: BATCH_RELEASE_GROUP_SECONDARY_TYPES,
             params: vec![p("rg_ids", IntArray, "1,2,3")],
         },
         QuerySpec {
@@ -840,6 +939,15 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: false,
             sql: LOAD_RELEASE_GROUP,
+            params: vec![p("rg_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_release_group_releases",
+            title: "Load: releases in a release group",
+            endpoint: "GET /ws/2/release-group/{mbid}",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_RELEASE_GROUP_RELEASES,
             params: vec![p("rg_id", Int, "1")],
         },
         QuerySpec {

@@ -7,7 +7,8 @@
 //!   `coverartarchive.org`. CAA answers image requests with a 3xx to
 //!   `archive.org`; the redirect is NOT followed server-side — its `Location` is
 //!   rewritten to the local `/_ia/<host>/<path>` form and returned, so the client
-//!   comes back through this proxy for the bytes.
+//!   comes back through this proxy for the bytes. Non-redirect 200/404 bodies
+//!   (JSON manifests) are disk-cached with a short TTL.
 //! - Byte layer: `/_ia/{host}/{*path}` streams from `https://<host>/<path>`,
 //!   bouncing any further `archive.org` CDN redirect back through `/_ia/`, and
 //!   caches the bytes on disk (30d positive, 6h negative) with single-flight per
@@ -20,7 +21,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -38,6 +39,8 @@ use crate::config::Config;
 /// Header advertising cache disposition (`HIT` served from disk, `MISS` fetched).
 const CACHE_STATUS: &str = "x-cache-status";
 
+const MANIFEST_TTL_SECS: u64 = 300;
+
 /// Runtime state for the Cover Art facade: the redirect-disabled HTTP client, the
 /// on-disk byte cache parameters, and the per-key single-flight lock table.
 pub struct CoverArtState {
@@ -47,7 +50,52 @@ pub struct CoverArtState {
     positive_ttl: Duration,
     negative_ttl: Duration,
     upstream_base: String,
-    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    locks: KeyedLocks,
+}
+
+struct KeyedLocks {
+    map: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+struct KeyedLockGuard<'a> {
+    locks: &'a KeyedLocks,
+    key: String,
+    entry: Arc<tokio::sync::Mutex<()>>,
+    permit: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl KeyedLocks {
+    fn new() -> Self {
+        Self { map: Mutex::new(HashMap::new()) }
+    }
+
+    async fn acquire(&self, key: &str) -> KeyedLockGuard<'_> {
+        let entry = {
+            let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+            map.entry(key.to_string()).or_default().clone()
+        };
+        let permit = entry.clone().lock_owned().await;
+        KeyedLockGuard { locks: self, key: key.to_string(), entry, permit: Some(permit) }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+}
+
+impl Drop for KeyedLockGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        let mut map = self.locks.map.lock().unwrap_or_else(PoisonError::into_inner);
+        // strong_count == 2 means only the map and this guard still reference the entry.
+        if let Some(cur) = map.get(&self.key)
+            && Arc::ptr_eq(cur, &self.entry)
+            && Arc::strong_count(cur) == 2
+        {
+            map.remove(&self.key);
+        }
+    }
 }
 
 impl CoverArtState {
@@ -68,18 +116,13 @@ impl CoverArtState {
             positive_ttl: Duration::from_secs(config.coverart_positive_ttl_secs),
             negative_ttl: Duration::from_secs(config.coverart_negative_ttl_secs),
             upstream_base: config.coverart_upstream_base.trim_end_matches('/').to_string(),
-            locks: Mutex::new(HashMap::new()),
+            locks: KeyedLocks::new(),
         }
     }
 
     fn paths(&self, key: &str) -> (PathBuf, PathBuf) {
         let stem = key_hash(key);
         (self.cache_dir.join(format!("{stem}.json")), self.cache_dir.join(format!("{stem}.bin")))
-    }
-
-    fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(key.to_string()).or_default().clone()
     }
 }
 
@@ -114,7 +157,12 @@ async fn release_group(state: State<Arc<AppState>>, uri: OriginalUri) -> Respons
 async fn redirect_layer(state: &AppState, uri: &OriginalUri) -> Response {
     let ca = &state.coverart;
     let pq = uri.path_and_query().map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
-    let url = format!("{}{}", ca.upstream_base, strip_mount_prefix(pq));
+    let key = strip_mount_prefix(pq);
+    if let Some((status, ct, body)) = cache_get(ca, key, MANIFEST_TTL_SECS, MANIFEST_TTL_SECS).await
+    {
+        return cached_response(status, ct.as_deref(), body);
+    }
+    let url = format!("{}{}", ca.upstream_base, key);
 
     let resp = match ca.client.get(&url).send().await {
         Ok(resp) => resp,
@@ -135,7 +183,13 @@ async fn redirect_layer(state: &AppState, uri: &OriginalUri) -> Response {
     }
     let ct = resp_content_type(&resp);
     match resp.bytes().await {
-        Ok(bytes) => body_response(status, ct.as_deref(), bytes.to_vec(), "MISS"),
+        Ok(bytes) => {
+            let body = bytes.to_vec();
+            if status == StatusCode::OK || status == StatusCode::NOT_FOUND {
+                cache_put(ca, key, status.as_u16(), ct.as_deref(), &body).await;
+            }
+            body_response(status, ct.as_deref(), body, "MISS")
+        }
         Err(e) => {
             tracing::warn!(error = %e, "coverart upstream body read failed");
             (StatusCode::BAD_GATEWAY, "upstream body error").into_response()
@@ -149,26 +203,25 @@ async fn ia_passthrough(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let ca = &state.coverart;
-    let key =
-        uri.path_and_query().map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
-
-    if let Some((status, ct, body)) = cache_get(ca, key).await {
-        return cached_response(status, ct.as_deref(), body);
-    }
 
     if let Err(reason) = guard_host(&host).await {
         tracing::warn!(host, reason, "coverart /_ia host rejected");
         return (StatusCode::FORBIDDEN, "forbidden host").into_response();
     }
 
-    let lock = ca.lock_for(key);
-    let _guard = lock.lock().await;
-    if let Some((status, ct, body)) = cache_get(ca, key).await {
+    let key = ia_cache_key(uri.path(), uri.query());
+    let pos = ca.positive_ttl.as_secs();
+    let neg = ca.negative_ttl.as_secs();
+    if let Some((status, ct, body)) = cache_get(ca, &key, pos, neg).await {
         return cached_response(status, ct.as_deref(), body);
     }
 
-    let path_rest = uri.path().strip_prefix("/_ia/").unwrap_or_else(|| uri.path());
-    let mut url = format!("https://{path_rest}");
+    let _lease = ca.locks.acquire(&key).await;
+    if let Some((status, ct, body)) = cache_get(ca, &key, pos, neg).await {
+        return cached_response(status, ct.as_deref(), body);
+    }
+
+    let mut url = format!("https://{}", ia_rest(uri.path()));
     if let Some(q) = uri.query() {
         url.push('?');
         url.push_str(q);
@@ -202,17 +255,22 @@ async fn ia_passthrough(
     };
     let body = bytes.to_vec();
     if status == StatusCode::OK || status == StatusCode::NOT_FOUND {
-        cache_put(ca, key, status.as_u16(), ct.as_deref(), &body).await;
+        cache_put(ca, &key, status.as_u16(), ct.as_deref(), &body).await;
     }
     body_response(status, ct.as_deref(), body, "MISS")
 }
 
 /// Read a fresh cache entry for `key`, or `None` on miss / stale / error.
-async fn cache_get(ca: &CoverArtState, key: &str) -> Option<(StatusCode, Option<String>, Vec<u8>)> {
+async fn cache_get(
+    ca: &CoverArtState,
+    key: &str,
+    positive_ttl: u64,
+    negative_ttl: u64,
+) -> Option<(StatusCode, Option<String>, Vec<u8>)> {
     let (meta_path, body_path) = ca.paths(key);
     let meta: Meta = serde_json::from_slice(&tokio::fs::read(meta_path).await.ok()?).ok()?;
     let age = now_secs().saturating_sub(meta.fetched_at);
-    if !is_cache_fresh(meta.status, age, ca.positive_ttl.as_secs(), ca.negative_ttl.as_secs()) {
+    if !is_cache_fresh(meta.status, age, positive_ttl, negative_ttl) {
         return None;
     }
     let body = tokio::fs::read(body_path).await.unwrap_or_default();
@@ -306,6 +364,24 @@ fn strip_mount_prefix(path_and_query: &str) -> &str {
         Some(rest) if rest.starts_with("/release") => rest,
         _ => path_and_query,
     }
+}
+
+/// `host/path` remainder of an `/_ia/` request path, whether root-mounted or
+/// nested under `/coverart`.
+#[must_use]
+fn ia_rest(path: &str) -> &str {
+    let path = match path.strip_prefix("/coverart") {
+        Some(rest) if rest.starts_with("/_ia/") => rest,
+        _ => path,
+    };
+    path.strip_prefix("/_ia/").unwrap_or(path)
+}
+
+/// Mount-invariant byte-cache key: canonical `/_ia/<host>/<path>[?<query>]`.
+#[must_use]
+fn ia_cache_key(path: &str, query: Option<&str>) -> String {
+    let rest = ia_rest(path);
+    query.map_or_else(|| format!("/_ia/{rest}"), |q| format!("/_ia/{rest}?{q}"))
 }
 
 /// Rewrite an absolute upstream redirect `Location` to the local `/_ia/` bounce so
@@ -512,5 +588,91 @@ mod tests {
         assert_eq!(key_hash("/_ia/archive.org/a.jpg"), key_hash("/_ia/archive.org/a.jpg"));
         assert_ne!(key_hash("/_ia/archive.org/a.jpg"), key_hash("/_ia/archive.org/b.jpg"));
         assert_eq!(key_hash("/_ia/archive.org/a.jpg").len(), 32);
+    }
+
+    #[test]
+    fn ia_rest_strips_both_mount_forms() {
+        assert_eq!(
+            ia_rest("/_ia/archive.org/download/x/front.jpg"),
+            "archive.org/download/x/front.jpg"
+        );
+        assert_eq!(
+            ia_rest("/coverart/_ia/archive.org/download/x/front.jpg"),
+            "archive.org/download/x/front.jpg"
+        );
+        assert_eq!(ia_rest("/coverartist/_ia/x"), "/coverartist/_ia/x");
+        assert_eq!(ia_rest("/coverart/release/x"), "/coverart/release/x");
+    }
+
+    #[test]
+    fn ia_cache_key_is_mount_invariant() {
+        let root = ia_cache_key("/_ia/archive.org/x.jpg", None);
+        let nested = ia_cache_key("/coverart/_ia/archive.org/x.jpg", None);
+        assert_eq!(root, "/_ia/archive.org/x.jpg");
+        assert_eq!(root, nested);
+        assert_eq!(
+            ia_cache_key("/coverart/_ia/host/p", Some("sig=1")),
+            ia_cache_key("/_ia/host/p", Some("sig=1"))
+        );
+        assert_eq!(ia_cache_key("/_ia/host/p", Some("sig=1")), "/_ia/host/p?sig=1");
+        assert_ne!(ia_cache_key("/_ia/host/p", Some("sig=1")), ia_cache_key("/_ia/host/p", None));
+    }
+
+    #[tokio::test]
+    async fn keyed_locks_prune_on_release() {
+        let locks = KeyedLocks::new();
+        {
+            let _lease = locks.acquire("k").await;
+            assert_eq!(locks.len(), 1);
+        }
+        assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_locks_survive_while_contended() {
+        let locks = Arc::new(KeyedLocks::new());
+        let lease = locks.acquire("k").await;
+        let contender = {
+            let locks = Arc::clone(&locks);
+            tokio::spawn(async move {
+                let _lease = locks.acquire("k").await;
+            })
+        };
+        while Arc::strong_count(&lease.entry) < 3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(locks.len(), 1);
+        drop(lease);
+        contender.await.unwrap();
+        assert_eq!(locks.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn manifest_cache_round_trip_is_mount_invariant() {
+        let dir = std::env::temp_dir().join(format!("shirabe-coverart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = CoverArtState {
+            client: reqwest::Client::new(),
+            cache_dir: dir.clone(),
+            max_bytes: 1_048_576,
+            positive_ttl: Duration::from_mins(1),
+            negative_ttl: Duration::from_mins(1),
+            upstream_base: "https://example.invalid".to_string(),
+            locks: KeyedLocks::new(),
+        };
+        let key = strip_mount_prefix("/coverart/release/mbid-1");
+        cache_put(&ca, key, 200, Some("application/json"), b"{\"images\":[]}").await;
+        let hit = cache_get(
+            &ca,
+            strip_mount_prefix("/release/mbid-1"),
+            MANIFEST_TTL_SECS,
+            MANIFEST_TTL_SECS,
+        )
+        .await
+        .expect("cached manifest");
+        assert_eq!(hit.0, StatusCode::OK);
+        assert_eq!(hit.1.as_deref(), Some("application/json"));
+        assert_eq!(hit.2, b"{\"images\":[]}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

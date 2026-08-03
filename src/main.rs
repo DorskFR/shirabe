@@ -145,6 +145,8 @@ fn ws2_router() -> Router<Arc<AppState>> {
         .route("/ws/2/release/{mbid}", get(handlers::lookup_release))
         .route("/ws/2/recording", get(handlers::search_recording))
         .route("/ws/2/recording/{mbid}", get(handlers::lookup_recording))
+        .route("/ws/2/release-group", get(handlers::browse_release_group))
+        .route("/ws/2/release-group/{mbid}", get(handlers::lookup_release_group))
 }
 
 /// `/music`: stripped `/artist|/release|/recording` shortcuts plus the full
@@ -157,6 +159,8 @@ fn music_alias_router() -> Router<Arc<AppState>> {
         .route("/release/{mbid}", get(handlers::lookup_release))
         .route("/recording", get(handlers::search_recording))
         .route("/recording/{mbid}", get(handlers::lookup_recording))
+        .route("/release-group", get(handlers::browse_release_group))
+        .route("/release-group/{mbid}", get(handlers::lookup_release_group))
         .merge(ws2_router())
 }
 
@@ -254,6 +258,9 @@ mod tests {
             "/music/ws/2/artist/1",
             "/music/ws/2/release",
             "/music/ws/2/recording",
+            "/music/release-group",
+            "/music/release-group/1",
+            "/music/ws/2/release-group",
         ] {
             assert_ne!(
                 routes(path).await,
@@ -268,6 +275,24 @@ mod tests {
         for path in ["/tv/series/1", "/movie/configuration", "/movie/movie/1", "/movies/movie/1"] {
             assert_eq!(routes(path).await, StatusCode::NOT_FOUND, "alias should be gone: {path}");
         }
+    }
+
+    #[tokio::test]
+    async fn release_group_routes_are_wired() {
+        for path in [
+            "/ws/2/release-group",
+            "/ws/2/release-group/1",
+            "/musicbrainz/ws/2/release-group",
+            "/musicbrainz/ws/2/release-group/1",
+        ] {
+            assert_ne!(routes(path).await, StatusCode::NOT_FOUND, "not wired: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn release_group_browse_requires_artist() {
+        assert_eq!(routes("/ws/2/release-group").await, StatusCode::BAD_REQUEST);
+        assert_eq!(routes("/ws/2/release-group?artist=not-a-uuid").await, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
