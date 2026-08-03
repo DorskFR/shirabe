@@ -81,9 +81,6 @@ fn rewrite_image_urls_inner(base: &str, value: &mut Value) {
     }
 }
 
-/// Upstream TMDB v3 API base.
-const API_BASE: &str = "https://api.themoviedb.org/3";
-
 /// Build the `/3` route group.
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -263,16 +260,21 @@ async fn self_link_external_ids(state: &AppState, tmdb_kind: &str, tmdb_id: i64,
 }
 
 /// Perform an upstream TMDB v3 GET, returning the parsed JSON body. `path` is the
-/// endpoint path under [`API_BASE`] (no leading slash); `extra` are extra query
-/// pairs appended after the held `api_key`.
-async fn upstream_get(key: &str, path: &str, extra: &[(&str, String)]) -> Result<Value, String> {
+/// endpoint path under the configured API base (no leading slash); `extra` are
+/// extra query pairs appended after the held `api_key`.
+async fn upstream_get(
+    base: &str,
+    key: &str,
+    path: &str,
+    extra: &[(&str, String)],
+) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let mut query: Vec<(&str, String)> = vec![("api_key", key.to_string())];
     query.extend(extra.iter().map(|(k, v)| (*k, v.clone())));
-    let url = format!("{API_BASE}/{path}");
+    let url = format!("{}/{path}", base.trim_end_matches('/'));
     let resp = client
         .get(&url)
         .query(&query)
@@ -554,7 +556,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     if search::is_thin_result(&renderable) || any_result_missing_fields(&payload, kind) {
         if let Some(key) = state.config.tmdb_api_key.as_deref() {
             let path = format!("search/{kind}");
-            match upstream_get(key, &path, &[("query", query)]).await {
+            match upstream_get(&state.config.tmdb_api_base, key, &path, &[("query", query)]).await {
                 Ok(live) => {
                     if let Some(arr) = payload.get_mut("results").and_then(Value::as_array_mut) {
                         let mut results = std::mem::take(arr);
@@ -648,7 +650,14 @@ async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str, params: &Value)
     };
 
     let path = format!("{kind}/{id}");
-    match upstream_get(key, &path, &[("append_to_response", union_appends(kind, &appends))]).await {
+    match upstream_get(
+        &state.config.tmdb_api_base,
+        key,
+        &path,
+        &[("append_to_response", union_appends(kind, &appends))],
+    )
+    .await
+    {
         Ok(mut payload) => {
             cache_put(state, id, kind, &payload).await;
             self_link_external_ids(state, kind, id, &payload).await;
@@ -717,7 +726,7 @@ async fn tv_season(
     };
 
     let path = format!("tv/{tv_id}/season/{season}");
-    match upstream_get(key, &path, &[]).await {
+    match upstream_get(&state.config.tmdb_api_base, key, &path, &[]).await {
         Ok(mut payload) => {
             cache_put(&state, cache_id, cache_kind, &payload).await;
             rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);

@@ -37,9 +37,6 @@ use tokio::sync::RwLock;
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
 use crate::config::Config;
 
-/// Upstream TheTVDB v4 API base.
-pub const API_BASE: &str = "https://api4.thetvdb.com/v4";
-
 /// A bearer token obtained from TheTVDB `/login`, with the wall-clock second at
 /// which we consider it expired. TheTVDB tokens live ~1 month; we refresh ahead of
 /// the nominal lifetime to avoid using a token that expires mid-flight.
@@ -144,7 +141,9 @@ impl TokenStore {
         // Log in WITHOUT holding the lock (never hold a lock across an .await):
         // a rare concurrent double-login is harmless — last write wins and both
         // tokens are valid. The store is updated under a brief write lock.
-        let bearer = login(API_BASE, key, config.tvdb_pin.as_deref()).await?;
+        let bearer =
+            login(config.tvdb_api_base.trim_end_matches('/'), key, config.tvdb_pin.as_deref())
+                .await?;
         let token = Token::new(bearer.clone(), now_secs());
         *self.inner.write().await = Some(token);
         Ok(bearer)

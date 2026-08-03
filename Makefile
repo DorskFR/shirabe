@@ -4,7 +4,7 @@ SHIRABE_BIND ?= 0.0.0.0:8800
 export DATABASE_URL
 export SHIRABE_BIND
 
-.PHONY: build check test fmt lint clean run
+.PHONY: build check test test-integration fmt lint clean run
 .PHONY: db/up db/down db/migrate/up db/psql
 .PHONY: image/build image/push image/release
 
@@ -35,6 +35,13 @@ lint:  ## Run clippy with deny warnings
 
 test:  ## Run unit tests (no DB required)
 	cargo test
+
+# DB-gated tests create throwaway databases on the server behind
+# DATABASE_URL_TEST, so it must NEVER point at a real MusicBrainz mirror.
+DATABASE_URL_TEST ?= postgres://musicbrainz:musicbrainz@localhost:5490/musicbrainz_db
+
+test-integration:  ## Run ALL tests incl. DB-gated (throwaway postgres; `make db/up` locally first)
+	DATABASE_URL_TEST=$(DATABASE_URL_TEST) cargo test -- --include-ignored
 
 # ── Run ────────────────────────────────────────────────────
 

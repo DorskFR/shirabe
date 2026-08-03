@@ -50,6 +50,7 @@ pub struct CoverArtState {
     positive_ttl: Duration,
     negative_ttl: Duration,
     upstream_base: String,
+    insecure_ia: bool,
     locks: KeyedLocks,
 }
 
@@ -116,6 +117,7 @@ impl CoverArtState {
             positive_ttl: Duration::from_secs(config.coverart_positive_ttl_secs),
             negative_ttl: Duration::from_secs(config.coverart_negative_ttl_secs),
             upstream_base: config.coverart_upstream_base.trim_end_matches('/').to_string(),
+            insecure_ia: config.coverart_insecure_ia,
             locks: KeyedLocks::new(),
         }
     }
@@ -204,7 +206,9 @@ async fn ia_passthrough(
 ) -> Response {
     let ca = &state.coverart;
 
-    if let Err(reason) = guard_host(&host).await {
+    if !ca.insecure_ia
+        && let Err(reason) = guard_host(&host).await
+    {
         tracing::warn!(host, reason, "coverart /_ia host rejected");
         return (StatusCode::FORBIDDEN, "forbidden host").into_response();
     }
@@ -221,7 +225,8 @@ async fn ia_passthrough(
         return cached_response(status, ct.as_deref(), body);
     }
 
-    let mut url = format!("https://{}", ia_rest(uri.path()));
+    let scheme = if ca.insecure_ia { "http" } else { "https" };
+    let mut url = format!("{scheme}://{}", ia_rest(uri.path()));
     if let Some(q) = uri.query() {
         url.push('?');
         url.push_str(q);
@@ -658,6 +663,7 @@ mod tests {
             positive_ttl: Duration::from_mins(1),
             negative_ttl: Duration::from_mins(1),
             upstream_base: "https://example.invalid".to_string(),
+            insecure_ia: false,
             locks: KeyedLocks::new(),
         };
         let key = strip_mount_prefix("/coverart/release/mbid-1");
