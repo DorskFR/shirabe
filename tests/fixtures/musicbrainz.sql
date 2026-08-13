@@ -45,6 +45,12 @@ CREATE TABLE musicbrainz.artist_tag (
     count  integer NOT NULL
 );
 
+CREATE TABLE musicbrainz.release_group_tag (
+    release_group integer NOT NULL,
+    tag           integer NOT NULL,
+    count         integer NOT NULL
+);
+
 CREATE TABLE musicbrainz.genre (
     id   integer PRIMARY KEY,
     gid  uuid NOT NULL,
@@ -212,10 +218,19 @@ INSERT INTO musicbrainz.artist (id, gid, name, sort_name, comment, type) VALUES
 INSERT INTO musicbrainz.artist_alias (id, artist, name, sort_name) VALUES
     (1, 1, 'Régio Costera', 'Costera, Régio');
 
-INSERT INTO musicbrainz.tag (id, name) VALUES (1, 'rock');
+INSERT INTO musicbrainz.tag (id, name) VALUES
+    (1, 'rock'),
+    (2, 'seen live'),
+    (3, 'downvoted');
 INSERT INTO musicbrainz.artist_tag (artist, tag, count) VALUES (1, 1, 5);
 INSERT INTO musicbrainz.genre (id, gid, name) VALUES
     (1, '99999999-9999-4999-8999-999999999999', 'rock');
+-- Release-group tags: 'rock' is also a genre, 'seen live' is tag-only, and the
+-- zero-count row must be filtered out of both blocks.
+INSERT INTO musicbrainz.release_group_tag (release_group, tag, count) VALUES
+    (1, 1, 4),
+    (1, 2, 2),
+    (1, 3, 0);
 
 INSERT INTO musicbrainz.annotation (id, text, created) VALUES
     (1, 'seaside radio annotation', now());
