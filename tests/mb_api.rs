@@ -115,6 +115,23 @@ async fn ws2_lookup_endpoints_serve_fixture_data() {
     assert_eq!(body["first-release-date"], "1997-05-21");
     assert_eq!(body["releases"].as_array().unwrap().len(), 2);
     assert_eq!(body["releases"][0]["status"], "Official");
+    assert!(body.get("genres").is_none(), "genres absent without inc");
+    assert!(body.get("tags").is_none(), "tags absent without inc");
+
+    let (status, body) =
+        get(&st, &format!("/ws/2/release-group/{RELEASE_GROUP_MBID}?inc=genres%2Btags")).await;
+    assert_eq!(status, StatusCode::OK);
+    let genres = body["genres"].as_array().unwrap();
+    assert_eq!(genres.len(), 1, "only genre-named tags: {genres:?}");
+    assert_eq!(genres[0]["id"], "99999999-9999-4999-8999-999999999999");
+    assert_eq!(genres[0]["name"], "rock");
+    assert_eq!(genres[0]["count"], 4);
+    let tags = body["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2, "zero-count tag filtered: {tags:?}");
+    assert_eq!(tags[0]["name"], "rock");
+    assert_eq!(tags[0]["count"], 4);
+    assert_eq!(tags[1]["name"], "seen live");
+    assert_eq!(tags[1]["count"], 2);
 }
 
 #[tokio::test]

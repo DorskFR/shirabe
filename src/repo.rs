@@ -923,6 +923,8 @@ async fn hydrate_release_groups(
             first_release_date: first_release_date(&row),
             disambiguation: row.try_get("comment").unwrap_or_default(),
             artist_credit: ac_map.get(&ac_id).cloned().unwrap_or_default(),
+            genres: None,
+            tags: None,
             releases: None,
         });
     }
@@ -954,10 +956,17 @@ pub async fn browse_release_groups(
     Ok((total, groups))
 }
 
-/// `GET /ws/2/release-group/{mbid}?inc=artist-credits+releases`
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReleaseGroupIncludes {
+    pub genres: bool,
+    pub tags: bool,
+}
+
+/// `GET /ws/2/release-group/{mbid}?inc=artist-credits+releases[+genres+tags]`
 pub async fn lookup_release_group(
     pool: &PgPool,
     gid: Uuid,
+    inc: ReleaseGroupIncludes,
 ) -> Result<Option<ReleaseGroupDetail>, sqlx::Error> {
     let Some(row) =
         sqlx::query(queries::LOOKUP_RELEASE_GROUP).bind(gid).fetch_optional(pool).await?
@@ -966,8 +975,28 @@ pub async fn lookup_release_group(
     };
     let rg_id: i32 = row.try_get("id")?;
     let mut group = hydrate_release_groups(pool, vec![row]).await?.remove(0);
+    group.genres =
+        if inc.genres { Some(load_release_group_genres(pool, rg_id).await?) } else { None };
+    group.tags = if inc.tags { Some(load_release_group_tags(pool, rg_id).await?) } else { None };
     group.releases = Some(load_release_group_releases(pool, rg_id).await?);
     Ok(Some(group))
+}
+
+async fn load_release_group_genres(pool: &PgPool, rg_id: i32) -> Result<Vec<Genre>, sqlx::Error> {
+    let rows = sqlx::query(queries::LOAD_RELEASE_GROUP_GENRES).bind(rg_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| {
+            let gid: Uuid = r.try_get("gid")?;
+            Ok(Genre { id: gid.to_string(), name: r.try_get("name")?, count: r.try_get("count")? })
+        })
+        .collect()
+}
+
+async fn load_release_group_tags(pool: &PgPool, rg_id: i32) -> Result<Vec<Tag>, sqlx::Error> {
+    let rows = sqlx::query(queries::LOAD_RELEASE_GROUP_TAGS).bind(rg_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|r| Ok(Tag { name: r.try_get("name")?, count: r.try_get("count")? }))
+        .collect()
 }
 
 async fn load_release_group_releases(

@@ -460,6 +460,23 @@ pub const LOAD_RELEASE_GROUP_RELEASES: &str = r"
         ORDER BY r.id ASC
         ";
 
+pub const LOAD_RELEASE_GROUP_GENRES: &str = r"
+        SELECT g.gid, g.name, rgt.count
+        FROM musicbrainz.release_group_tag rgt
+        JOIN musicbrainz.tag t ON t.id = rgt.tag
+        JOIN musicbrainz.genre g ON g.name = t.name
+        WHERE rgt.release_group = $1 AND rgt.count > 0
+        ORDER BY g.name ASC
+        ";
+
+pub const LOAD_RELEASE_GROUP_TAGS: &str = r"
+        SELECT t.name, rgt.count
+        FROM musicbrainz.release_group_tag rgt
+        JOIN musicbrainz.tag t ON t.id = rgt.tag
+        WHERE rgt.release_group = $1 AND rgt.count > 0
+        ORDER BY t.name ASC
+        ";
+
 pub const LOAD_RELEASE_STATUS: &str = r"
         SELECT rs.name
         FROM musicbrainz.release r
@@ -1075,6 +1092,24 @@ pub fn catalog() -> Vec<QuerySpec> {
             db: TargetDb::Musicbrainz,
             trigram: false,
             sql: LOAD_RELEASE_GROUP_RELEASES,
+            params: vec![p("rg_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_release_group_genres",
+            title: "Load: release-group genres",
+            endpoint: "GET /ws/2/release-group/{mbid}?inc=genres",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_RELEASE_GROUP_GENRES,
+            params: vec![p("rg_id", Int, "1")],
+        },
+        QuerySpec {
+            id: "load_release_group_tags",
+            title: "Load: release-group tags",
+            endpoint: "GET /ws/2/release-group/{mbid}?inc=tags",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: LOAD_RELEASE_GROUP_TAGS,
             params: vec![p("rg_id", Int, "1")],
         },
         QuerySpec {

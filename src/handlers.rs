@@ -23,7 +23,8 @@ pub struct SearchParams {
     pub offset: Option<i64>,
     // `fmt` is accepted for compatibility but not acted on structurally — shapes
     // are fixed per endpoint. `inc` is honoured by the artist lookup
-    // (url-rels, genres, tags, annotation).
+    // (url-rels, genres, tags, annotation) and the release-group lookup
+    // (genres, tags).
     #[allow(dead_code)]
     pub fmt: Option<String>,
     pub inc: Option<String>,
@@ -160,6 +161,10 @@ fn artist_includes(inc: Option<&str>) -> repo::ArtistIncludes {
     }
 }
 
+fn release_group_includes(inc: Option<&str>) -> repo::ReleaseGroupIncludes {
+    repo::ReleaseGroupIncludes { genres: inc_has(inc, "genres"), tags: inc_has(inc, "tags") }
+}
+
 /// `GET /ws/2/artist/{mbid}`
 pub async fn lookup_artist(
     State(state): State<Arc<AppState>>,
@@ -215,9 +220,12 @@ pub async fn browse_release_group(
 pub async fn lookup_release_group(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
+    Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
-    let group = repo::lookup_release_group(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
+    let inc = release_group_includes(params.inc.as_deref());
+    let group =
+        repo::lookup_release_group(state.pool(), gid, inc).await?.ok_or(ApiError::NotFound)?;
     Ok(Json(serde_json::to_value(group).expect("release group serializes")))
 }
 
@@ -242,7 +250,7 @@ pub async fn health_sources(
 
 #[cfg(test)]
 mod tests {
-    use super::{artist_includes, inc_has, resolve_offset};
+    use super::{artist_includes, inc_has, release_group_includes, resolve_offset};
 
     #[test]
     fn resolve_offset_defaults_and_clamps() {
@@ -277,5 +285,21 @@ mod tests {
 
         let inc = artist_includes(None);
         assert!(!inc.url_rels && !inc.genres && !inc.tags && !inc.annotation);
+    }
+
+    #[test]
+    fn release_group_includes_requires_each_token() {
+        let inc = release_group_includes(Some("genres+tags"));
+        assert!(inc.genres && inc.tags);
+
+        let inc = release_group_includes(Some("artist-credits+releases+genres"));
+        assert!(inc.genres);
+        assert!(!inc.tags);
+
+        let inc = release_group_includes(Some("artist-credits+releases"));
+        assert!(!inc.genres && !inc.tags);
+
+        let inc = release_group_includes(None);
+        assert!(!inc.genres && !inc.tags);
     }
 }

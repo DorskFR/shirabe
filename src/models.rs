@@ -119,6 +119,8 @@ pub struct ReleaseGroupBrowseResponse {
 
 /// A release-group in the browse/lookup shape. `releases` is `Some` only on the
 /// lookup path (serialized even when the group has none, matching upstream MB).
+/// `genres`/`tags` are inc-gated: `None` when their token was not requested
+/// (absent from the JSON); requested-but-empty serializes as `[]`.
 #[derive(Debug, Serialize)]
 pub struct ReleaseGroupDetail {
     pub id: String,
@@ -132,6 +134,10 @@ pub struct ReleaseGroupDetail {
     pub disambiguation: String,
     #[serde(rename = "artist-credit")]
     pub artist_credit: Vec<ArtistCredit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genres: Option<Vec<Genre>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<Tag>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub releases: Option<Vec<ReleaseGroupRelease>>,
 }
@@ -275,6 +281,8 @@ mod tests {
                     aliases: vec![],
                 },
             }],
+            genres: None,
+            tags: None,
             releases: None,
         }
     }
@@ -363,6 +371,40 @@ mod tests {
         d.releases = Some(vec![]);
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["releases"], json!([]));
+    }
+
+    #[test]
+    fn release_group_omits_genres_and_tags_unless_requested() {
+        let v = serde_json::to_value(detail()).unwrap();
+        assert!(v.get("genres").is_none());
+        assert!(v.get("tags").is_none());
+    }
+
+    #[test]
+    fn release_group_requested_genres_and_tags_shapes() {
+        let mut d = detail();
+        d.genres = Some(vec![Genre {
+            id: "89255676-1f14-4dd8-bbad-fca839d6aff4".into(),
+            name: "electronic".into(),
+            count: 7,
+        }]);
+        d.tags = Some(vec![Tag { name: "icelandic".into(), count: 3 }]);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            v["genres"][0],
+            json!({ "id": "89255676-1f14-4dd8-bbad-fca839d6aff4", "name": "electronic", "count": 7 })
+        );
+        assert_eq!(v["tags"][0], json!({ "name": "icelandic", "count": 3 }));
+    }
+
+    #[test]
+    fn release_group_requested_but_empty_genres_and_tags() {
+        let mut d = detail();
+        d.genres = Some(vec![]);
+        d.tags = Some(vec![]);
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["genres"], json!([]));
+        assert_eq!(v["tags"], json!([]));
     }
 
     #[test]

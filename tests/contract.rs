@@ -191,6 +191,28 @@ async fn mb_lookup_surface_matches_downstream_inc_shapes() {
         assert!(release["id"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(release["status"], "Official");
     }
+    assert!(body.get("genres").is_none(), "genres must stay inc-gated");
+    assert!(body.get("tags").is_none(), "tags must stay inc-gated");
+
+    let (status, body) = get(
+        &st,
+        &format!("/music/ws/2/release-group/{RELEASE_GROUP_MBID}?fmt=json&inc=genres%2Btags"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "album-enrichment release-group tier request");
+    assert_eq!(body["genres"][0]["name"], "rock");
+    assert_eq!(body["genres"][0]["count"], 4);
+    assert_eq!(body["tags"][0]["name"], "rock", "tags are the genre fallback downstream");
+    assert_eq!(body["tags"][1]["name"], "seen live");
+
+    let (status, body) = get(
+        &st,
+        &format!("/music/ws/2/release-group/{RELEASE_GROUP2_MBID}?fmt=json&inc=genres%2Btags"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["genres"], json!([]), "untagged group serves [] not an error");
+    assert_eq!(body["tags"], json!([]));
 }
 
 #[tokio::test]
