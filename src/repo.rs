@@ -428,11 +428,15 @@ pub async fn search_artists(
         let gid: Uuid = row.try_get("gid")?;
         let score: f32 = row.try_get("score")?;
         let aliases = aliases_map.remove(&id).unwrap_or_default();
+        let comment: String = row.try_get("comment").unwrap_or_default();
         artists.push(Artist {
             id: gid.to_string(),
             name: row.try_get("name")?,
             score: Some(to_score(score)),
             aliases,
+            disambiguation: if comment.is_empty() { None } else { Some(comment) },
+            artist_type: row.try_get("type_name").ok(),
+            country: row.try_get("country").ok(),
         });
     }
     Ok((total, artists))

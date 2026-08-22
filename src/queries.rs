@@ -21,6 +21,9 @@
 // MAX score. Trigram `%` fallback (SEARCH_ARTISTS_FUZZY) runs only when FTS
 // matches nothing (typo'd / partial query).
 pub const SEARCH_ARTISTS: &str = r"
+        SELECT g.id, g.gid, g.name, g.score, g.total,
+               a.comment, at.name AS type_name, i.code AS country
+        FROM (
         SELECT c.id, c.gid, c.name, MAX(c.score) AS score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
@@ -48,6 +51,13 @@ pub const SEARCH_ARTISTS: &str = r"
         GROUP BY c.id, c.gid, c.name
         ORDER BY score DESC, c.id ASC
         LIMIT $2 OFFSET $3
+        ) g
+        JOIN musicbrainz.artist a ON a.id = g.id
+        LEFT JOIN musicbrainz.artist_type at ON at.id = a.type
+        LEFT JOIN LATERAL (
+            SELECT code FROM musicbrainz.iso_3166_1 WHERE area = a.area LIMIT 1
+        ) i ON TRUE
+        ORDER BY g.score DESC, g.id ASC
         ";
 
 // Trigram fallback for SEARCH_ARTISTS: used only when FTS matches nothing. The
@@ -55,6 +65,9 @@ pub const SEARCH_ARTISTS: &str = r"
 // offset paging can reach past the first page; trigram is naturally
 // accent-tolerant, so no f_unaccent here.
 pub const SEARCH_ARTISTS_FUZZY: &str = r"
+        SELECT g.id, g.gid, g.name, g.score, g.total,
+               a.comment, at.name AS type_name, i.code AS country
+        FROM (
         SELECT c.id, c.gid, c.name, MAX(c.score) AS score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
@@ -82,6 +95,13 @@ pub const SEARCH_ARTISTS_FUZZY: &str = r"
         GROUP BY c.id, c.gid, c.name
         ORDER BY score DESC, c.id ASC
         LIMIT $2 OFFSET $3
+        ) g
+        JOIN musicbrainz.artist a ON a.id = g.id
+        LEFT JOIN musicbrainz.artist_type at ON at.id = a.type
+        LEFT JOIN LATERAL (
+            SELECT code FROM musicbrainz.iso_3166_1 WHERE area = a.area LIMIT 1
+        ) i ON TRUE
+        ORDER BY g.score DESC, g.id ASC
         ";
 
 // SHIB-23: FTS + f_unaccent fast path. `to_tsvector(f_unaccent(name)) @@
