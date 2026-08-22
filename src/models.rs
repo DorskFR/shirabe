@@ -76,6 +76,12 @@ pub struct Artist {
     pub score: Option<i32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<Alias>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disambiguation: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub artist_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -655,21 +661,33 @@ mod tests {
             name: "Björk".into(),
             score: Some(100),
             aliases: vec![Alias { name: "Björk Guðmundsdóttir".into(), sort_name: None }],
+            disambiguation: Some("Icelandic singer".into()),
+            artist_type: Some("Person".into()),
+            country: Some("IS".into()),
         })
         .unwrap();
         assert_eq!(v["score"], json!(100));
         assert_eq!(v["aliases"][0]["name"], json!("Björk Guðmundsdóttir"));
         assert!(v["aliases"][0].get("sort-name").is_none());
+        assert_eq!(v["disambiguation"], json!("Icelandic singer"));
+        assert_eq!(v["type"], json!("Person"));
+        assert_eq!(v["country"], json!("IS"));
 
         let bare = serde_json::to_value(Artist {
             id: "x".into(),
             name: "y".into(),
             score: None,
             aliases: vec![],
+            disambiguation: None,
+            artist_type: None,
+            country: None,
         })
         .unwrap();
         assert!(bare.get("score").is_none());
         assert!(bare.get("aliases").is_none());
+        assert!(bare.get("disambiguation").is_none());
+        assert!(bare.get("type").is_none());
+        assert!(bare.get("country").is_none());
     }
 
     #[test]
