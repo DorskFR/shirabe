@@ -45,6 +45,9 @@ async fn mb_search_surface_matches_downstream_query_shapes() {
     assert_eq!(artist["name"], "Seaside Radio");
     assert!(artist["score"].is_i64() || artist["score"].is_u64());
     assert_eq!(artist["aliases"][0]["name"], "Régio Costera", "aliases feed confidence scoring");
+    assert_eq!(artist["disambiguation"], "test band", "comment discriminates same-named artists");
+    assert_eq!(artist["type"], "Group");
+    assert_eq!(artist["country"], "GB");
 
     let (status, body) = get(&st, "/ws/2/artist?query=seaside~&fmt=json&limit=15").await;
     assert_eq!(status, StatusCode::OK, "Lucene fuzzy suffix must not break matching");
