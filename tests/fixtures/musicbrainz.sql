@@ -24,7 +24,8 @@ CREATE TABLE musicbrainz.artist (
     name      text NOT NULL,
     sort_name text NOT NULL,
     comment   text NOT NULL DEFAULT '',
-    type      integer
+    type      integer,
+    area      integer
 );
 
 CREATE TABLE musicbrainz.artist_alias (
@@ -212,8 +213,8 @@ CREATE TABLE musicbrainz.l_release_release (
 
 INSERT INTO musicbrainz.artist_type (id, name) VALUES (1, 'Group');
 
-INSERT INTO musicbrainz.artist (id, gid, name, sort_name, comment, type) VALUES
-    (1, '11111111-1111-4111-8111-111111111111', 'Seaside Radio', 'Seaside Radio', 'test band', 1);
+INSERT INTO musicbrainz.artist (id, gid, name, sort_name, comment, type, area) VALUES
+    (1, '11111111-1111-4111-8111-111111111111', 'Seaside Radio', 'Seaside Radio', 'test band', 1, 1);
 
 INSERT INTO musicbrainz.artist_alias (id, artist, name, sort_name) VALUES
     (1, 1, 'Régio Costera', 'Costera, Régio');
