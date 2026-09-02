@@ -234,19 +234,21 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new("info"))
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(capture.clone()));
-        let _guard = subscriber.set_default();
+        subscriber.try_init().expect("no other global subscriber in the lib test binary");
 
         let app = build_router(test_state());
-        let req = Request::builder().uri("/no-such-route").body(Body::empty()).unwrap();
+        let req = Request::builder().uri("/access-log-probe").body(Body::empty()).unwrap();
         let status = app.oneshot(req).await.unwrap().status();
 
         let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        let lines: Vec<&str> = out.lines().filter(|l| l.contains("tower_http")).collect();
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("tower_http") && l.contains("uri=/access-log-probe"))
+            .collect();
         assert_eq!(lines.len(), 1, "expected one access-log line, got:\n{out}");
         let line = lines[0];
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.contains("method=GET"), "{line}");
-        assert!(line.contains("uri=/no-such-route"), "{line}");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(line.contains("status=404"), "{line}");
         assert!(line.contains(" ms"), "{line}");
