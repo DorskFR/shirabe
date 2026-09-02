@@ -44,14 +44,15 @@ async fn count_search_indexes(pool: &PgPool) -> Result<i64, sqlx::Error> {
     Ok(row.get::<i64, _>("n"))
 }
 
-/// Cheap row count for one mirror table, used to surface mirror population in
-/// health detail.
-async fn count_rows(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
+/// Planner row estimate (`pg_class.reltuples`) for one mirror table; an exact
+/// `count(*)` on the big mirror tables takes seconds and would stall `/health/sources`.
+async fn estimate_rows(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
     // `table` is a fixed literal from our own call sites, never user input.
-    let row = sqlx::query(&format!("SELECT count(*) AS n FROM musicbrainz.{table}"))
-        .fetch_one(pool)
-        .await?;
-    Ok(row.get::<i64, _>("n"))
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT reltuples::bigint FROM pg_class WHERE oid = 'musicbrainz.{table}'::regclass"
+    ))
+    .fetch_one(pool)
+    .await
 }
 
 #[async_trait]
@@ -76,7 +77,7 @@ impl Source for MusicBrainzSource {
     }
 
     async fn health(&self) -> SourceHealth {
-        // Ping + index presence + a representative row count.
+        // Ping + index presence + a representative row estimate.
         let index_count = match count_search_indexes(&self.pool).await {
             Ok(n) => n,
             Err(e) => {
@@ -87,13 +88,13 @@ impl Source for MusicBrainzSource {
                 };
             }
         };
-        let artist_rows = count_rows(&self.pool, "artist").await.unwrap_or(-1);
+        let artist_rows = estimate_rows(&self.pool, "artist").await.unwrap_or(-1);
         SourceHealth {
             source: self.id().to_string(),
             reachable: true,
             detail: format!(
                 "musicbrainz mirror reachable; {index_count} trgm search index(es); \
-                 artist rows={artist_rows}"
+                 artist rows~{artist_rows}"
             ),
         }
     }

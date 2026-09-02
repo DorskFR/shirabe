@@ -1,6 +1,9 @@
 use axum::Json;
+use axum::extract::{FromRequestParts, Query};
+use axum::http::request::Parts;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 use serde_json::json;
 
 pub async fn no_such_route(method: Method, uri: Uri) -> Response {
@@ -26,6 +29,9 @@ pub enum ApiError {
 
     #[error("not found")]
     NotFound,
+
+    #[error("unauthorized")]
+    Unauthorized,
 }
 
 impl IntoResponse for ApiError {
@@ -37,6 +43,7 @@ impl IntoResponse for ApiError {
             }
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
         };
         // MusicBrainz returns an `error` field on failures; mirror that shape.
         (status, Json(json!({ "error": message }))).into_response()
@@ -44,6 +51,25 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// `axum::extract::Query` whose rejection is an `ApiError::BadRequest` JSON body
+/// instead of axum's plain-text 400.
+pub struct ApiQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(v)| Self(v))
+            .map_err(|rej| ApiError::BadRequest(rej.body_text()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -87,6 +113,13 @@ mod tests {
         let (status, body) = parts(ApiError::NotFound.into_response()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "not found");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_shape() {
+        let (status, body) = parts(ApiError::Unauthorized.into_response()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "unauthorized");
     }
 
     #[test]

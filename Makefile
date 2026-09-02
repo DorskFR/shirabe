@@ -41,7 +41,7 @@ test:  ## Run unit tests (no DB required)
 DATABASE_URL_TEST ?= postgres://musicbrainz:musicbrainz@localhost:5490/musicbrainz_db
 
 test-integration:  ## Run ALL tests incl. DB-gated (throwaway postgres; `make db/up` locally first)
-	DATABASE_URL_TEST=$(DATABASE_URL_TEST) cargo test -- --include-ignored
+	DATABASE_URL_TEST=$(DATABASE_URL_TEST) cargo test --no-fail-fast -- --include-ignored
 
 # ── Run ────────────────────────────────────────────────────
 
@@ -52,7 +52,7 @@ run:  ## Run the server locally (needs DATABASE_URL pointing at a MB mirror)
 
 db/up:  ## Start the local (empty) postgres for smoke-testing
 	docker compose up -d shirabe-postgres
-	@until docker exec shirabe-postgres pg_isready -U musicbrainz > /dev/null 2>&1; do sleep 1; done
+	@until docker exec shirabe-postgres pg_isready -U musicbrainz -d musicbrainz_db > /dev/null 2>&1; do sleep 1; done
 	@echo "Postgres ready on port 5490"
 
 db/down:  ## Stop the local postgres

@@ -21,8 +21,10 @@ pub mod xref;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -229,14 +231,11 @@ impl Registry {
         Some(report)
     }
 
-    /// Health of every registered source (for the internal registry probe and,
-    /// later, `/health/sources`).
+    /// Live health of every registered source, probed concurrently with a
+    /// per-source [`HEALTH_PROBE_TIMEOUT`] so one slow backing store can't hang
+    /// the whole report.
     pub async fn health_all(&self) -> Vec<SourceHealth> {
-        let mut out = Vec::with_capacity(self.sources.len());
-        for source in self.sources.values() {
-            out.push(source.health().await);
-        }
-        out
+        join_all(self.sources.values().map(|s| probe_health(s.as_ref()))).await
     }
 
     /// Gather the `/health/sources` report: for every registered source, merge the
@@ -259,14 +258,32 @@ impl Registry {
             None => BTreeMap::new(),
         };
 
-        let mut sources = Vec::with_capacity(self.sources.len());
-        for source in self.sources.values() {
-            let live = source.health().await;
-            let row = persisted.get(source.id());
-            sources.push(merge_source_health(source.as_ref(), &live, row));
-        }
+        let live = self.health_all().await;
+        let sources = self
+            .sources
+            .values()
+            .zip(&live)
+            .map(|(source, live)| {
+                merge_source_health(source.as_ref(), live, persisted.get(source.id()))
+            })
+            .collect();
         SourcesHealthReport { sources }
     }
+}
+
+/// Upper bound for one source's live `health()` probe.
+pub const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run one source's `health()` under [`HEALTH_PROBE_TIMEOUT`]; a probe that
+/// overruns is reported as unreachable instead of stalling the caller.
+async fn probe_health(source: &dyn Source) -> SourceHealth {
+    tokio::time::timeout(HEALTH_PROBE_TIMEOUT, source.health()).await.unwrap_or_else(|_| {
+        SourceHealth {
+            source: source.id().to_string(),
+            reachable: false,
+            detail: format!("probe timed out after {}s", HEALTH_PROBE_TIMEOUT.as_secs()),
+        }
+    })
 }
 
 /// A persisted `shirabe.source` row, as read back for `/health/sources`.
@@ -484,6 +501,65 @@ mod tests {
                 detail: "fake reachable; 3 rows".to_string(),
             }
         }
+    }
+
+    /// A `Source` whose `health()` never finishes in time.
+    struct SlowSource;
+
+    #[async_trait]
+    impl Source for SlowSource {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn id(&self) -> &str {
+            "slow"
+        }
+        fn ingest_mode(&self) -> IngestMode {
+            IngestMode::BulkDump
+        }
+        async fn refresh(&self, _ctx: &RefreshCtx) -> RefreshReport {
+            RefreshReport::ok("noop")
+        }
+        async fn health(&self) -> SourceHealth {
+            tokio::time::sleep(HEALTH_PROBE_TIMEOUT * 10).await;
+            SourceHealth {
+                source: "slow".to_string(),
+                reachable: true,
+                detail: "too late".to_string(),
+            }
+        }
+    }
+
+    /// A probe that overruns the timeout is cut off and reported unhealthy; the
+    /// other sources' probes still land, and the report returns promptly.
+    #[tokio::test]
+    async fn health_report_times_out_slow_probe() {
+        let pools = Pools {
+            musicbrainz: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused@localhost/unused")
+                .expect("lazy pool"),
+            shirabe: None,
+            imdb: None,
+            tmdb: None,
+            tvdb: None,
+            fanart: None,
+        };
+        let mut registry = Registry { pools, sources: BTreeMap::new() };
+        registry.register(Arc::new(FakeSource));
+        registry.register(Arc::new(SlowSource));
+
+        let started = std::time::Instant::now();
+        let report = registry.health_report().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= HEALTH_PROBE_TIMEOUT && elapsed < HEALTH_PROBE_TIMEOUT * 2,
+            "probes must run concurrently and be cut at the timeout, took {elapsed:?}"
+        );
+
+        let by_name: BTreeMap<_, _> = report.sources.iter().map(|s| (s.id.as_str(), s)).collect();
+        assert!(by_name["fake"].healthy);
+        let slow = by_name["slow"];
+        assert!(!slow.healthy);
+        assert!(!slow.reachable);
+        assert_eq!(slow.live_detail, "probe timed out after 2s");
     }
 
     /// Merge with a persisted ok row + a reachable live probe → healthy, and the

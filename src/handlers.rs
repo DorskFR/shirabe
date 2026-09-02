@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiQuery, ApiResult};
 use crate::models::{
     ArtistSearchResponse, RecordingSearchResponse, ReleaseGroupBrowseResponse,
     ReleaseSearchResponse,
@@ -45,7 +45,7 @@ pub struct BrowseParams {
 /// `GET /ws/2/artist`
 pub async fn search_artist(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<ArtistSearchResponse>> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
@@ -71,7 +71,7 @@ pub async fn search_artist(
 /// `GET /ws/2/release`
 pub async fn search_release(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<ReleaseSearchResponse>> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
@@ -115,7 +115,7 @@ pub async fn search_release(
 /// `GET /ws/2/recording`
 pub async fn search_recording(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<RecordingSearchResponse>> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
@@ -169,7 +169,7 @@ fn release_group_includes(inc: Option<&str>) -> repo::ReleaseGroupIncludes {
 pub async fn lookup_artist(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
     let inc = artist_includes(params.inc.as_deref());
@@ -200,7 +200,7 @@ pub async fn lookup_recording(
 /// `GET /ws/2/release-group?artist={mbid}`
 pub async fn browse_release_group(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<BrowseParams>,
+    ApiQuery(params): ApiQuery<BrowseParams>,
 ) -> ApiResult<Json<ReleaseGroupBrowseResponse>> {
     let artist =
         params.artist.as_deref().ok_or_else(|| ApiError::BadRequest("missing artist".into()))?;
@@ -220,7 +220,7 @@ pub async fn browse_release_group(
 pub async fn lookup_release_group(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<Value>> {
     let gid = parse_mbid(&mbid)?;
     let inc = release_group_includes(params.inc.as_deref());

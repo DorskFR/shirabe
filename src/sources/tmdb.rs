@@ -109,7 +109,7 @@ fn parse_export_line(line: &str) -> Option<ExportRow> {
 }
 
 /// The TMDB enumeration source. Holds the optional writable `tmdb` pool so
-/// `health()` can report the id-index row count; `None` when `TMDB_DATABASE_URL`
+/// `health()` can report the id-index row estimate; `None` when `TMDB_DATABASE_URL`
 /// is unset (the API pod still boots and the source registers, but ingest and the
 /// count are unavailable).
 pub struct TmdbSource {
@@ -274,14 +274,16 @@ impl Source for TmdbSource {
                 detail: "TMDB_DATABASE_URL is not set; tmdb id index unavailable".to_string(),
             };
         };
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tmdb_id_index")
-            .fetch_one(pool)
-            .await
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'tmdb_id_index'::regclass",
+        )
+        .fetch_one(pool)
+        .await
         {
             Ok(n) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!("tmdb_id_index reachable; {n} enumerated ids"),
+                detail: format!("tmdb_id_index reachable; ~{n} enumerated ids"),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),

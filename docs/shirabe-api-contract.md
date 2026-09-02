@@ -72,7 +72,7 @@ failures:
 
 | Facade | Shape | Statuses |
 |---|---|---|
-| MusicBrainz `/ws/2` | `{ "error": "<message>" }` (MB's shape) | 400 bad query/MBID, 404 not found, 500 DB error |
+| MusicBrainz `/ws/2` | `{ "error": "<message>" }` (MB's shape) | 400 bad query/MBID/malformed `limit`/`offset`, 404 not found, 500 DB error |
 | TMDB `/3` | `{ "status_code": <n>, "status_message": "…" }` | 400 (code 22/34), 502 upstream (code 11), 503 not configured (code 7) |
 | TheTVDB `/v4` | `{ "status": "failure", "message": "…" }` | 400 invalid id, 502 upstream, 503 not configured |
 | fanart.tv `/v3` | `{ "status": "error", "error message": "…" }` — but an upstream **404 passes through** with the upstream body (authoritative "no artwork", safe to negative-cache) | 404 passthrough, 502 upstream, 503 not configured |
@@ -88,9 +88,12 @@ synthesized from `similarity()`.
 
 Search endpoints return the ws/2 envelope
 `{ "count": <total matches>, "offset": <offset>, "<plural>": [...] }` and accept
-`limit=` / `offset=`:
+`limit=` / `offset=`. `fmt` is accepted for compatibility only: `fmt=xml` still
+returns JSON.
 
-- `GET /ws/2/artist?query=&fmt=json` → `{ "count", "offset", "artists": [...] }`
+- `GET /ws/2/artist?query=&fmt=json` → `{ "count", "offset", "artists": [...] }`;
+  each artist carries `id, name, sort-name, score, type, country, disambiguation`
+  (nullable fields omitted) plus `aliases[].{name,sort-name}` with `inc=aliases`
 - `GET /ws/2/release?query=&fmt=json` → `{ "count", "offset", "releases": [...] }`
 - `GET /ws/2/recording?query=&fmt=json` → `{ "count", "offset", "recordings": [...] }`
 

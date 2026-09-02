@@ -24,8 +24,8 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
+use sqlx::PgPool;
 use sqlx::postgres::PgPoolCopyExt;
-use sqlx::{PgPool, Row};
 use tokio_util::io::StreamReader;
 
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
@@ -267,7 +267,7 @@ fn datasets() -> Vec<Dataset> {
 }
 
 /// The IMDb bulk-dump source. Holds the optional writable `imdb` pool so
-/// `health()` can report per-table row counts; `None` when `IMDB_DATABASE_URL`
+/// `health()` can report per-table row estimates; `None` when `IMDB_DATABASE_URL`
 /// is unset (the API pod still boots and the source registers, but ingest and
 /// counts are unavailable).
 pub struct ImdbSource {
@@ -405,13 +405,17 @@ fn index_name(create_index_sql: &str) -> Option<String> {
     rest.split_whitespace().next().map(ToString::to_string)
 }
 
-/// Row count for one (possibly absent) table; `-1` when the table is missing.
-async fn count_rows(pool: &PgPool, table: &str) -> i64 {
+/// Planner row estimate (`pg_class.reltuples`) for one (possibly absent) table;
+/// `-1` when the table is missing. Exact `count(*)` on the ~58M-row akas table
+/// takes far longer than a health probe may.
+async fn estimate_rows(pool: &PgPool, table: &str) -> i64 {
     // `table` is a fixed literal from our own dataset list, never user input.
-    sqlx::query(&format!("SELECT count(*) AS n FROM {table}"))
-        .fetch_one(pool)
-        .await
-        .map_or(-1, |row| row.get::<i64, _>("n"))
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass"
+    ))
+    .fetch_one(pool)
+    .await
+    .unwrap_or(-1)
 }
 
 #[async_trait]
@@ -467,7 +471,7 @@ impl Source for ImdbSource {
 
     async fn health(&self) -> SourceHealth {
         // last_refresh is tracked by the registry (`shirabe.source` row); here we
-        // report reachability + per-table row counts from the imdb pool.
+        // report reachability + per-table row estimates from the imdb pool.
         let Some(pool) = self.pool.as_ref() else {
             return SourceHealth {
                 source: self.id().to_string(),
@@ -479,7 +483,7 @@ impl Source for ImdbSource {
             Ok(counts) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!("imdb bulk mirror reachable; row counts {counts}"),
+                detail: format!("imdb bulk mirror reachable; estimated rows {counts}"),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),
@@ -490,7 +494,7 @@ impl Source for ImdbSource {
     }
 }
 
-/// Per-table row counts for the imdb mirror. Returns an error if the pool is
+/// Per-table row estimates for the imdb mirror. Returns an error if the pool is
 /// unreachable; missing individual tables surface as `-1`.
 async fn table_counts(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // Reachability probe so a dead pool errors rather than reporting all -1.
@@ -501,7 +505,7 @@ async fn table_counts(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
         ["imdb_title_basics", "imdb_title_episode", "imdb_title_akas", "imdb_title_ratings"];
     let mut map = serde_json::Map::new();
     for t in tables {
-        map.insert(t.to_string(), json!(count_rows(pool, t).await));
+        map.insert(t.to_string(), json!(estimate_rows(pool, t).await));
     }
     Ok(serde_json::Value::Object(map))
 }
