@@ -74,14 +74,16 @@ impl Source for FanartSource {
                     .to_string(),
             };
         };
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM fanart_cache")
-            .fetch_one(pool)
-            .await
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'fanart_cache'::regclass",
+        )
+        .fetch_one(pool)
+        .await
         {
             Ok(n) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!("fanart_cache reachable; {n} cached rows; key configured"),
+                detail: format!("fanart_cache reachable; ~{n} cached rows; key configured"),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),

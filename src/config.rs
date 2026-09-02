@@ -26,10 +26,10 @@ pub enum Command {
     /// schema-bootstrap the dedicated per-provider databases in-cluster (they come
     /// up empty and there is no external migration runner). Idempotent.
     ///
-    /// `db` is one of `shirabe`, `imdb`, `tmdb`, `tvdb`, or `all` (every DB whose
-    /// URL is configured). The read-only `musicbrainz` mirror is NOT migrated here.
+    /// `db` is one of `shirabe`, `imdb`, `tmdb`, `tvdb`, `fanart`, or `all` (every DB
+    /// whose URL is configured). The read-only `musicbrainz` mirror is NOT migrated here.
     Migrate {
-        /// Database to migrate: `shirabe` | `imdb` | `tmdb` | `tvdb` | `all`.
+        /// Database to migrate: `shirabe` | `imdb` | `tmdb` | `tvdb` | `fanart` | `all`.
         db: String,
     },
 }
@@ -168,8 +168,16 @@ pub struct Config {
     /// diagnosing slow trigram searches. Params are bound (never interpolated) and
     /// only catalog SQL is runnable; still, keep this off in any exposed
     /// deployment as it can run arbitrary EXPLAIN ANALYZE load against the DBs.
+    /// Has no effect unless `SHIRABE_DEBUG_UI_TOKEN` is also set.
     #[arg(long, env = "SHIRABE_DEBUG_UI", default_value_t = false)]
     pub debug_ui: bool,
+
+    /// Bearer token guarding the `/debug/*` explorer. Every debug request must
+    /// carry `Authorization: Bearer <token>` or it is answered 401. Required for
+    /// `SHIRABE_DEBUG_UI` to take effect: when it is unset or empty the explorer is
+    /// not mounted at all and a WARN is logged at boot.
+    #[arg(long, env = "SHIRABE_DEBUG_UI_TOKEN")]
+    pub debug_ui_token: Option<String>,
 
     /// Externally-reachable base URL of the `caache` image proxy (SHIB-9). TMDB/TVDB
     /// poster/artwork URLs in the `/3` and `/v4` facade payloads are rewritten to
@@ -293,5 +301,24 @@ mod tests {
     #[test]
     fn default_is_also_clamped_to_max() {
         assert_eq!(cfg(200, 100).resolve_limit(None), 100);
+    }
+
+    #[test]
+    fn env_example_documents_every_env_var() {
+        let source = include_str!("config.rs");
+        let example = include_str!("../.env.example");
+        let documented: std::collections::BTreeSet<&str> = example
+            .lines()
+            .map(|l| l.trim().trim_start_matches('#').trim_start())
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+            .collect();
+        let missing: Vec<&str> = source
+            .split("env = \"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|name| !documented.contains(name))
+            .collect();
+        assert!(missing.is_empty(), "env vars missing from .env.example: {missing:?}");
     }
 }

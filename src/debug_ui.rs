@@ -1,5 +1,6 @@
-//! Opt-in SQL query explorer (SHIB-21), mounted at `/debug/queries` only when
-//! `SHIRABE_DEBUG_UI=1`.
+//! Opt-in SQL query explorer, mounted at `/debug/queries` only when both
+//! `SHIRABE_DEBUG_UI=1` and `SHIRABE_DEBUG_UI_TOKEN` are set; every request must
+//! carry `Authorization: Bearer <token>` or gets a 401.
 //!
 //! It renders every statement in [`crate::queries::catalog`] — the exact SQL the
 //! handlers run — and lets an operator execute each one, or its
@@ -16,8 +17,10 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
-use axum::response::{Html, IntoResponse, Json};
+use axum::extract::{Request, State};
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,12 +29,37 @@ use sqlx::{PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::error::ApiError;
 use crate::queries::{self, ParamType, QuerySpec, TargetDb};
 use crate::search::sanitize_work_mem;
 
-/// Routes for the explorer. Merged into the main router only when enabled.
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/debug/queries", get(page)).route("/debug/run", post(run))
+/// Routes for the explorer, all behind a `Bearer <token>` check. Merged into the
+/// main router only when enabled and a token is configured.
+pub fn router(token: String) -> Router<Arc<AppState>> {
+    let token = Arc::new(token);
+    Router::new()
+        .route("/debug/queries", get(page))
+        .route("/debug/run", post(run))
+        .layer(middleware::from_fn(move |req, next| require_bearer(token.clone(), req, next)))
+}
+
+async fn require_bearer(token: Arc<String>, req: Request, next: Next) -> Response {
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(p) if constant_time_eq(p.as_bytes(), token.as_bytes()) => next.run(req).await,
+        _ => ApiError::Unauthorized.into_response(),
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ── page ──────────────────────────────────────────────────────

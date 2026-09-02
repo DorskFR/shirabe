@@ -22,7 +22,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 use sqlx::PgPool;
-use tower_http::trace::TraceLayer;
+use tower_http::LatencyUnit;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use crate::config::Config;
 use crate::db::Pools;
@@ -139,15 +141,31 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(facades::coverart::router())
         .nest("/coverart", facades::coverart::router());
 
-    // Opt-in query explorer (SHIB-21): off unless SHIRABE_DEBUG_UI=1. Serves the
-    // self-generated `/debug/queries` page + `/debug/run` runner against the pools.
-    let app = if state.config.debug_ui { app.merge(debug_ui::router()) } else { app };
+    // Opt-in query explorer: needs SHIRABE_DEBUG_UI=1 and a non-empty
+    // SHIRABE_DEBUG_UI_TOKEN; every `/debug/*` request must present that bearer.
+    let app = match (state.config.debug_ui, state.config.debug_ui_token.as_deref()) {
+        (true, Some(token)) if !token.is_empty() => app.merge(debug_ui::router(token.to_owned())),
+        (true, _) => {
+            tracing::warn!(
+                "SHIRABE_DEBUG_UI set without SHIRABE_DEBUG_UI_TOKEN; debug UI not mounted"
+            );
+            app
+        }
+        (false, _) => app,
+    };
 
     app.fallback(error::no_such_route)
         .method_not_allowed_fallback(error::method_not_allowed)
-        // Per-request access log (method, path, status, latency). Enable with
-        // `tower_http=debug` in RUST_LOG to see every ws/2 call.
-        .layer(TraceLayer::new_for_http())
+        // One INFO access-log line per request (method, uri, status, latency ms),
+        // visible at the default `RUST_LOG=info`.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_request(())
+                .on_response(
+                    DefaultOnResponse::new().level(Level::INFO).latency_unit(LatencyUnit::Millis),
+                ),
+        )
         .with_state(state)
 }
 
@@ -187,6 +205,51 @@ mod tests {
         let app = build_router(test_state());
         let req = Request::builder().uri(path).body(Body::empty()).unwrap();
         app.oneshot(req).await.unwrap().status()
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn access_log_is_one_info_line_with_status_and_latency() {
+        use tracing_subscriber::prelude::*;
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(capture.clone()));
+        let _guard = subscriber.set_default();
+
+        let app = build_router(test_state());
+        let req = Request::builder().uri("/no-such-route").body(Body::empty()).unwrap();
+        let status = app.oneshot(req).await.unwrap().status();
+
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("tower_http")).collect();
+        assert_eq!(lines.len(), 1, "expected one access-log line, got:\n{out}");
+        let line = lines[0];
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.contains("method=GET"), "{line}");
+        assert!(line.contains("uri=/no-such-route"), "{line}");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(line.contains("status=404"), "{line}");
+        assert!(line.contains(" ms"), "{line}");
     }
 
     /// Every provider alias must reach a handler (non-404), proving the route is

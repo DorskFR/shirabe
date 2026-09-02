@@ -4,9 +4,15 @@
 
 mod common;
 
-use axum::http::StatusCode;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
 use common::{body_json, get, send, state};
 use serde_json::Value;
+use shirabe::{AppState, build_router};
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn health_reports_db_failure_as_500_error_shape() {
@@ -49,6 +55,25 @@ async fn ws2_search_missing_query_is_400_across_mounts() {
         let (status, body) = get(&st, path).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
         assert_eq!(body["error"], msg, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn ws2_bad_limit_and_offset_are_json_400() {
+    let st = state(&[]);
+    for path in [
+        "/ws/2/artist?query=radiohead&limit=abc",
+        "/musicbrainz/ws/2/artist?query=radiohead&offset=abc",
+        "/music/artist?query=radiohead&limit=abc",
+        "/ws/2/release-group?artist=00000000-0000-0000-0000-000000000000&limit=x",
+    ] {
+        let resp = send(&st, "GET", path).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}");
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
+        assert!(ct.starts_with("application/json"), "{path}: {ct}");
+        let body = body_json(resp).await;
+        let msg = body["error"].as_str().unwrap_or_else(|| panic!("{path}: {body}"));
+        assert!(msg.contains("Failed to deserialize query string"), "{path}: {msg}");
     }
 }
 
@@ -227,4 +252,48 @@ async fn coverart_ia_guard_rejects_private_hosts_on_both_mounts() {
         let resp = send(&st, "GET", path).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
     }
+}
+
+async fn debug_get(st: &Arc<AppState>, bearer: Option<&str>) -> Response {
+    let mut req = Request::builder().method("GET").uri("/debug/queries");
+    if let Some(b) = bearer {
+        req = req.header("authorization", format!("Bearer {b}"));
+    }
+    build_router(st.clone()).oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+}
+
+#[tokio::test]
+async fn debug_ui_is_absent_when_disabled() {
+    let st = state(&["--debug-ui-token", "s3cret"]);
+    assert_eq!(debug_get(&st, Some("s3cret")).await.status(), StatusCode::NOT_FOUND);
+    let (status, _) = get(&st, "/debug/queries").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn debug_ui_is_absent_when_enabled_without_token() {
+    for st in [state(&["--debug-ui"]), state(&["--debug-ui", "--debug-ui-token", ""])] {
+        let (status, body) = get(&st, "/debug/queries").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].is_string());
+        let resp = send(&st, "POST", "/debug/run").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn debug_ui_requires_matching_bearer() {
+    let st = state(&["--debug-ui", "--debug-ui-token", "s3cret"]);
+    for bearer in [None, Some("wrong"), Some("s3cre"), Some("s3cret!")] {
+        let resp = debug_get(&st, bearer).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{bearer:?}");
+        assert_eq!(body_json(resp).await["error"], "unauthorized", "{bearer:?}");
+    }
+    let resp = send(&st, "POST", "/debug/run").await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = debug_get(&st, Some("s3cret")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
+    assert!(ct.starts_with("text/html"), "{ct}");
 }

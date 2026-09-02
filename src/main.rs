@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clap::Parser;
 use shirabe::config::{Cli, Command};
 use shirabe::db::Pools;
@@ -11,7 +13,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
+        .with(fmt::layer().with_ansi(std::io::stdout().is_terminal()))
         .init();
 
     let cli = Cli::parse();

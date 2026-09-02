@@ -18,13 +18,14 @@ and confidence re-scoring work unchanged.
 ## Endpoints
 
 All responses are JSON with MB's hyphenated keys (`artist-credit`,
-`track-count`, `release-group`, `primary-type`, `sort-name`, ...). Search
-responses carry the ws/2 envelope: `{"count": <total>, "offset": <offset>,
-"<plural>": [...]}`; `limit=` and `offset=` page through it.
+`track-count`, `release-group`, `primary-type`, `sort-name`, ...); `fmt=xml` is
+accepted for compatibility but still returns JSON. Search responses carry the
+ws/2 envelope: `{"count": <total>, "offset": <offset>, "<plural>": [...]}`;
+`limit=` and `offset=` page through it.
 
 | Method & path | Query shape | Notes |
 | --- | --- | --- |
-| `GET /ws/2/artist?query=&limit=&offset=&inc=aliases` | bare artist name | `id, name, score, aliases[].{name,sort-name}` |
+| `GET /ws/2/artist?query=&limit=&offset=&inc=aliases` | bare artist name | `id, name, score, type, country, disambiguation, aliases[].{name,sort-name}` |
 | `GET /ws/2/artist/{mbid}?inc=url-rels+genres+tags+annotation` | — | artist lookup; `inc` tokens `url-rels`, `genres`, `tags`, `annotation` |
 | `GET /ws/2/release?query=&limit=&offset=` | `release:(title) AND artist:(name) [AND date:(YYYY*)]` — or `arid:<mbid>` (+ optional `primarytype:`, `status:`) for an artist browse | `id, title, date, score, status, disambiguation, artist-credit, track-count, release-group` |
 | `GET /ws/2/recording?query=&limit=&offset=&inc=releases+artist-credits+media` | `recording:"title" AND artist:"name"` | recordings + full release shapes (incl. media/tracks) |
@@ -32,8 +33,8 @@ responses carry the ws/2 envelope: `{"count": <total>, "offset": <offset>,
 | `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases` | — | recording + releases |
 | `GET /ws/2/release-group?artist=<mbid>&limit=&offset=` | browse by artist MBID | `{"release-group-count", "release-group-offset", "release-groups": [...]}` |
 | `GET /ws/2/release-group/{mbid}` | — | release-group lookup |
-| `GET /health`, `GET /ws/2` | — | DB ping, `{"status":"ok"}` |
-| `GET /health/sources` | — | per-source health/staleness report |
+| `GET /health`, `GET /ws/2` | — | DB ping, `{"status":"ok"}` — use this as the k8s readiness/liveness probe |
+| `GET /health/sources` | — | per-source health/staleness report; probes every backing store (each capped at 2 s, run concurrently). Diagnostic only — do not wire it as a k8s probe |
 
 Unknown paths and wrong methods get JSON errors from every mount:
 `404 {"error":"shirabe: no such route: GET /x"}` /
@@ -150,8 +151,9 @@ fast with a clear error if it is unset.
 | `SHIRABE_COVERART_POSITIVE_TTL_SECS` | no | `2592000` | Byte-cache TTL for 200 responses (30 days) |
 | `SHIRABE_COVERART_NEGATIVE_TTL_SECS` | no | `21600` | Byte-cache TTL for 404 responses (6 hours) |
 | `SHIRABE_COVERART_UPSTREAM_BASE` | no | `https://coverartarchive.org` | Upstream base for the `/release`, `/release-group` redirect layer |
-| `SHIRABE_DEBUG_UI` | no | `false` | Opt-in SQL query explorer at `/debug/queries`; keep off in exposed deployments |
-| `RUST_LOG` | no | `info` | tracing/`EnvFilter` filter |
+| `SHIRABE_DEBUG_UI` | no | `false` | Opt-in SQL query explorer at `/debug/queries`; keep off in exposed deployments. Only mounted when `SHIRABE_DEBUG_UI_TOKEN` is also set |
+| `SHIRABE_DEBUG_UI_TOKEN` | no | – | Bearer token required on every `/debug/*` request (`Authorization: Bearer <token>`, else 401). Without it the explorer is not mounted and a WARN is logged at boot |
+| `RUST_LOG` | no | `info` | tracing/`EnvFilter` filter; `info` already includes one access-log line per request (method, uri, status, latency ms). ANSI colours are off when stdout is not a tty |
 
 Testing-only (hidden from `--help`; never set in a real deployment):
 `TMDB_API_BASE`, `TVDB_API_BASE`, `FANART_API_BASE` point a facade at a mock

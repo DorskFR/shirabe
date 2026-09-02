@@ -248,12 +248,18 @@ impl Source for TvdbSource {
                 detail: "TVDB_DATABASE_URL is not set; tvdb cache unavailable".to_string(),
             };
         };
-        match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tvdb_cache").fetch_one(pool).await
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'tvdb_cache'::regclass",
+        )
+        .fetch_one(pool)
+        .await
         {
             Ok(n) => SourceHealth {
                 source: self.id().to_string(),
                 reachable: true,
-                detail: format!("tvdb_cache reachable; {n} cached rows; token_valid={token_valid}"),
+                detail: format!(
+                    "tvdb_cache reachable; ~{n} cached rows; token_valid={token_valid}"
+                ),
             },
             Err(e) => SourceHealth {
                 source: self.id().to_string(),

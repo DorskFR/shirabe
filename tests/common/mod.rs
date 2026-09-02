@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -35,8 +36,7 @@ pub fn state_with_db(musicbrainz_url: &str, extra_args: &[&str]) -> Arc<AppState
     let mut args = vec!["shirabe", "--database-url", musicbrainz_url];
     args.extend_from_slice(extra_args);
     let config = Cli::try_parse_from(args).expect("test cli args").config;
-    // Short acquire timeout so the NO_DB (connection-refused) paths fail in
-    // milliseconds instead of sqlx's 30s default retry window.
+    init_tracing();
     let lazy = |url: &Option<String>| url.as_deref().map(lazy_pool);
     let pools = Pools {
         musicbrainz: lazy_pool(&config.database_url),
@@ -52,12 +52,26 @@ pub fn state_with_db(musicbrainz_url: &str, extra_args: &[&str]) -> Arc<AppState
     Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
 }
 
+/// `NO_DB` (connection refused) fails in milliseconds instead of sqlx's 30 s
+/// retry window; real fixture DBs get a generous timeout because the first
+/// connect to a freshly created database on a busy postgres can exceed 500 ms.
 fn lazy_pool(url: &str) -> PgPool {
+    let acquire_timeout =
+        if url == NO_DB { Duration::from_millis(500) } else { Duration::from_secs(10) };
     PgPoolOptions::new()
         .max_connections(2)
-        .acquire_timeout(std::time::Duration::from_millis(500))
+        .acquire_timeout(acquire_timeout)
         .connect_lazy(url)
         .unwrap()
+}
+
+/// Installs a `RUST_LOG`-driven subscriber once per test binary so handler
+/// errors (e.g. sqlx failures behind an opaque 500) show up in test output.
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
 }
 
 pub async fn send(state: &Arc<AppState>, method: &str, path: &str) -> Response {
