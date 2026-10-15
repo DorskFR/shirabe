@@ -139,6 +139,7 @@ once, caches, and self-links `remoteIds` into `shirabe.xref`.
 | `GET /v4/series/{id}` | series record |
 | `GET /v4/series/{id}/extended` | `{ "data": { "name", "firstAired", "seasons": [ { …, "type": { "type": "official"\|"dvd"\|… } } ], "remoteIds": [...] } }` |
 | `GET /v4/series/{id}/episodes/{season-type}?season=&page=` | `{ "data": { "episodes": [ { "number", "name", "seasonNumber", "aired", "runtime" } ] }, "links": { "next": "<url>"\|null } }` — pure passthrough of `links`; paginate until `links.next` is null/absent |
+| `GET /v4/series/{id}/episodes/{season-type}/{lang}?season=&page=` | Same shape, `name`/`overview` translated to `lang` (e.g. `eng`) |
 | `GET /v4/movies/{id}` | movie record; served from the upstream **extended** record so `remoteIds` cross-IDs are present |
 
 Ids are accepted as bare integers (`1396`) or prefixed slugs (`series-1396`,

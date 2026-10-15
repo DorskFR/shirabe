@@ -808,3 +808,57 @@ async fn tvdb_episode_pages_signal_continuation_only_via_links_next() {
         "last page must carry links.next = null — the walk's only stop signal"
     );
 }
+
+#[tokio::test]
+async fn tvdb_translated_episodes_pass_through_lang_and_pagination() {
+    let server = MockServer::start().await;
+    tvdb_login_mock().mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/series/81797/episodes/official/eng"))
+        .and(query_param("season", "1"))
+        .and(query_param("page", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": { "episodes": [{
+                "id": 1, "number": 1, "seasonNumber": 1, "name": "I'm Luffy!",
+                "image": "https://artworks.thetvdb.com/banners/episodes/e.jpg"
+            }] },
+            "links": { "prev": null, "next": "/series/81797/episodes/official/eng?page=1" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/series/81797/episodes/official"))
+        .and(query_param("season", "1"))
+        .and(query_param("page", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "success",
+            "data": { "episodes": [{ "id": 1, "number": 1, "seasonNumber": 1,
+                                     "name": "Ore wa Luffy!" }] },
+            "links": { "prev": null, "next": null }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let st = state(&[
+        "--tvdb-api-key",
+        "server-key",
+        "--tvdb-api-base",
+        &server.uri(),
+        "--caache-base-url",
+        "https://img.example",
+    ]);
+
+    let (status, body) = get(&st, "/v4/series/81797/episodes/official/eng?season=1&page=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let ep = &body["data"]["episodes"][0];
+    assert_eq!(ep["name"], "I'm Luffy!");
+    assert_eq!(ep["image"], "https://img.example/_ia/artworks.thetvdb.com/banners/episodes/e.jpg");
+    assert_eq!(body["links"]["next"], "/series/81797/episodes/official/eng?page=1");
+
+    let (status, body) = get(&st, "/v4/series/81797/episodes/official?season=1&page=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["episodes"][0]["name"], "Ore wa Luffy!", "lang is part of the key");
+}

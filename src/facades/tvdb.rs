@@ -89,6 +89,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v4/series/{id}", get(series))
         .route("/v4/series/{id}/extended", get(series_extended))
         .route("/v4/series/{id}/episodes/{season_type}", get(series_episodes))
+        .route("/v4/series/{id}/episodes/{season_type}/{lang}", get(series_episodes_lang))
         .route("/v4/movies/{id}", get(movie))
 }
 
@@ -438,17 +439,44 @@ async fn series_episodes(
     Path((id_raw, season_type)): Path<(String, String)>,
     Query(params): Query<Value>,
 ) -> Response {
-    let Some(id) = numeric_id(&id_raw) else {
+    episodes(&state, &id_raw, &season_type, None, &params).await
+}
+
+/// `GET /v4/series/{id}/episodes/{season_type}/{lang}?season=&page=` → the same
+/// paginated episodes with names/overviews translated to `lang` (e.g. `eng`).
+async fn series_episodes_lang(
+    State(state): State<Arc<AppState>>,
+    Path((id_raw, season_type, lang)): Path<(String, String, String)>,
+    Query(params): Query<Value>,
+) -> Response {
+    if lang.is_empty() || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return tvdb_failure(StatusCode::BAD_REQUEST, "invalid language");
+    }
+    episodes(&state, &id_raw, &season_type, Some(&lang), &params).await
+}
+
+async fn episodes(
+    state: &Arc<AppState>,
+    id_raw: &str,
+    season_type: &str,
+    lang: Option<&str>,
+    params: &Value,
+) -> Response {
+    let Some(id) = numeric_id(id_raw) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "invalid series id");
     };
     let season = params.get("season").and_then(value_as_str_or_num);
     let page = params.get("page").and_then(value_as_str_or_num).unwrap_or_else(|| "0".to_string());
 
-    let cache_key = format!("{id}:{season_type}:{}:{page}", season.clone().unwrap_or_default());
+    let mut cache_key = format!("{id}:{season_type}:{}:{page}", season.clone().unwrap_or_default());
+    if let Some(lang) = lang {
+        cache_key.push(':');
+        cache_key.push_str(lang);
+    }
     let cache_kind = "series_episodes";
     let cache_id = stable_cache_id(&cache_key);
 
-    if let Some(mut cached) = cache_get(&state, cache_id, cache_kind).await {
+    if let Some(mut cached) = cache_get(state, cache_id, cache_kind).await {
         rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);
         return Json(cached).into_response();
     }
@@ -460,10 +488,14 @@ async fn series_episodes(
     if let Some(season) = season {
         extra.push(("season", season));
     }
-    let path = format!("series/{id}/episodes/{season_type}");
-    match upstream_get(&state, &path, &extra).await {
+    let mut path = format!("series/{id}/episodes/{season_type}");
+    if let Some(lang) = lang {
+        path.push('/');
+        path.push_str(lang);
+    }
+    match upstream_get(state, &path, &extra).await {
         Ok(payload) => {
-            cache_put(&state, cache_id, cache_kind, &payload).await;
+            cache_put(state, cache_id, cache_kind, &payload).await;
             episodes_response(state.config.caache_base_url.as_deref(), payload)
         }
         Err(e) => {
