@@ -799,8 +799,8 @@ mod tests {
 
     #[test]
     fn merge_handles_empty_sources() {
-        assert!(merge_hits(vec![]).is_empty());
-        assert!(merge_hits(vec![vec![], vec![]]).is_empty());
+        assert_eq!(merge_hits(vec![]).len(), 0);
+        assert_eq!(merge_hits(vec![vec![], vec![]]).len(), 0);
     }
 
     // ── tconst → TMDB id cross-referencing (SHIB-15) ────────────

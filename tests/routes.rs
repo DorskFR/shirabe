@@ -30,7 +30,7 @@ async fn health_sources_always_answers_with_report_shape() {
     let (status, body) = get(&st, "/health/sources").await;
     assert_eq!(status, StatusCode::OK);
     let sources = body["sources"].as_array().expect("sources array");
-    assert!(!sources.is_empty());
+    assert_ne!(sources.len(), 0);
     for s in sources {
         assert!(s["id"].is_string(), "source entry: {s}");
         assert!(s["healthy"].is_boolean(), "source entry: {s}");

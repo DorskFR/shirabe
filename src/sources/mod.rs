@@ -446,7 +446,7 @@ mod tests {
             IngestMode::IndexMaintenance,
         ] {
             assert_eq!(mode.to_string(), mode.as_str());
-            assert!(!mode.as_str().is_empty());
+            assert_ne!(mode.as_str(), "");
         }
     }
 

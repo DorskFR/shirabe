@@ -960,8 +960,8 @@ mod tests {
     fn client_appends_parses_param() {
         let params = json!({ "append_to_response": " external_ids , release_dates ,, " });
         assert_eq!(client_appends(&params), vec!["external_ids", "release_dates"]);
-        assert!(client_appends(&json!({})).is_empty());
-        assert!(client_appends(&json!({ "append_to_response": "" })).is_empty());
+        assert_eq!(client_appends(&json!({})), Vec::<String>::new());
+        assert_eq!(client_appends(&json!({ "append_to_response": "" })), Vec::<String>::new());
     }
 
     /// A cached payload satisfies a request only when every client-requested
