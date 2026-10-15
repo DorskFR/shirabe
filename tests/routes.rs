@@ -203,6 +203,7 @@ async fn tvdb_login_and_error_contract() {
         "/tvdb/v4/series/1396",
         "/v4/series/1396/extended",
         "/v4/series/1396/episodes/default",
+        "/v4/series/1396/episodes/official/eng",
         "/v4/movies/42",
     ] {
         let (status, body) = get(&st, path).await;
@@ -214,6 +215,8 @@ async fn tvdb_login_and_error_contract() {
         "/v4/series/abc",
         "/v4/series/abc/extended",
         "/v4/series/abc/episodes/default",
+        "/v4/series/abc/episodes/official/eng",
+        "/v4/series/1396/episodes/official/e%20ng",
         "/v4/movies/abc",
     ] {
         let (status, body) = get(&st, path).await;

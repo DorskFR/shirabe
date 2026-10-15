@@ -197,6 +197,16 @@ async fn tvdb_extended_movie_and_episodes_routes_hit_expected_upstream_paths() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
+        .and(path("/series/81797/episodes/official/eng"))
+        .and(query_param("page", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "episodes": [{ "id": 1, "name": "Pilot" }] },
+            "links": { "next": null }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
         .and(path("/series/81797/episodes/default"))
         .and(query_param("page", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -219,6 +229,10 @@ async fn tvdb_extended_movie_and_episodes_routes_hit_expected_upstream_paths() {
     let (status, body) = get(&st, "/v4/series/81797/episodes/default").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["links"]["next"].is_null(), "pagination stop signal must survive");
+
+    let (status, body) = get(&st, "/v4/series/81797/episodes/official/eng").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["episodes"][0]["name"], "Pilot");
 }
 
 #[tokio::test]
