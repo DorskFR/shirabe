@@ -322,3 +322,19 @@ async fn debug_ui_requires_matching_bearer() {
     let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
     assert!(ct.starts_with("text/html"), "{ct}");
 }
+
+#[tokio::test]
+async fn ws2_search_failures_are_never_cached() {
+    let st = state(&[]);
+    for path in [
+        "/ws/2/release",
+        "/ws/2/release?query=harbour%20lights",
+        "/ws/2/artist?query=seaside",
+        "/ws/2/recording?query=lighthouse",
+    ] {
+        let (status, body) = get(&st, path).await;
+        assert!(status.is_client_error() || status.is_server_error(), "{path}: {status}");
+        assert!(body["error"].is_string(), "{path}");
+    }
+    assert!(st.search_cache.is_empty(), "400s and 500s must not populate the search cache");
+}

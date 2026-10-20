@@ -274,6 +274,10 @@ pub async fn configure_search_session(
     sqlx::query(&format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"))
         .execute(&mut **conn)
         .await?;
+    // Searches return a handful of rows; when a generic plan's estimate crosses
+    // jit_optimize_above_cost, LLVM compilation alone costs 300+ ms of CPU per
+    // execution and never pays back.
+    sqlx::query("SET jit = off").execute(&mut **conn).await?;
     Ok(())
 }
 

@@ -1,10 +1,14 @@
 //! axum handlers implementing the MusicBrainz ws/2 subset the consumer uses.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use serde::Deserialize;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -13,6 +17,7 @@ use crate::models::{
     ArtistSearchResponse, RecordingSearchResponse, ReleaseGroupBrowseResponse,
     ReleaseSearchResponse,
 };
+use crate::search_cache::SearchKey;
 use crate::{AppState, query, repo};
 
 /// Common query string for the search endpoints.
@@ -21,11 +26,10 @@ pub struct SearchParams {
     pub query: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    // `fmt` is accepted for compatibility but not acted on structurally — shapes
+    // `fmt` is accepted for compatibility and only enters the cache key — shapes
     // are fixed per endpoint. `inc` is honoured by the artist lookup
     // (url-rels, genres, tags, annotation) and the release-group lookup
     // (genres, tags).
-    #[allow(dead_code)]
     pub fmt: Option<String>,
     pub inc: Option<String>,
 }
@@ -42,11 +46,40 @@ pub struct BrowseParams {
     pub inc: Option<String>,
 }
 
+/// Serialise a search response the same way `axum::Json` does, so cached and
+/// fresh bodies are byte-identical.
+fn json_bytes<T: Serialize>(value: &T) -> Bytes {
+    Bytes::from(serde_json::to_vec(value).expect("search response serializes"))
+}
+
+fn json_response(body: Bytes) -> Response {
+    ([(CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Run a search through the response cache: serve a fresh hit, otherwise
+/// execute `search` once for every concurrent identical request.
+async fn cached_search<F, Fut, T>(
+    state: &AppState,
+    key: SearchKey,
+    search: F,
+) -> ApiResult<Response>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ApiResult<T>>,
+    T: Serialize,
+{
+    let body = state
+        .search_cache
+        .get_or_compute(key, || async { search().await.map(|v| json_bytes(&v)) })
+        .await?;
+    Ok(json_response(body))
+}
+
 /// `GET /ws/2/artist`
 pub async fn search_artist(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
-) -> ApiResult<Json<ArtistSearchResponse>> {
+) -> ApiResult<Response> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
     // Artist endpoint: the name is the bare query (or an explicit artist:field).
@@ -56,86 +89,103 @@ pub async fn search_artist(
         .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
     let limit = state.config.resolve_limit(params.limit);
     let offset = resolve_offset(params.offset);
-    let (count, artists) = repo::search_artists(
-        state.pool(),
-        &name,
-        limit,
-        offset,
-        state.config.similarity_threshold,
-        &state.config.search_work_mem,
-    )
-    .await?;
-    Ok(Json(ArtistSearchResponse { count, offset, artists }))
+    let key = SearchKey::new("artist", &raw, limit, offset, params.fmt.as_deref());
+    cached_search(&state, key, || async {
+        let (count, artists) = repo::search_artists(
+            state.pool(),
+            &name,
+            limit,
+            offset,
+            state.config.similarity_threshold,
+            &state.config.search_work_mem,
+        )
+        .await?;
+        Ok(ArtistSearchResponse { count, offset, artists })
+    })
+    .await
 }
 
 /// `GET /ws/2/release`
 pub async fn search_release(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
-) -> ApiResult<Json<ReleaseSearchResponse>> {
+) -> ApiResult<Response> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
     let limit = state.config.resolve_limit(params.limit);
     let offset = resolve_offset(params.offset);
+    let key = SearchKey::new("release", &raw, limit, offset, params.fmt.as_deref());
     if let Some(arid) = parsed.arid.as_deref() {
         let gid = parse_mbid(arid)?;
-        let (count, releases) = repo::browse_releases_by_artist(
-            state.pool(),
-            gid,
-            parsed.primary_type.as_deref(),
-            parsed.status.as_deref(),
-            limit,
-            offset,
-        )
-        .await?;
-        return Ok(Json(ReleaseSearchResponse { count, offset, releases }));
+        return cached_search(&state, key, || async {
+            let (count, releases) = repo::browse_releases_by_artist(
+                state.pool(),
+                gid,
+                parsed.primary_type.as_deref(),
+                parsed.status.as_deref(),
+                limit,
+                offset,
+            )
+            .await?;
+            Ok(ReleaseSearchResponse { count, offset, releases })
+        })
+        .await;
     }
     let title = parsed
         .release
+        .clone()
         .or_else(|| parsed.bare.clone())
         .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
-    let (count, releases) = repo::search_releases(
-        state.pool(),
-        &title,
-        repo::ReleaseFilters {
-            artist: parsed.artist.as_deref(),
-            year: parsed.date_year.as_deref(),
-            primary_type: parsed.primary_type.as_deref(),
-            status: parsed.status.as_deref(),
-        },
-        limit,
-        offset,
-        state.config.similarity_threshold,
-        &state.config.search_work_mem,
-    )
-    .await?;
-    Ok(Json(ReleaseSearchResponse { count, offset, releases }))
+    cached_search(&state, key, || async {
+        let (count, releases) = repo::search_releases(
+            state.pool(),
+            &title,
+            repo::ReleaseFilters {
+                artist: parsed.artist.as_deref(),
+                year: parsed.date_year.as_deref(),
+                primary_type: parsed.primary_type.as_deref(),
+                status: parsed.status.as_deref(),
+            },
+            limit,
+            offset,
+            state.config.similarity_threshold,
+            &state.config.search_work_mem,
+        )
+        .await?;
+        Ok(ReleaseSearchResponse { count, offset, releases })
+    })
+    .await
 }
 
 /// `GET /ws/2/recording`
 pub async fn search_recording(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
-) -> ApiResult<Json<RecordingSearchResponse>> {
+) -> ApiResult<Response> {
     let raw = params.query.unwrap_or_default();
     let parsed = query::parse(&raw);
     let title = parsed
         .recording
+        .clone()
         .or_else(|| parsed.bare.clone())
         .ok_or_else(|| ApiError::BadRequest("missing recording title".into()))?;
     let limit = state.config.resolve_limit(params.limit);
     let offset = resolve_offset(params.offset);
-    let (count, recordings) = repo::search_recordings(
-        state.pool(),
-        &title,
-        parsed.artist.as_deref(),
-        limit,
-        offset,
-        state.config.similarity_threshold,
-        &state.config.search_work_mem,
-    )
-    .await?;
-    Ok(Json(RecordingSearchResponse { count, offset, recordings }))
+    let key = SearchKey::new("recording", &raw, limit, offset, params.fmt.as_deref());
+    cached_search(&state, key, || async {
+        let (count, recordings) = repo::search_recordings(
+            state.pool(),
+            &title,
+            parsed.artist.as_deref(),
+            limit,
+            offset,
+            state.config.similarity_threshold,
+            &state.config.search_work_mem,
+        )
+        .await?;
+        Ok(RecordingSearchResponse { count, offset, recordings })
+    })
+    .await
 }
 
 fn resolve_offset(offset: Option<i64>) -> i64 {

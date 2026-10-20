@@ -110,6 +110,19 @@ pub struct Config {
     #[arg(long, env = "SHIRABE_SEARCH_WORK_MEM", default_value = "256MB")]
     pub search_work_mem: String,
 
+    /// TTL (seconds) of the in-process response cache for ws/2 search
+    /// endpoints, keyed by normalised (entity, query, limit, offset, fmt). `0`
+    /// disables storage; concurrent identical searches are still collapsed into
+    /// one DB query. The mirror is refreshed by a sync job, so a few minutes of
+    /// staleness is invisible to consumers.
+    #[arg(long, env = "SHIRABE_SEARCH_CACHE_TTL_SECS", default_value_t = 300)]
+    pub search_cache_ttl_secs: u64,
+
+    /// Maximum number of cached ws/2 search responses; the oldest entry is
+    /// evicted first once full. `0` disables storage.
+    #[arg(long, env = "SHIRABE_SEARCH_CACHE_MAX_ENTRIES", default_value_t = 4096)]
+    pub search_cache_max_entries: usize,
+
     /// Server-side TMDB v3 API key. Optional: when unset, the `/3` facade and the
     /// `tmdb` source degrade gracefully (503-style error / cache-only) rather than
     /// panicking, and the API server still boots and serves `/ws/2` + other

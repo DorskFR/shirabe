@@ -593,7 +593,8 @@ mod tests {
         let tvdb_tokens = TokenStore::new();
         let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
         let coverart = CoverArtState::new(&config);
-        Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+        let search_cache = AppState::search_cache_for(&config);
+        Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart, search_cache })
     }
 
     async fn post_login(state: Arc<AppState>, content_type: Option<&str>, body: Body) -> Response {

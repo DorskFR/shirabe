@@ -107,22 +107,24 @@ pub const SEARCH_ARTISTS_FUZZY: &str = r"
 // SHIB-23: FTS + f_unaccent fast path. `to_tsvector(f_unaccent(name)) @@
 // websearch_to_tsquery(f_unaccent(q))` reduces a multi-word title to the handful
 // of rows containing every word (accent-folded, so 'sigur ros' matches 'Sigur
-// Rós'), ranked by similarity(). The artist_credit table is touched ONLY when an
-// artist filter ($2) is given — via EXISTS for the filter and a scalar subquery
-// for the ranking bonus — so a title-only query never joins artist_credit for its
-// whole candidate set (that join was O(candidates): 8s for 'over the rainbow').
+// Rós'), ranked by similarity(). The artist filter ($2) is a correlated SCALAR
+// subquery on artist_credit's primary key, evaluated per title candidate, and
+// never an EXISTS: the planner turns `EXISTS (... ac.id = r.artist_credit AND
+// ac.name % $2)` into a hashed subplan that trigram-scans the whole 3.7M-row
+// artist_credit table ('BT': 801k index hits, 7 s) before touching a single
+// release row.
 pub const SEARCH_RELEASES: &str = r"
         SELECT c.id, c.gid, c.name, c.artist_credit, c.release_group,
                similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
-            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
+            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (SELECT ac.name FROM musicbrainz.artist_credit ac
+                              WHERE ac.id = r.artist_credit) END AS ac_name
             FROM musicbrainz.release r
             WHERE to_tsvector('simple', musicbrainz.f_unaccent(r.name))
                   @@ websearch_to_tsquery('simple', musicbrainz.f_unaccent($1))
-              AND ($2::text IS NULL OR EXISTS (
-                    SELECT 1 FROM musicbrainz.artist_credit ac
-                    WHERE ac.id = r.artist_credit AND ac.name % $2))
               AND ($3::int IS NULL OR EXISTS (
                     SELECT 1 FROM musicbrainz.release_country rc
                     WHERE rc.release = r.id AND rc.date_year = $3
@@ -137,11 +139,10 @@ pub const SEARCH_RELEASES: &str = r"
                     SELECT 1 FROM musicbrainz.release_status rs
                     WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
         ) c
+        WHERE ($2::text IS NULL OR c.ac_name % $2)
         ORDER BY (similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))
                   + CASE WHEN $2::text IS NULL THEN 0::real
-                         ELSE COALESCE((SELECT similarity(ac.name, $2)
-                                        FROM musicbrainz.artist_credit ac
-                                        WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
+                         ELSE COALESCE(similarity(c.ac_name, $2), 0::real) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $4 OFFSET $7
         ";
@@ -154,12 +155,12 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
                similarity(c.name, $1)::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
-            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
+            SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (SELECT ac.name FROM musicbrainz.artist_credit ac
+                              WHERE ac.id = r.artist_credit) END AS ac_name
             FROM musicbrainz.release r
             WHERE r.name % $1
-              AND ($2::text IS NULL OR EXISTS (
-                    SELECT 1 FROM musicbrainz.artist_credit ac
-                    WHERE ac.id = r.artist_credit AND ac.name % $2))
               AND ($3::int IS NULL OR EXISTS (
                     SELECT 1 FROM musicbrainz.release_country rc
                     WHERE rc.release = r.id AND rc.date_year = $3
@@ -174,11 +175,10 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
                     SELECT 1 FROM musicbrainz.release_status rs
                     WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
         ) c
+        WHERE ($2::text IS NULL OR c.ac_name % $2)
         ORDER BY (similarity(c.name, $1)
                   + CASE WHEN $2::text IS NULL THEN 0::real
-                         ELSE COALESCE((SELECT similarity(ac.name, $2)
-                                        FROM musicbrainz.artist_credit ac
-                                        WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
+                         ELSE COALESCE(similarity(c.ac_name, $2), 0::real) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $4 OFFSET $7
         ";
@@ -188,19 +188,18 @@ pub const SEARCH_RECORDINGS: &str = r"
                similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
-            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
+            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (SELECT ac.name FROM musicbrainz.artist_credit ac
+                              WHERE ac.id = rec.artist_credit) END AS ac_name
             FROM musicbrainz.recording rec
             WHERE to_tsvector('simple', musicbrainz.f_unaccent(rec.name))
                   @@ websearch_to_tsquery('simple', musicbrainz.f_unaccent($1))
-              AND ($2::text IS NULL OR EXISTS (
-                    SELECT 1 FROM musicbrainz.artist_credit ac
-                    WHERE ac.id = rec.artist_credit AND ac.name % $2))
         ) c
+        WHERE ($2::text IS NULL OR c.ac_name % $2)
         ORDER BY (similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))
                   + CASE WHEN $2::text IS NULL THEN 0::real
-                         ELSE COALESCE((SELECT similarity(ac.name, $2)
-                                        FROM musicbrainz.artist_credit ac
-                                        WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
+                         ELSE COALESCE(similarity(c.ac_name, $2), 0::real) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $3 OFFSET $4
         ";
@@ -211,18 +210,17 @@ pub const SEARCH_RECORDINGS_FUZZY: &str = r"
                similarity(c.name, $1)::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM (
-            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
+            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+                   CASE WHEN $2::text IS NULL THEN NULL
+                        ELSE (SELECT ac.name FROM musicbrainz.artist_credit ac
+                              WHERE ac.id = rec.artist_credit) END AS ac_name
             FROM musicbrainz.recording rec
             WHERE rec.name % $1
-              AND ($2::text IS NULL OR EXISTS (
-                    SELECT 1 FROM musicbrainz.artist_credit ac
-                    WHERE ac.id = rec.artist_credit AND ac.name % $2))
         ) c
+        WHERE ($2::text IS NULL OR c.ac_name % $2)
         ORDER BY (similarity(c.name, $1)
                   + CASE WHEN $2::text IS NULL THEN 0::real
-                         ELSE COALESCE((SELECT similarity(ac.name, $2)
-                                        FROM musicbrainz.artist_credit ac
-                                        WHERE ac.id = c.artist_credit), 0::real) * 0.5::real END) DESC,
+                         ELSE COALESCE(similarity(c.ac_name, $2), 0::real) * 0.5::real END) DESC,
                  c.id ASC
         LIMIT $3 OFFSET $4
         ";
