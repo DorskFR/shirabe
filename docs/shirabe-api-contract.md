@@ -74,8 +74,8 @@ failures:
 |---|---|---|
 | MusicBrainz `/ws/2` | `{ "error": "<message>" }` (MB's shape) | 400 bad query/MBID/malformed `limit`/`offset`, 404 not found, 500 DB error |
 | TMDB `/3` | `{ "status_code": <n>, "status_message": "…" }` | 400 (code 22/34), 502 upstream (code 11), 503 not configured (code 7) |
-| TheTVDB `/v4` | `{ "status": "failure", "message": "…" }` | 400 invalid id, 502 upstream, 503 not configured |
-| fanart.tv `/v3` | `{ "status": "error", "error message": "…" }` — but an upstream **404 passes through** with the upstream body (authoritative "no artwork", safe to negative-cache) | 404 passthrough, 502 upstream, 503 not configured |
+| TheTVDB `/v4` | `{ "status": "failure", "message": "…" }` | 400 invalid id/season type/language/season/page, 502 upstream, 503 not configured |
+| fanart.tv `/v3` | `{ "status": "error", "error message": "…" }` — but an upstream **404 passes through** with the upstream body (authoritative "no artwork", safe to negative-cache) | 400 invalid id (not alphanumeric/hyphen), 404 passthrough, 502 upstream, 503 not configured |
 | Cover Art `/release`, `/_ia` | plain-text bodies | 403 forbidden host (SSRF guard), 502 upstream |
 
 "Not configured" (503) means the server-side key is unset and the request could
