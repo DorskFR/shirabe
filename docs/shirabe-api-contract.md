@@ -76,7 +76,7 @@ failures:
 | TMDB `/3` | `{ "status_code": <n>, "status_message": "…" }` | 400 (code 22/34), 502 upstream (code 11), 503 not configured (code 7) |
 | TheTVDB `/v4` | `{ "status": "failure", "message": "…" }` | 400 invalid id/season type/language/season/page, 502 upstream, 503 not configured |
 | fanart.tv `/v3` | `{ "status": "error", "error message": "…" }` — but an upstream **404 passes through** with the upstream body (authoritative "no artwork", safe to negative-cache) | 400 invalid id (not alphanumeric/hyphen), 404 passthrough, 502 upstream, 503 not configured |
-| Cover Art `/release`, `/_ia` | plain-text bodies | 403 forbidden host (SSRF guard), 502 upstream |
+| Cover Art `/release`, `/_ia` | plain-text bodies | 403 forbidden host (SSRF guard), 502 upstream (`upstream error`, `upstream body error`, `upstream body too large`) |
 
 "Not configured" (503) means the server-side key is unset and the request could
 not be served from cache; the server still boots and serves everything else.
@@ -215,9 +215,17 @@ Two layers:
   bouncing any further CDN redirect back through `/_ia/`, and caches bytes on
   disk (30 d positive / 6 h negative TTL, ~9 GiB budget with oldest-mtime
   eviction, single-flight per key). An `X-Cache-Status: HIT|MISS` header reports
-  disposition. SSRF guard: HTTPS-only, explicit ports refused, and any host
-  resolving to a private/loopback/link-local/unique-local/unspecified address is
-  rejected with 403.
+  disposition. SSRF guard: HTTPS-only, explicit ports refused, and any host that
+  is or resolves to a non-public address (private, loopback, link-local, CGNAT,
+  unique-local, multicast, reserved, benchmarking, documentation, or an IPv6
+  mapped/compatible/NAT64/6to4 form embedding one) is rejected with 403. The
+  vetted addresses are the ones the proxy connects to, so a DNS answer cannot
+  change between the check and the connection.
+
+Both layers cap upstream bodies at **20 MiB**: a larger `Content-Length` is
+refused before the body is read, and a chunked body is aborted the moment it
+crosses the cap. Either case answers `502` with the plain-text body
+`upstream body too large`, and nothing is cached.
 
 Both layers are mounted at the root **and** under `/coverart`; the cache key is
 mount-invariant, and the `/coverart` prefix is stripped before proxying upstream

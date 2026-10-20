@@ -170,3 +170,80 @@ async fn ws2_browse_and_db_backed_404s() {
     assert_eq!(body["count"], 0);
     assert_eq!(body["artists"], serde_json::json!([]));
 }
+
+#[tokio::test]
+#[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
+async fn ws2_search_artist_filter_and_response_cache() {
+    let db = mb_fixture_db().await;
+    let st = state_with_db(&db, &[]);
+
+    let (status, body) =
+        get(&st, "/ws/2/release?query=release:(harbour%20lights)%20AND%20artist:(seaside%20radio)")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2, "artist filter keeps the credited releases");
+    assert_eq!(body["releases"][0]["artist-credit"][0]["artist"]["name"], "Seaside Radio");
+
+    let (status, body) = get(
+        &st,
+        "/ws/2/release?query=release:(harbour%20lights)%20AND%20artist:(moorland%20echoes)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 0, "artist filter drops releases credited to someone else");
+    assert_eq!(body["releases"], serde_json::json!([]));
+
+    let (status, body) = get(
+        &st,
+        "/ws/2/release?query=release:(harbour%20lights)%20AND%20artist:(seaside%20radio)%20AND%20date:(1997*)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1, "artist + year filters compose");
+    assert_eq!(body["releases"][0]["id"], RELEASE_MBID);
+
+    let (status, body) =
+        get(&st, "/ws/2/release?query=release:(harbor%20lite)%20AND%20artist:(seaside%20radio)")
+            .await;
+    assert_eq!(status, StatusCode::OK, "trigram fallback honours the artist filter");
+    assert_eq!(body["count"], 2);
+
+    let (status, body) = get(
+        &st,
+        "/ws/2/recording?query=recording:(lighthouse%20keeper)%20AND%20artist:(seaside%20radio)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["recordings"][0]["id"], RECORDING_MBID);
+
+    let (status, body) = get(
+        &st,
+        "/ws/2/recording?query=recording:(lighthouse%20keeper)%20AND%20artist:(moorland%20echoes)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 0);
+
+    let cached = st.search_cache.len();
+    assert!(cached >= 6, "every successful search is cached, got {cached}");
+    let (_, again) = get(
+        &st,
+        "/ws/2/recording?query=Recording:(LIGHTHOUSE%20%20keeper)%20AND%20artist:(Seaside%20Radio)",
+    )
+    .await;
+    assert_eq!(st.search_cache.len(), cached, "case/whitespace variants share one entry");
+    assert_eq!(again["count"], 1);
+    let (_, paged) = get(
+        &st,
+        "/ws/2/recording?query=recording:(lighthouse%20keeper)%20AND%20artist:(seaside%20radio)&offset=1",
+    )
+    .await;
+    assert_eq!(paged["recordings"], serde_json::json!([]));
+    assert_eq!(st.search_cache.len(), cached + 1, "offset is part of the key");
+
+    let off = state_with_db(&db, &["--search-cache-ttl-secs", "0"]);
+    let (status, _) = get(&off, "/ws/2/artist?query=seaside%20radio").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(off.search_cache.is_empty(), "TTL 0 disables storage");
+}

@@ -15,6 +15,7 @@ pub mod queries;
 pub mod query;
 pub mod repo;
 pub mod search;
+pub mod search_cache;
 pub mod sources;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ use tracing::Level;
 use crate::config::Config;
 use crate::db::Pools;
 use crate::facades::coverart::CoverArtState;
+use crate::search_cache::SearchCache;
 use crate::sources::Registry;
 use crate::sources::tvdb::TokenStore;
 
@@ -47,6 +49,8 @@ pub struct AppState {
     /// single-flight locks) backing the `/release`, `/release-group`, and `/_ia`
     /// routes.
     pub coverart: CoverArtState,
+    /// Bounded TTL cache + single-flight for the ws/2 search endpoints.
+    pub search_cache: SearchCache,
 }
 
 impl AppState {
@@ -54,6 +58,15 @@ impl AppState {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pools.musicbrainz
+    }
+
+    /// Build the search cache from the config's TTL / capacity knobs.
+    #[must_use]
+    pub fn search_cache_for(config: &Config) -> SearchCache {
+        SearchCache::new(
+            std::time::Duration::from_secs(config.search_cache_ttl_secs),
+            config.search_cache_max_entries,
+        )
     }
 }
 
@@ -84,7 +97,8 @@ pub async fn serve(
     let bind = config.bind.clone();
     tracing::info!(bind = %bind, "starting shirabe");
     let coverart = CoverArtState::new(&config);
-    let state = Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart });
+    let search_cache = AppState::search_cache_for(&config);
+    let state = Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart, search_cache });
 
     let app = build_router(state);
 
@@ -198,7 +212,15 @@ mod tests {
         let tvdb_tokens = TokenStore::new();
         let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
         let coverart = CoverArtState::new(&config);
-        std::sync::Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+        let search_cache = AppState::search_cache_for(&config);
+        std::sync::Arc::new(AppState {
+            pools,
+            config,
+            registry,
+            tvdb_tokens,
+            coverart,
+            search_cache,
+        })
     }
 
     async fn routes(path: &str) -> StatusCode {

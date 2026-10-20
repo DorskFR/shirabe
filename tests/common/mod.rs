@@ -49,7 +49,8 @@ pub fn state_with_db(musicbrainz_url: &str, extra_args: &[&str]) -> Arc<AppState
     let tvdb_tokens = TokenStore::new();
     let registry = Registry::with_defaults(pools.clone(), config.clone(), tvdb_tokens.clone());
     let coverart = CoverArtState::new(&config);
-    Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart })
+    let search_cache = AppState::search_cache_for(&config);
+    Arc::new(AppState { pools, config, registry, tvdb_tokens, coverart, search_cache })
 }
 
 /// `NO_DB` (connection refused) fails in milliseconds instead of sqlx's 30 s
