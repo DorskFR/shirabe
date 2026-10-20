@@ -193,6 +193,11 @@ fn numeric_id(raw: &str) -> Option<i64> {
     raw.rsplit('-').next().unwrap_or(raw).parse::<i64>().ok()
 }
 
+/// A path segment safe to forward upstream: rejects decoded `/`, `?`, `..` etc.
+fn is_path_token(raw: &str) -> bool {
+    !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// Extract `remoteIds` from a hydrated v4 payload and self-link them into
 /// `shirabe.xref`, so a TVDB id resolves to its sibling provider ids. Best-effort.
 ///
@@ -249,6 +254,8 @@ async fn upstream_get(
 ) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let url = format!("{}/{path}", state.config.tvdb_api_base.trim_end_matches('/'));
@@ -449,7 +456,7 @@ async fn series_episodes_lang(
     Path((id_raw, season_type, lang)): Path<(String, String, String)>,
     Query(params): Query<Value>,
 ) -> Response {
-    if lang.is_empty() || !lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if !is_path_token(&lang) {
         return tvdb_failure(StatusCode::BAD_REQUEST, "invalid language");
     }
     episodes(&state, &id_raw, &season_type, Some(&lang), &params).await
@@ -465,8 +472,15 @@ async fn episodes(
     let Some(id) = numeric_id(id_raw) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "invalid series id");
     };
+    if !is_path_token(season_type) {
+        return tvdb_failure(StatusCode::BAD_REQUEST, "invalid season type");
+    }
     let season = params.get("season").and_then(value_as_str_or_num);
     let page = params.get("page").and_then(value_as_str_or_num).unwrap_or_else(|| "0".to_string());
+    let is_number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_number(&page) || season.as_deref().is_some_and(|s| !is_number(s)) {
+        return tvdb_failure(StatusCode::BAD_REQUEST, "invalid season or page");
+    }
 
     let mut cache_key = format!("{id}:{season_type}:{}:{page}", season.clone().unwrap_or_default());
     if let Some(lang) = lang {
@@ -708,6 +722,16 @@ mod tests {
         assert_eq!(numeric_id("movie-42"), Some(42));
         assert_eq!(numeric_id("series-abc"), None);
         assert_eq!(numeric_id(""), None);
+    }
+
+    #[test]
+    fn path_token_rejects_traversal_and_query() {
+        for ok in ["default", "official", "eng", "pt-br"] {
+            assert!(is_path_token(ok), "{ok}");
+        }
+        for bad in ["", "..", "a/b", "x?page=1", "e ng", "a:b", "a%2Fb"] {
+            assert!(!is_path_token(bad), "{bad}");
+        }
     }
 
     /// Stable cache id is deterministic, query-sensitive, and non-negative.

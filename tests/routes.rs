@@ -167,9 +167,16 @@ async fn tmdb_detail_error_contract() {
         assert_eq!(body["status_message"], "TMDB source not configured", "{path}");
     }
 
-    let (status, body) = get(&st, "/3/tv/1396/season/one").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["status_code"], 34);
+    for path in [
+        "/3/tv/1396/season/one",
+        "/3/tv/1396/season/10000",
+        "/3/tv/1/season/-1",
+        "/3/tv/0/season/1",
+    ] {
+        let (status, body) = get(&st, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(body["status_code"], 34, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -217,6 +224,11 @@ async fn tvdb_login_and_error_contract() {
         "/v4/series/abc/episodes/default",
         "/v4/series/abc/episodes/official/eng",
         "/v4/series/1396/episodes/official/e%20ng",
+        "/v4/series/1396/episodes/..",
+        "/v4/series/1396/episodes/x%2F..%2F..%2Fsearch%3Fquery%3Dx",
+        "/v4/series/1396/episodes/de%3Ffault/eng",
+        "/v4/series/1396/episodes/default?season=1:0&page=x",
+        "/v4/series/1396/episodes/default?page=-1",
         "/v4/movies/abc",
     ] {
         let (status, body) = get(&st, path).await;
@@ -240,6 +252,16 @@ async fn fanart_not_configured_contract_on_every_route() {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(body["status"], "error", "{path}");
         assert!(body["error message"].is_string(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn fanart_rejects_ids_that_would_escape_the_upstream_path() {
+    let st = state(&[]);
+    for path in ["/v3/movies/..%2F..%2Fanything", "/v3/tv/1%3Fx=y", "/v3/music/a%20b"] {
+        let (status, body) = get(&st, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(body["status"], "error", "{path}");
     }
 }
 

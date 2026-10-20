@@ -270,6 +270,8 @@ async fn upstream_get(
 ) -> Result<Value, String> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let mut query: Vec<(&str, String)> = vec![("api_key", key.to_string())];
@@ -712,9 +714,11 @@ async fn tv_season(
     let (Ok(tv_id), Ok(season)) = (id.parse::<i64>(), n.parse::<i64>()) else {
         return tmdb_error(StatusCode::BAD_REQUEST, 34, "invalid id");
     };
-    // Cache key: pack (tv_id, season) into one id space distinct from tv detail.
+    if !(1..i64::MAX / 10_000).contains(&tv_id) || !(0..10_000).contains(&season) {
+        return tmdb_error(StatusCode::BAD_REQUEST, 34, "invalid id");
+    }
     let cache_kind = "tv_season";
-    let cache_id = tv_id.wrapping_mul(10_000).wrapping_add(season);
+    let cache_id = tv_id * 10_000 + season;
 
     if let Some(mut cached) = cache_get(&state, cache_id, cache_kind).await {
         rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut cached);

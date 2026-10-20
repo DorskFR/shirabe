@@ -192,6 +192,8 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamErr
     };
     let client = reqwest::Client::builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| UpstreamError::Other(format!("http client: {e}")))?;
     let query = upstream_query(api_key, state.config.fanart_personal_api_key.as_deref());
@@ -241,6 +243,9 @@ fn success_response(caache_base: Option<&str>, mut payload: Value) -> Response {
 /// URLs through caache. Degrades to a clean 503 when no key is configured and the
 /// row is not cached.
 async fn cached_fetch(state: &Arc<AppState>, key: &str, kind: &str, path: &str) -> Response {
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return fanart_error(StatusCode::BAD_REQUEST, "invalid id");
+    }
     if let Some(cached) = cache_get(state, key, kind).await {
         return success_response(state.config.caache_base_url.as_deref(), cached);
     }
