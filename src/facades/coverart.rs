@@ -109,7 +109,7 @@ impl CoverArtState {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_mins(2))
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap_or_default();
         Self {
