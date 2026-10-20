@@ -143,7 +143,7 @@ impl CoverArtState {
 }
 
 fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
@@ -853,8 +853,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("shirabe-coverart-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca = CoverArtState {
-            client: reqwest::Client::new(),
-            ia_client: reqwest::Client::new(),
+            client: crate::http::client(),
+            ia_client: crate::http::client(),
             cache_dir: dir.clone(),
             max_bytes: 1_048_576,
             positive_ttl: Duration::from_secs(60),
@@ -954,8 +954,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("shirabe-coverart-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let ca = CoverArtState {
-            client: reqwest::Client::new(),
-            ia_client: reqwest::Client::new(),
+            client: crate::http::client(),
+            ia_client: crate::http::client(),
             cache_dir: dir.clone(),
             max_bytes: 1_048_576,
             positive_ttl: Duration::from_secs(60),

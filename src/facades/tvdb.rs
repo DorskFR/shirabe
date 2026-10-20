@@ -252,7 +252,7 @@ async fn upstream_get(
     path: &str,
     extra: &[(&str, String)],
 ) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))

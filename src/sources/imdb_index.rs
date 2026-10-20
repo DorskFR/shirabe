@@ -203,13 +203,13 @@ impl Source for ImdbIndexSource {
         };
 
         for stmt in self.set.prereqs() {
-            if let Err(e) = sqlx::query(stmt).execute(pool).await {
+            if let Err(e) = sqlx::query(*stmt).execute(pool).await {
                 return RefreshReport::failed(format!("prerequisite failed ({stmt}): {e}"));
             }
         }
 
         for stmt in self.set.build_steps() {
-            if let Err(e) = sqlx::query(stmt).execute(pool).await {
+            if let Err(e) = sqlx::query(*stmt).execute(pool).await {
                 return RefreshReport::failed(format!("search-table build failed: {e}"));
             }
         }
@@ -222,7 +222,10 @@ impl Source for ImdbIndexSource {
         for (name, valid) in &pre_existing {
             if !valid {
                 tracing::warn!(source = self.id(), index = %name, "dropping INVALID index");
-                if let Err(e) = sqlx::query(&format!("DROP INDEX {name}")).execute(pool).await {
+                if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!("DROP INDEX {name}")))
+                    .execute(pool)
+                    .await
+                {
                     return RefreshReport::failed(format!("dropping invalid {name} failed: {e}"));
                 }
             }

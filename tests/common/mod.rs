@@ -120,7 +120,10 @@ pub async fn create_test_db(prefix: &str) -> String {
     let admin = admin_url();
     let name = format!("shirabe_it_{prefix}_{}", uuid::Uuid::new_v4().simple());
     let pool = connect(&admin, 1).await.expect("connect DATABASE_URL_TEST");
-    sqlx::query(&format!(r#"CREATE DATABASE "{name}""#)).execute(&pool).await.expect("create db");
+    sqlx::query(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .execute(&pool)
+        .await
+        .expect("create db");
     pool.close().await;
     with_db_name(&admin, &name)
 }

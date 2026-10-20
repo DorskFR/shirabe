@@ -48,9 +48,9 @@ async fn count_search_indexes(pool: &PgPool) -> Result<i64, sqlx::Error> {
 /// `count(*)` on the big mirror tables takes seconds and would stall `/health/sources`.
 async fn estimate_rows(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
     // `table` is a fixed literal from our own call sites, never user input.
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
         "SELECT reltuples::bigint FROM pg_class WHERE oid = 'musicbrainz.{table}'::regclass"
-    ))
+    )))
     .fetch_one(pool)
     .await
 }

@@ -1,7 +1,8 @@
 [package]
 name = "shirabe"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
+rust-version = "1.94"
 license = "WTFPL"
 authors = ["DorskFR"]
 description = "A small, fast MusicBrainz ws/2 subset served directly from a MusicBrainz Postgres mirror via pg_trgm."
@@ -26,11 +27,11 @@ struct_field_names = "allow"
 
 [dependencies]
 axum = "0.8"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -38,7 +39,8 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider", "http2", "charset", "query"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 flate2 = "1"
 csv = "1"
 futures-util = "0.3"
