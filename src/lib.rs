@@ -8,6 +8,7 @@ pub mod debug_ui;
 pub mod error;
 pub mod facades;
 pub mod handlers;
+pub mod http;
 pub mod images;
 pub mod migrate;
 pub mod models;

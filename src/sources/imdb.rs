@@ -24,8 +24,8 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolCopyExt;
+use sqlx::{AssertSqlSafe, PgPool};
 use tokio_util::io::StreamReader;
 
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
@@ -306,8 +306,10 @@ async fn ingest_dataset(
     let staging = format!("{}_new", ds.table);
 
     // Fresh staging table (drop any leftover from a crashed run).
-    sqlx::query(&format!("DROP TABLE IF EXISTS {staging}")).execute(pool).await?;
-    sqlx::query(&format!("CREATE TABLE {staging} ({})", ds.create_new)).execute(pool).await?;
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {staging}"))).execute(pool).await?;
+    sqlx::query(AssertSqlSafe(format!("CREATE TABLE {staging} ({})", ds.create_new)))
+        .execute(pool)
+        .await?;
 
     // Stream the gzip download → gunzip → synchronous TSV parse, building COPY
     // text and streaming it into the staging table.
@@ -378,18 +380,22 @@ async fn ingest_dataset(
         let staged = idx_sql
             .replacen(&format!("ON {}", ds.table), &format!("ON {staging}"), 1)
             .replacen("CREATE INDEX ", &format!("CREATE INDEX tmp{i}_"), 1);
-        sqlx::query(&staged).execute(pool).await?;
+        sqlx::query(AssertSqlSafe(staged)).execute(pool).await?;
     }
 
     // Atomic swap: drop live, rename staging (+ its indexes) into place.
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {}", ds.table)).execute(&mut *tx).await?;
-    sqlx::query(&format!("ALTER TABLE {staging} RENAME TO {}", ds.table)).execute(&mut *tx).await?;
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {}", ds.table)))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(AssertSqlSafe(format!("ALTER TABLE {staging} RENAME TO {}", ds.table)))
+        .execute(&mut *tx)
+        .await?;
     // Rename the staged indexes to their canonical live names.
     for (i, idx_sql) in ds.indexes.iter().enumerate() {
         if let Some(name) = index_name(idx_sql) {
             let staged_name = format!("tmp{i}_{name}");
-            sqlx::query(&format!("ALTER INDEX {staged_name} RENAME TO {name}"))
+            sqlx::query(AssertSqlSafe(format!("ALTER INDEX {staged_name} RENAME TO {name}")))
                 .execute(&mut *tx)
                 .await?;
         }
@@ -410,9 +416,9 @@ fn index_name(create_index_sql: &str) -> Option<String> {
 /// takes far longer than a health probe may.
 async fn estimate_rows(pool: &PgPool, table: &str) -> i64 {
     // `table` is a fixed literal from our own dataset list, never user input.
-    sqlx::query_scalar::<_, i64>(&format!(
+    sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
         "SELECT reltuples::bigint FROM pg_class WHERE oid = '{table}'::regclass"
-    ))
+    )))
     .fetch_one(pool)
     .await
     .unwrap_or(-1)
@@ -435,7 +441,7 @@ impl Source for ImdbSource {
                  writable imdb database",
             );
         };
-        let client = match reqwest::Client::builder()
+        let client = match crate::http::client_builder()
             .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
             .build()
         {

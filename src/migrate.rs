@@ -109,7 +109,7 @@ async fn migrate_one(config: &Config, db: &str) -> anyhow::Result<()> {
 /// Execute a migration file's full SQL against the pool. The files are simple
 /// idempotent DDL; Postgres' simple-query protocol runs the whole multi-statement
 /// string in one round-trip via `execute`.
-async fn apply_sql(pool: &PgPool, sql: &str) -> Result<(), sqlx::Error> {
+async fn apply_sql(pool: &PgPool, sql: &'static str) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(sql).execute(pool).await?;
     Ok(())
 }

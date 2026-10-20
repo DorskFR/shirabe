@@ -158,7 +158,7 @@ impl TokenStore {
 /// Perform a `POST {base}/login {apikey, pin}` against TheTVDB and return the
 /// bearer token. Network/parse failures surface as an error string.
 async fn login(base: &str, apikey: &str, pin: Option<&str>) -> Result<String, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))

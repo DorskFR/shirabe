@@ -158,7 +158,7 @@ async fn upsert_id_index(
         " ON CONFLICT (id, kind) DO UPDATE SET \
          name = EXCLUDED.name, popularity = EXCLUDED.popularity, adult = EXCLUDED.adult",
     );
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     for row in rows {
         q = q
             .bind(row.id)
@@ -230,7 +230,7 @@ impl Source for TmdbSource {
                  tmdb database",
             );
         };
-        let client = match reqwest::Client::builder()
+        let client = match crate::http::client_builder()
             .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
             .build()
         {

@@ -25,7 +25,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::postgres::PgArguments;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -184,7 +184,7 @@ async fn run_query(state: &AppState, req: RunRequest) -> Result<Value, String> {
     // statement_timeout: 0 disables (Postgres semantics). Applied once for the
     // session; splicing (not binding) is required — SET takes no parameters.
     let timeout = req.timeout_ms.max(0);
-    sqlx::query(&format!("SET statement_timeout = {timeout}"))
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {timeout}")))
         .execute(&mut *conn)
         .await
         .map_err(|e| format!("set statement_timeout: {e}"))?;
@@ -197,14 +197,17 @@ async fn run_query(state: &AppState, req: RunRequest) -> Result<Value, String> {
             .execute(&mut *conn)
             .await
             .map_err(|e| format!("set_limit: {e}"))?;
-        sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(&req.work_mem)))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| format!("set work_mem: {e}"))?;
+        sqlx::query(AssertSqlSafe(format!(
+            "SET work_mem = '{}'",
+            sanitize_work_mem(&req.work_mem)
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("set work_mem: {e}"))?;
     }
 
     for _ in 0..iterations {
-        let mut q = sqlx::query(&final_sql);
+        let mut q = sqlx::query(AssertSqlSafe(final_sql.as_str()));
         for (param, raw) in spec.params.iter().zip(req.params.iter()) {
             q = bind_param(q, param.ty, param.nullable, raw.trim())?;
         }

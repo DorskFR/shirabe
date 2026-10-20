@@ -21,7 +21,7 @@
 
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row};
 
 use crate::queries;
 
@@ -32,7 +32,7 @@ async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PoolConnection<Postgres>,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query(&format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}"))
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}")))
         .execute(&mut **conn)
         .await?;
     let result = match query.fetch_all(&mut **conn).await {
@@ -46,9 +46,11 @@ async fn fetch_fuzzy(
         Err(e) => Err(e),
     };
     // The pooled connection must not carry the tight cap into later queries.
-    let _ = sqlx::query(&format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"))
-        .execute(&mut **conn)
-        .await;
+    let _ = sqlx::query(AssertSqlSafe(format!(
+        "SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"
+    )))
+    .execute(&mut **conn)
+    .await;
     result
 }
 
@@ -266,12 +268,12 @@ pub async fn configure_search_session(
     work_mem: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
-    sqlx::query(&format!("SET work_mem = '{}'", sanitize_work_mem(work_mem)))
+    sqlx::query(AssertSqlSafe(format!("SET work_mem = '{}'", sanitize_work_mem(work_mem))))
         .execute(&mut **conn)
         .await?;
     // `statement_timeout` as a bare integer is interpreted by Postgres as ms.
     // Set on THIS connection so the search query below inherits the cap.
-    sqlx::query(&format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"))
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}")))
         .execute(&mut **conn)
         .await?;
     // Searches return a handful of rows; when a generic plan's estimate crosses

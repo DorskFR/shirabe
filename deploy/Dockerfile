@@ -1,7 +1,7 @@
 # Build on bookworm-based rust so the binary matches the bookworm-slim runtime
 # glibc. The build is self-contained: public base images + crates.io deps, no
 # MusicBrainz DB required (sqlx runtime queries, not compile-time macros).
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1.94-slim-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./

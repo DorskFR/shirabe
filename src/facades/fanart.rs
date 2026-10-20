@@ -190,7 +190,7 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamErr
     let Some(api_key) = state.config.fanart_api_key.as_deref() else {
         return Err(UpstreamError::Other("fanart.tv api key not configured".to_string()));
     };
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
