@@ -81,12 +81,12 @@ const DEFAULT_SEARCH_WORK_MEM: &str = "256MB";
 /// at the client's request cap; this caps it server-side so it fails fast with a
 /// clear Postgres error on the SAME connection that runs the search. Mirrors the
 /// `SHIRABE_STATEMENT_TIMEOUT_MS` config default.
-const DEFAULT_STATEMENT_TIMEOUT_MS: i64 = 10_000;
+pub(crate) const DEFAULT_STATEMENT_TIMEOUT_MS: i64 = 10_000;
 
 /// Tighter `statement_timeout` (ms) for the trigram fuzzy fallback only: a KNN
 /// scan that hasn't answered in 3s will not answer well, and it must not hold
 /// the request for the full session cap.
-const FUZZY_STATEMENT_TIMEOUT_MS: i64 = 3_000;
+pub(crate) const FUZZY_STATEMENT_TIMEOUT_MS: i64 = 3_000;
 
 /// Clamp a configured similarity threshold to the IMDb probe floor
 /// ([`IMDB_PROBE_MIN_THRESHOLD`]). Pure so it is unit-testable.

@@ -13,6 +13,16 @@ CREATE OR REPLACE FUNCTION musicbrainz.f_unaccent(text) RETURNS text
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS
 $$ SELECT public.unaccent('public.unaccent', $1) $$;
 
+-- Stand-ins for MusicBrainz's own text-search objects (mb_lower uses the
+-- musicbrainz collation upstream).
+CREATE OR REPLACE FUNCTION musicbrainz.mb_lower(input text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS
+$$ SELECT lower(input) $$;
+CREATE TEXT SEARCH CONFIGURATION musicbrainz.mb_simple (COPY = pg_catalog.simple);
+CREATE OR REPLACE FUNCTION musicbrainz.mb_simple_tsvector(input text) RETURNS tsvector
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS
+$$ SELECT to_tsvector('musicbrainz.mb_simple', musicbrainz.mb_lower(input)) $$;
+
 CREATE TABLE musicbrainz.artist_type (
     id   integer PRIMARY KEY,
     name text NOT NULL
@@ -209,6 +219,11 @@ CREATE TABLE musicbrainz.l_release_release (
     entity1 integer NOT NULL
 );
 
+CREATE TABLE musicbrainz.artist_gid_redirect (gid uuid PRIMARY KEY, new_id integer NOT NULL);
+CREATE TABLE musicbrainz.release_gid_redirect (gid uuid PRIMARY KEY, new_id integer NOT NULL);
+CREATE TABLE musicbrainz.release_group_gid_redirect (gid uuid PRIMARY KEY, new_id integer NOT NULL);
+CREATE TABLE musicbrainz.recording_gid_redirect (gid uuid PRIMARY KEY, new_id integer NOT NULL);
+
 -- ── seed ──
 
 INSERT INTO musicbrainz.artist_type (id, name) VALUES (1, 'Group');
@@ -303,3 +318,13 @@ VALUES
     (4, 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', 'Peat and Heather', 2, 2, 1, '');
 INSERT INTO musicbrainz.release_unknown_country (release, date_year, date_month, date_day) VALUES
     (3, 2003, 4, NULL);
+
+-- MBIDs merged into the seeded entities.
+INSERT INTO musicbrainz.artist_gid_redirect (gid, new_id) VALUES
+    ('a1111111-1111-4111-8111-111111111111', 1);
+INSERT INTO musicbrainz.release_gid_redirect (gid, new_id) VALUES
+    ('a3333333-3333-4333-8333-333333333333', 1);
+INSERT INTO musicbrainz.release_group_gid_redirect (gid, new_id) VALUES
+    ('a2222222-2222-4222-8222-222222222222', 1);
+INSERT INTO musicbrainz.recording_gid_redirect (gid, new_id) VALUES
+    ('a5555555-5555-4555-8555-555555555555', 1);
