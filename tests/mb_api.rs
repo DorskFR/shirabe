@@ -271,6 +271,14 @@ async fn artist_qualified_searches_are_scoped_to_the_artist() {
     assert_eq!(body["count"], 1);
     assert_eq!(body["recordings"][0]["id"], RECORDING_MBID);
 
+    let (status, body) = get(
+        &st,
+        "/ws/2/recording?query=recording:(lighthous%20kepper)%20AND%20artist:(seaside%20radio)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1, "a typo'd title falls back to similarity within the artist");
+
     let (status, body) = get(&st, "/ws/2/recording?query=lighthous%20kepper").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["count"], 0, "title-only recording search has no trigram fallback");

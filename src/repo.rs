@@ -57,8 +57,8 @@ fn is_statement_timeout(e: &sqlx::Error) -> bool {
     e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref() == Some("57014")
 }
 
-/// Trigram fuzzy fallback for a title-only search whose FTS primary matched
-/// nothing, capped at [`FUZZY_STATEMENT_TIMEOUT_MS`].
+/// Trigram fuzzy fallback for a search whose FTS primary matched nothing,
+/// capped at [`FUZZY_STATEMENT_TIMEOUT_MS`].
 #[tracing::instrument(skip_all, fields(search.timed_out = tracing::field::Empty), err(level = "info"))]
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
@@ -649,18 +649,22 @@ pub async fn search_releases(
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let year_i32 = filters.year.and_then(|y| y.parse::<i32>().ok());
     let rows = if let Some(artist) = scoping_artist(filters.artist) {
-        fetch_bounded(
-            sqlx::query(queries::SEARCH_RELEASES_BY_ARTIST)
+        let scoped = |sql| {
+            sqlx::query(sql)
                 .bind(title)
                 .bind(artist)
                 .bind(year_i32)
                 .bind(limit)
                 .bind(filters.primary_type)
                 .bind(filters.status)
-                .bind(offset),
-            &mut conn,
-        )
-        .await?
+                .bind(offset)
+        };
+        let rows = fetch_bounded(scoped(queries::SEARCH_RELEASES_BY_ARTIST), &mut conn).await?;
+        if rows.is_empty() {
+            fetch_fuzzy(scoped(queries::SEARCH_RELEASES_BY_ARTIST_FUZZY), &mut conn).await?
+        } else {
+            rows
+        }
     } else {
         let rows = fetch_bounded(
             sqlx::query(queries::SEARCH_RELEASES)
@@ -1109,15 +1113,14 @@ pub async fn search_recordings(
     // recording table can run for minutes past its statement_timeout.
     let rows = match scoping_artist(artist) {
         Some(artist) => {
-            fetch_bounded(
-                sqlx::query(queries::SEARCH_RECORDINGS_BY_ARTIST)
-                    .bind(title)
-                    .bind(artist)
-                    .bind(limit)
-                    .bind(offset),
-                &mut conn,
-            )
-            .await?
+            let scoped = |sql| sqlx::query(sql).bind(title).bind(artist).bind(limit).bind(offset);
+            let rows =
+                fetch_bounded(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST), &mut conn).await?;
+            if rows.is_empty() {
+                fetch_fuzzy(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST_FUZZY), &mut conn).await?
+            } else {
+                rows
+            }
         }
         None => {
             fetch_bounded(

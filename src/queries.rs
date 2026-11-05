@@ -33,16 +33,26 @@ macro_rules! artist_credits_cte {
     };
 }
 
-/// A title (`$1`) matching `{col}` by whole words, trigram similarity, or as a
-/// word sequence inside a longer title ("Best Of" in "The Best of …").
-macro_rules! title_matches {
+/// A title (`$1`) matching `{col}` by whole words: indexable, so the planner
+/// intersects the title and artist-credit indexes instead of reading every
+/// recording of a prolific artist.
+macro_rules! title_words_match {
     ($col:literal) => {
         concat!(
-            "(to_tsvector('simple', musicbrainz.f_unaccent(",
+            "to_tsvector('simple', musicbrainz.f_unaccent(",
             $col,
             "))
-                 @@ websearch_to_tsquery('simple', musicbrainz.f_unaccent($1))
-             OR similarity(musicbrainz.f_unaccent(",
+                 @@ websearch_to_tsquery('simple', musicbrainz.f_unaccent($1))"
+        )
+    };
+}
+
+/// A typo'd or partial title (`$1`) matching `{col}` by trigram similarity, or
+/// as a word sequence inside a longer title ("Best Of" in "The Best of …").
+macro_rules! title_resembles {
+    ($col:literal) => {
+        concat!(
+            "(similarity(musicbrainz.f_unaccent(",
             $col,
             "), musicbrainz.f_unaccent($1)) >= show_limit()
              OR word_similarity(musicbrainz.f_unaccent($1), musicbrainz.f_unaccent(",
@@ -238,7 +248,41 @@ pub const SEARCH_RELEASES_BY_ARTIST: &str = concat!(
         JOIN credits ac ON ac.id = r.artist_credit
         WHERE r.artist_credit = ANY(ARRAY(SELECT id FROM credits))
           AND ",
-    title_matches!("r.name"),
+    title_words_match!("r.name"),
+    r"
+          AND ($3::int IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_country rc
+                WHERE rc.release = r.id AND rc.date_year = $3
+                UNION ALL
+                SELECT 1 FROM musicbrainz.release_unknown_country ruc
+                WHERE ruc.release = r.id AND ruc.date_year = $3))
+          AND ($5::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_group rg
+                JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+                WHERE rg.id = r.release_group AND lower(rgpt.name) = lower($5)))
+          AND ($6::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_status rs
+                WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
+        ORDER BY (similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))
+                  + similarity(ac.name, $2) * 0.5::real) DESC,
+                 r.id ASC
+        LIMIT $4 OFFSET $7
+        "
+);
+
+// Fallback for SEARCH_RELEASES_BY_ARTIST when no title word matches: scans the artist's
+// titles by similarity, so it runs under the tight fuzzy timeout.
+pub const SEARCH_RELEASES_BY_ARTIST_FUZZY: &str = concat!(
+    artist_credits_cte!(),
+    r"
+        SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+               similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
+        FROM musicbrainz.release r
+        JOIN credits ac ON ac.id = r.artist_credit
+        WHERE r.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+          AND ",
+    title_resembles!("r.name"),
     r"
           AND ($3::int IS NULL OR EXISTS (
                 SELECT 1 FROM musicbrainz.release_country rc
@@ -294,7 +338,28 @@ pub const SEARCH_RECORDINGS_BY_ARTIST: &str = concat!(
         JOIN credits ac ON ac.id = rec.artist_credit
         WHERE rec.artist_credit = ANY(ARRAY(SELECT id FROM credits))
           AND ",
-    title_matches!("rec.name"),
+    title_words_match!("rec.name"),
+    r"
+        ORDER BY (similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))
+                  + similarity(ac.name, $2) * 0.5::real) DESC,
+                 rec.id ASC
+        LIMIT $3 OFFSET $4
+        "
+);
+
+// Fallback for SEARCH_RECORDINGS_BY_ARTIST when no title word matches: scans the artist's
+// titles by similarity, so it runs under the tight fuzzy timeout.
+pub const SEARCH_RECORDINGS_BY_ARTIST_FUZZY: &str = concat!(
+    artist_credits_cte!(),
+    r"
+        SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+               similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
+        FROM musicbrainz.recording rec
+        JOIN credits ac ON ac.id = rec.artist_credit
+        WHERE rec.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+          AND ",
+    title_resembles!("rec.name"),
     r"
         ORDER BY (similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))
                   + similarity(ac.name, $2) * 0.5::real) DESC,
@@ -845,6 +910,23 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
+            id: "search_releases_by_artist_fuzzy",
+            title: "Release search scoped to an artist (similarity fallback)",
+            endpoint: "GET /ws/2/release (artist:, fallback)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: SEARCH_RELEASES_BY_ARTIST_FUZZY,
+            params: vec![
+                p("title", Text, "ok compter"),
+                p("artist", Text, "radiohead"),
+                pn("year", Int, ""),
+                p("limit", BigInt, "25"),
+                pn("primarytype", Text, ""),
+                pn("status", Text, ""),
+                p("offset", BigInt, "0"),
+            ],
+        },
+        QuerySpec {
             id: "search_releases",
             title: "Release search (FTS)",
             endpoint: "GET /ws/2/release",
@@ -901,6 +983,20 @@ pub fn catalog() -> Vec<QuerySpec> {
             sql: SEARCH_RECORDINGS_BY_ARTIST,
             params: vec![
                 p("title", Text, "paranoid android"),
+                p("artist", Text, "radiohead"),
+                p("limit", BigInt, "25"),
+                p("offset", BigInt, "0"),
+            ],
+        },
+        QuerySpec {
+            id: "search_recordings_by_artist_fuzzy",
+            title: "Recording search scoped to an artist (similarity fallback)",
+            endpoint: "GET /ws/2/recording (artist:, fallback)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: SEARCH_RECORDINGS_BY_ARTIST_FUZZY,
+            params: vec![
+                p("title", Text, "paranoid androd"),
                 p("artist", Text, "radiohead"),
                 p("limit", BigInt, "25"),
                 p("offset", BigInt, "0"),
