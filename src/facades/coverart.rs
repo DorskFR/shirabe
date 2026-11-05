@@ -171,12 +171,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/_ia/{host}/{*path}", get(ia_passthrough))
 }
 
-#[tracing::instrument(name = "shirabe.coverart.release", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn release(state: State<Arc<AppState>>, uri: OriginalUri) -> Response {
     redirect_layer(&state, &uri).await
 }
 
-#[tracing::instrument(name = "shirabe.coverart.release_group", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn release_group(state: State<Arc<AppState>>, uri: OriginalUri) -> Response {
     redirect_layer(&state, &uri).await
 }
@@ -184,7 +184,7 @@ async fn release_group(state: State<Arc<AppState>>, uri: OriginalUri) -> Respons
 /// Proxy a `/release` or `/release-group` request to Cover Art Archive, rewriting
 /// any redirect `Location` to the local `/_ia/` bounce and passing other responses
 /// through unchanged.
-#[tracing::instrument(name = "shirabe.coverart.redirect_layer", skip_all, fields(coverart.key = tracing::field::Empty, cache.hit = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(coverart.key = tracing::field::Empty, cache.hit = tracing::field::Empty))]
 async fn redirect_layer(state: &AppState, uri: &OriginalUri) -> Response {
     let ca = &state.coverart;
     let pq = uri.path_and_query().map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
@@ -233,7 +233,7 @@ async fn redirect_layer(state: &AppState, uri: &OriginalUri) -> Response {
     body_response(status, ct.as_deref(), body, "MISS")
 }
 
-#[tracing::instrument(name = "shirabe.coverart.ia_passthrough", skip_all, fields(server.address = %host, cache.hit = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(server.address = %host, cache.hit = tracing::field::Empty))]
 async fn ia_passthrough(
     State(state): State<Arc<AppState>>,
     Path((host, _path)): Path<(String, String)>,
@@ -326,7 +326,7 @@ impl BodyError {
 
 /// Buffer the body, refusing a declared `Content-Length` over `cap` before
 /// reading and aborting a chunked body as soon as it crosses `cap`.
-#[tracing::instrument(name = "shirabe.coverart.read_capped", skip_all, fields(http.body.cap = cap))]
+#[tracing::instrument(skip_all, fields(http.body.cap = cap))]
 async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, BodyError> {
     if resp.content_length().is_some_and(|len| len > cap) {
         return Err(BodyError::TooLarge(cap));
@@ -343,7 +343,7 @@ async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Result<Vec<u8>, B
 }
 
 /// Read a fresh cache entry for `key`, or `None` on miss / stale / error.
-#[tracing::instrument(name = "shirabe.coverart.cache_get", skip_all, fields(cache.hit = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(cache.hit = tracing::field::Empty))]
 async fn cache_get(
     ca: &CoverArtState,
     key: &str,
@@ -376,7 +376,7 @@ async fn cache_lookup(
 
 /// Atomically store a cache entry (temp file + rename), then evict oldest entries
 /// if the cache is over its byte budget. Best-effort: failures are logged only.
-#[tracing::instrument(name = "shirabe.coverart.cache_put", skip_all, fields(http.response.status_code = status, http.body.size = body.len()))]
+#[tracing::instrument(skip_all, fields(http.response.status_code = status, http.body.size = body.len()))]
 async fn cache_put(ca: &CoverArtState, key: &str, status: u16, ct: Option<&str>, body: &[u8]) {
     let (meta_path, body_path) = ca.paths(key);
     let meta = Meta {
@@ -407,7 +407,7 @@ async fn cache_put(ca: &CoverArtState, key: &str, status: u16, ct: Option<&str>,
 
 /// Write through a per-call temp file so concurrent writers of one path never
 /// share (or rename out from under) each other's partial output.
-#[tracing::instrument(name = "shirabe.coverart.write_atomic", skip_all, fields(file.size = bytes.len()), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(file.size = bytes.len()), err(level = "info"))]
 async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -425,7 +425,7 @@ async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 
 /// Evict oldest (`.bin`, `.json`) entry pairs by mtime until the total on-disk
 /// size is back under `max_bytes`.
-#[tracing::instrument(name = "shirabe.coverart.evict_over_budget", skip_all, fields(cache.max_bytes = max_bytes))]
+#[tracing::instrument(skip_all, fields(cache.max_bytes = max_bytes))]
 fn evict_over_budget(dir: &std::path::Path, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

@@ -137,7 +137,7 @@ const fn default_iterations() -> u32 {
     1
 }
 
-#[tracing::instrument(name = "shirabe.debug.run", skip_all, fields(debug.query_id = req.id.as_str(), debug.mode = req.mode.as_str()))]
+#[tracing::instrument(skip_all, fields(debug.query_id = req.id.as_str(), debug.mode = req.mode.as_str()))]
 async fn run(State(state): State<Arc<AppState>>, Json(req): Json<RunRequest>) -> impl IntoResponse {
     match run_query(&state, req).await {
         Ok(v) => Json(v),
@@ -162,7 +162,7 @@ fn pool_for(state: &AppState, db: TargetDb) -> Result<&PgPool, String> {
     }
 }
 
-#[tracing::instrument(name = "shirabe.debug.run_query", skip_all, fields(debug.query_id = req.id.as_str(), debug.mode = req.mode.as_str(), debug.iterations = req.iterations), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(debug.query_id = req.id.as_str(), debug.mode = req.mode.as_str(), debug.iterations = req.iterations), err(level = "info"))]
 async fn run_query(state: &AppState, req: RunRequest) -> Result<Value, String> {
     let spec = queries::find(&req.id).ok_or_else(|| format!("unknown query id `{}`", req.id))?;
     if req.params.len() != spec.params.len() {

@@ -71,7 +71,6 @@ impl AppState {
 
 /// Run a single source's `refresh()` and exit non-zero on failure or unknown id.
 #[tracing::instrument(
-    name = "shirabe.sync",
     skip_all,
     fields(sync.source = source, otel.status_code, otel.status_description)
 )]

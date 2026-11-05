@@ -68,12 +68,12 @@ pub fn init(default_filter: &str, ansi: bool) -> TelemetryGuard {
     } else {
         (None, None)
     };
-    let fmt =
-        tracing_subscriber::fmt::layer().with_ansi(ansi).with_filter(env_filter(default_filter));
-    let _ = tracing_subscriber::registry()
-        .with(fmt)
-        .with(provider.as_ref().map(|p| export_layers(&p.tracer(SERVICE_NAME), default_filter)))
-        .try_init();
+    // Not an `Option` layer nor a boxed subscriber: neither forwards
+    // `on_register_dispatch`, which the sqlx bridge needs.
+    let _ = provider.as_ref().map_or_else(
+        || tracing_subscriber::registry().with(fmt_layer(default_filter, ansi)).try_init(),
+        |p| exporting_subscriber(&p.tracer(SERVICE_NAME), default_filter, ansi).try_init(),
+    );
     if let Some(err) = build_error {
         tracing::warn!(%err, "OTLP trace exporter could not be built; trace export disabled");
     }
@@ -81,6 +81,25 @@ pub fn init(default_filter: &str, ansi: bool) -> TelemetryGuard {
         tracing::info!("OTLP trace export enabled");
     }
     TelemetryGuard { provider }
+}
+
+/// fmt logs plus span export: the stack [`init`] installs when exporting.
+#[must_use]
+pub fn exporting_subscriber(
+    tracer: &Tracer,
+    default_filter: &str,
+    ansi: bool,
+) -> impl Subscriber + Send + Sync + use<> {
+    tracing_subscriber::registry()
+        .with(fmt_layer(default_filter, ansi))
+        .with(export_layers(tracer, default_filter))
+}
+
+fn fmt_layer<S>(default_filter: &str, ansi: bool) -> impl Layer<S> + use<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer().with_ansi(ansi).with_filter(env_filter(default_filter))
 }
 
 /// The span-export layers: `tracing-opentelemetry` over the log filter widened

@@ -300,7 +300,7 @@ fn tsv_reader<R: std::io::Read>(reader: R) -> csv::Reader<R> {
 
 /// Download + decode + COPY-load one dataset into its `_new` staging table, then
 /// atomically swap it into place. Returns the loaded row count.
-#[tracing::instrument(name = "shirabe.imdb.ingest_dataset", skip_all, fields(dataset = ds.table, imdb.rows = tracing::field::Empty), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(dataset = ds.table, imdb.rows = tracing::field::Empty), err(level = "info"))]
 async fn ingest_dataset(
     pool: &PgPool,
     client: &reqwest::Client,
@@ -398,7 +398,7 @@ async fn ingest_dataset(
 }
 
 /// Drop the live table and rename staging (+ its indexes) into place, atomically.
-#[tracing::instrument(name = "shirabe.imdb.swap", skip_all, fields(dataset = ds.table), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(dataset = ds.table), err(level = "info"))]
 async fn swap_into_place(pool: &PgPool, ds: &Dataset, staging: &str) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {}", ds.table)))
@@ -448,7 +448,7 @@ impl Source for ImdbSource {
         IngestMode::BulkDump
     }
 
-    #[tracing::instrument(name = "shirabe.imdb.refresh", skip_all, fields(sync.source = Self::ID))]
+    #[tracing::instrument(skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
         let Some(pool) = ctx.pools.imdb.as_ref() else {
             return RefreshReport::failed(
@@ -517,7 +517,7 @@ impl Source for ImdbSource {
 
 /// Per-table row estimates for the imdb mirror. Returns an error if the pool is
 /// unreachable; missing individual tables surface as `-1`.
-#[tracing::instrument(name = "shirabe.imdb.table_counts", skip_all, err(level = "info"))]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn table_counts(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // Reachability probe so a dead pool errors rather than reporting all -1.
     sqlx::query("SELECT 1").execute(pool).await?;
