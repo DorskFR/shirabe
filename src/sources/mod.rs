@@ -210,7 +210,7 @@ impl Registry {
     /// Run a source's `refresh()` and upsert its `shirabe.source` row. Used by
     /// the `shirabe sync <id>` subcommand. Returns the report, or `None` if no
     /// such source is registered.
-    #[tracing::instrument(name = "shirabe.sources.run_refresh", skip_all, fields(sync.source = id, sync.ok = tracing::field::Empty))]
+    #[tracing::instrument(skip_all, fields(sync.source = id, sync.ok = tracing::field::Empty))]
     pub async fn run_refresh(&self, id: &str) -> Option<RefreshReport> {
         let source = self.get(id)?.clone();
         let ctx = RefreshCtx { pools: self.pools.clone() };
@@ -389,7 +389,7 @@ async fn fetch_source_rows(pool: &PgPool) -> Result<BTreeMap<String, SourceRow>,
 
 /// Upsert a source's row in `shirabe.source` after a refresh. Runtime query
 /// (no compile-time macro); writes only the `shirabe` schema.
-#[tracing::instrument(name = "shirabe.sources.upsert_refresh", skip_all, fields(sync.source = source.id()), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(sync.source = source.id()), err(level = "info"))]
 async fn upsert_refresh(
     pool: &PgPool,
     source: &dyn Source,

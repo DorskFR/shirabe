@@ -86,7 +86,6 @@ fn record_paging(span: &Span, query: &str, limit: i64, offset: i64) {
 
 /// `GET /ws/2/artist`
 #[tracing::instrument(
-    name = "shirabe.ws2.search_artist",
     skip_all,
     fields(
         mb.entity = "artist",
@@ -137,7 +136,6 @@ pub async fn search_artist(
 
 /// `GET /ws/2/release`
 #[tracing::instrument(
-    name = "shirabe.ws2.search_release",
     skip_all,
     fields(
         mb.entity = "release",
@@ -213,7 +211,6 @@ pub async fn search_release(
 
 /// `GET /ws/2/recording`
 #[tracing::instrument(
-    name = "shirabe.ws2.search_recording",
     skip_all,
     fields(
         mb.entity = "recording",
@@ -292,7 +289,6 @@ fn release_group_includes(inc: Option<&str>) -> repo::ReleaseGroupIncludes {
 
 /// `GET /ws/2/artist/{mbid}`
 #[tracing::instrument(
-    name = "shirabe.ws2.lookup_artist",
     skip_all,
     fields(
         mb.entity = "artist",
@@ -321,7 +317,6 @@ pub async fn lookup_artist(
 
 /// `GET /ws/2/release/{mbid}`
 #[tracing::instrument(
-    name = "shirabe.ws2.lookup_release",
     skip_all,
     fields(
         mb.entity = "release",
@@ -347,7 +342,6 @@ pub async fn lookup_release(
 
 /// `GET /ws/2/recording/{mbid}`
 #[tracing::instrument(
-    name = "shirabe.ws2.lookup_recording",
     skip_all,
     fields(
         mb.entity = "recording",
@@ -373,7 +367,6 @@ pub async fn lookup_recording(
 
 /// `GET /ws/2/release-group?artist={mbid}`
 #[tracing::instrument(
-    name = "shirabe.ws2.browse_release_group",
     skip_all,
     fields(
         mb.entity = "release-group",
@@ -416,7 +409,6 @@ pub async fn browse_release_group(
 
 /// `GET /ws/2/release-group/{mbid}`
 #[tracing::instrument(
-    name = "shirabe.ws2.lookup_release_group",
     skip_all,
     fields(
         mb.entity = "release-group",
@@ -446,7 +438,6 @@ pub async fn lookup_release_group(
 
 /// `GET /health` and `GET /ws/2` ping.
 #[tracing::instrument(
-    name = "shirabe.ws2.health",
     skip_all,
     fields(otel.status_code = Empty, otel.status_description = Empty)
 )]
@@ -462,7 +453,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>
 /// `shirabe sync <source>` CronJob runs), so a stale or errored source is obvious
 /// at a glance via the `healthy` rollup. Degrades gracefully when the writable
 /// shirabe pool is absent (reports only what live `health()` can determine).
-#[tracing::instrument(name = "shirabe.ws2.health_sources", skip_all)]
+#[tracing::instrument(skip_all)]
 pub async fn health_sources(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::sources::SourcesHealthReport> {

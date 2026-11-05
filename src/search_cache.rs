@@ -134,7 +134,6 @@ impl SearchCache {
     /// of the same key. A failed compute is not cached: waiters re-run it
     /// themselves, one at a time.
     #[tracing::instrument(
-        name = "shirabe.search_cache.get_or_compute",
         skip_all,
         fields(
             cache.entity = key.entity,
@@ -307,7 +306,7 @@ mod tests {
         .await;
 
         let caller = &capture.named("shirabe.caller")[0];
-        let cached = capture.named("shirabe.search_cache.get_or_compute");
+        let cached = capture.named("get_or_compute");
         assert_eq!(cached.len(), 2);
         for span in &cached {
             assert_eq!(span.parent_span_id, caller.span_context.span_id());

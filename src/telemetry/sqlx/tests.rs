@@ -91,3 +91,24 @@ fn statements_outside_a_span_are_not_exported() {
     statement_event("SELECT 1", "", 0.001);
     assert_eq!(capture.spans(), Vec::new());
 }
+
+#[test]
+fn the_init_subscriber_bridges_statements() {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let tracer = provider.tracer("test");
+    let _default = tracing::subscriber::set_default(crate::telemetry::exporting_subscriber(
+        &tracer, "info", false,
+    ));
+    {
+        let _enter = tracing::info_span!("shirabe.prod").entered();
+        statement_event("SELECT 1", "", 0.001);
+    }
+    let names: Vec<_> =
+        exporter.get_finished_spans().unwrap().into_iter().map(|s| s.name).collect();
+    assert!(names.iter().any(|n| n == "SELECT"), "{names:?}");
+}

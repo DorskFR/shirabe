@@ -134,11 +134,7 @@ impl TokenStore {
     }
 
     /// Acquire the write lock, log in against TheTVDB, and store the new token.
-    #[tracing::instrument(
-        name = "shirabe.tvdb_source.refresh_locked",
-        skip_all,
-        err(level = "info")
-    )]
+    #[tracing::instrument(skip_all, err(level = "info"))]
     async fn refresh_locked(&self, config: &Config) -> Result<String, String> {
         let key = config
             .tvdb_api_key
@@ -163,7 +159,7 @@ impl TokenStore {
 
 /// Perform a `POST {base}/login {apikey, pin}` against TheTVDB and return the
 /// bearer token. Network/parse failures surface as an error string.
-#[tracing::instrument(name = "shirabe.tvdb_source.login", skip_all, err(level = "info"))]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn login(base: &str, apikey: &str, pin: Option<&str>) -> Result<String, String> {
     let client = crate::http::client_builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
@@ -222,7 +218,7 @@ impl Source for TvdbSource {
     /// probe: when a key is configured it verifies a login can be obtained;
     /// otherwise it records that the source is unconfigured (not an error — the
     /// operator simply has not supplied a key yet).
-    #[tracing::instrument(name = "shirabe.tvdb_source.refresh", skip_all, fields(sync.source = Self::ID))]
+    #[tracing::instrument(skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, _ctx: &RefreshCtx) -> RefreshReport {
         if self.config.tvdb_api_key.is_none() {
             return RefreshReport::ok(

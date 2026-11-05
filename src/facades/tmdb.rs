@@ -150,7 +150,7 @@ const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
 /// Fetch a fresh cached payload for `(id, kind)`, honouring the configured TTL.
 /// The freshness test is done in SQL (`fetched_at` vs `now()`), so no timestamp
 /// type needs decoding client-side. Returns `None` on miss / stale / no pool.
-#[tracing::instrument(name = "shirabe.tmdb.cache_get", skip_all, fields(tmdb.kind = kind, tmdb.id = id, cache.hit = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind, tmdb.id = id, cache.hit = tracing::field::Empty))]
 async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
     let hit = cache_lookup(state, id, kind).await;
     tracing::Span::current().record("cache.hit", hit.is_some());
@@ -180,7 +180,7 @@ async fn cache_lookup(state: &AppState, id: i64, kind: &str) -> Option<Value> {
 
 /// Store (upsert) a payload into `tmdb_cache` with `fetched_at = now()`.
 /// Best-effort: a cache write failure is logged but does not fail the request.
-#[tracing::instrument(name = "shirabe.tmdb.cache_put", skip_all, fields(tmdb.kind = kind, tmdb.id = id))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind, tmdb.id = id))]
 async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
     let Some(pool) = tmdb_pool(state) else {
         return;
@@ -203,7 +203,7 @@ async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
 }
 
 /// Batch [`cache_get`]: fresh cached payloads for many ids of one `kind`.
-#[tracing::instrument(name = "shirabe.tmdb.cache_get_many", skip_all, fields(tmdb.kind = kind, batch.size = ids.len(), result.count = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind, batch.size = ids.len(), result.count = tracing::field::Empty))]
 async fn cache_get_many(
     state: &AppState,
     ids: &[i64],
@@ -242,7 +242,7 @@ async fn cache_get_many(
 /// Self-link any external ids found in a hydrated detail payload into
 /// `shirabe.xref`, so a TMDB id resolves to its sibling provider ids. Reads both a
 /// top-level `imdb_id` and an `external_ids` object. Best-effort.
-#[tracing::instrument(name = "shirabe.tmdb.self_link_external_ids", skip_all, fields(tmdb.kind, tmdb.id))]
+#[tracing::instrument(skip_all, fields(tmdb.kind, tmdb.id))]
 async fn self_link_external_ids(state: &AppState, tmdb_kind: &str, tmdb_id: i64, payload: &Value) {
     let Some(pool) = shirabe_pool(state) else {
         return;
@@ -274,7 +274,7 @@ async fn self_link_external_ids(state: &AppState, tmdb_kind: &str, tmdb_id: i64,
 /// Perform an upstream TMDB v3 GET, returning the parsed JSON body. `path` is the
 /// endpoint path under the configured API base (no leading slash); `extra` are
 /// extra query pairs appended after the held `api_key`.
-#[tracing::instrument(name = "shirabe.tmdb.upstream_get", skip_all, fields(tmdb.path = path), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(tmdb.path = path), err(level = "info"))]
 async fn upstream_get(
     base: &str,
     key: &str,
@@ -471,7 +471,7 @@ fn ensure_result_fields(payload: &mut Value, kind: &str) {
 
 /// Fill missing required fields on local search results from already-hydrated
 /// detail payloads in `tmdb_cache`, avoiding a live call when the answer is local.
-#[tracing::instrument(name = "shirabe.tmdb.enrich_from_cached_details", skip_all, fields(tmdb.kind = kind))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind))]
 async fn enrich_from_cached_details(state: &AppState, kind: &str, payload: &mut Value) {
     let Some(arr) = payload.get("results").and_then(Value::as_array) else {
         return;
@@ -531,7 +531,7 @@ fn merge_live_results(results: &mut Vec<Value>, live: &Value) {
 /// FIRST; on a thin or empty local result, fall through to the live API and MERGE
 /// (dedupe by id). Cache holds the merged payload so the second identical call is
 /// served without re-hitting upstream.
-#[tracing::instrument(name = "shirabe.tmdb.search", skip_all, fields(tmdb.kind = kind, search.query = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind, search.query = tracing::field::Empty))]
 async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     let Some(query) = search_query(params) else {
         if is_unanswerable(params) {
@@ -643,7 +643,7 @@ fn cached_satisfies(payload: &Value, client: &[String]) -> bool {
 /// stored under the base `kind` cache key: richer payloads are supersets, so one
 /// cache row serves every append combination once hydrated. A cached row lacking
 /// a requested section forces a re-fetch instead of shadowing the richer request.
-#[tracing::instrument(name = "shirabe.tmdb.detail", skip_all, fields(tmdb.kind = kind, tmdb.id = id_raw))]
+#[tracing::instrument(skip_all, fields(tmdb.kind = kind, tmdb.id = id_raw))]
 async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str, params: &Value) -> Response {
     let Ok(id) = id_raw.parse::<i64>() else {
         return tmdb_error(StatusCode::BAD_REQUEST, 34, "invalid id");
@@ -694,20 +694,20 @@ async fn detail(state: &Arc<AppState>, kind: &str, id_raw: &str, params: &Value)
 }
 
 /// `GET /3/search/tv?query=` → `{results:[{id,name,first_air_date,…}]}`.
-#[tracing::instrument(name = "shirabe.tmdb.search_tv", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn search_tv(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
     search(&state, "tv", &params).await
 }
 
 /// `GET /3/search/movie?query=` → `{results:[{id,title,release_date,overview,…}]}`.
-#[tracing::instrument(name = "shirabe.tmdb.search_movie", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn search_movie(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
     search(&state, "movie", &params).await
 }
 
 /// `GET /3/tv/{id}?append_to_response=content_ratings` →
 /// `{name,first_air_date,seasons:[…],external_ids:{imdb_id},content_ratings:{…}}`.
-#[tracing::instrument(name = "shirabe.tmdb.tv", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn tv(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -718,7 +718,7 @@ async fn tv(
 
 /// `GET /3/movie/{id}?append_to_response=external_ids,release_dates` →
 /// `{title,release_date,runtime,imdb_id,external_ids:{imdb_id},release_dates:{…}}`.
-#[tracing::instrument(name = "shirabe.tmdb.movie", skip_all)]
+#[tracing::instrument(skip_all)]
 async fn movie(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -728,7 +728,7 @@ async fn movie(
 }
 
 /// `GET /3/tv/{id}/season/{n}` → `{episodes:[{episode_number,name,runtime}]}`.
-#[tracing::instrument(name = "shirabe.tmdb.tv_season", skip_all, fields(tmdb.id = %id, tmdb.season = %n))]
+#[tracing::instrument(skip_all, fields(tmdb.id = %id, tmdb.season = %n))]
 async fn tv_season(
     State(state): State<Arc<AppState>>,
     Path((id, n)): Path<(String, String)>,
@@ -794,7 +794,7 @@ mod tests {
         assert!(err.starts_with("upstream status: HTTP status server error (500"), "{err}");
         assert!(!err.contains("server-key"), "{err}");
 
-        let span = &capture.named("shirabe.tmdb.upstream_get")[0];
+        let span = &capture.named("upstream_get")[0];
         assert!(matches!(span.status, Status::Error { .. }));
         for span in capture.spans() {
             let rendered = format!("{:?} {:?}", span.attributes, span.events);

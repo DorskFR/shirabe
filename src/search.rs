@@ -28,7 +28,7 @@ use crate::queries;
 /// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
 /// nothing), time-boxed to [`FUZZY_STATEMENT_TIMEOUT_MS`]. Hitting the cap
 /// yields no rows (SQLSTATE 57014) rather than erroring the whole request.
-#[tracing::instrument(name = "shirabe.search.fetch_fuzzy", skip_all, err(level = "info"))]
+#[tracing::instrument(skip_all, err(level = "info"))]
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PoolConnection<Postgres>,
@@ -288,7 +288,7 @@ pub async fn configure_search_session(
 /// scoring on `name` and carrying `popularity`/`adult` for ranking + native shape.
 /// Returns an empty vec (not an error) is reserved for genuine emptiness; DB
 /// errors propagate so the caller can decide to fall through.
-#[tracing::instrument(name = "shirabe.search.search_tmdb_id_index", skip_all, fields(search.query = query, search.kind = kind, search.limit = limit, result.count = tracing::field::Empty), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(search.query = query, search.kind = kind, search.limit = limit, result.count = tracing::field::Empty), err(level = "info"))]
 async fn search_tmdb_id_index(
     pool: &PgPool,
     query: &str,
@@ -339,7 +339,7 @@ async fn search_tmdb_id_index(
 /// path — 銀魂 resolves to its tconst here). One row per `tconst`, scored by the
 /// GREATEST similarity across the three columns. `kind_filter`, when set, narrows
 /// `imdb_title_basics.title_type` (e.g. `tvSeries` / `movie`); `None` searches all.
-#[tracing::instrument(name = "shirabe.search.search_imdb_titles", skip_all, fields(search.query = query, search.title_types = ?title_types, search.limit = limit, result.count = tracing::field::Empty), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(search.query = query, search.title_types = ?title_types, search.limit = limit, result.count = tracing::field::Empty), err(level = "info"))]
 async fn search_imdb_titles(
     pool: &PgPool,
     query: &str,
@@ -416,7 +416,7 @@ pub struct IndexMeta {
 /// top-level `imdb_id`), so any title Shirabe has ever hydrated resolves locally
 /// with no upstream call (SHIB-15). `kind` is the detail cache kind (`tv` /
 /// `movie`). Backed by the `tmdb_cache_kind_imdb_id_idx` expression index.
-#[tracing::instrument(name = "shirabe.search.resolve_tconsts_via_cache", skip_all, fields(batch.size = tconsts.len(), search.kind = kind), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(batch.size = tconsts.len(), search.kind = kind), err(level = "info"))]
 async fn resolve_tconsts_via_cache(
     pool: &PgPool,
     tconsts: &[String],
@@ -441,7 +441,7 @@ async fn resolve_tconsts_via_cache(
 }
 
 /// Fetch [`IndexMeta`] for a set of TMDB ids from `tmdb_id_index`.
-#[tracing::instrument(name = "shirabe.search.index_meta_for_ids", skip_all, fields(batch.size = ids.len(), search.kind = kind), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(batch.size = ids.len(), search.kind = kind), err(level = "info"))]
 async fn index_meta_for_ids(
     pool: &PgPool,
     ids: &[i64],
@@ -502,7 +502,7 @@ pub fn apply_tconst_resolution(
 /// (see [`resolve_tconsts_via_cache`]) and enrich from `tmdb_id_index`.
 /// Best-effort: with no tmdb pool or on a DB error the hits pass through
 /// unresolved (degraded, never an error).
-#[tracing::instrument(name = "shirabe.search.resolve_imdb_hits", skip_all, fields(batch.size = hits.len(), search.kind = kind))]
+#[tracing::instrument(skip_all, fields(batch.size = hits.len(), search.kind = kind))]
 async fn resolve_imdb_hits(
     tmdb_pool: Option<&PgPool>,
     hits: Vec<ScoredHit>,
@@ -541,7 +541,7 @@ async fn resolve_imdb_hits(
 /// then merges / dedupes / ranks in Rust. Absent pools simply contribute nothing.
 /// DB errors on either pool are swallowed to an empty contribution so a
 /// half-provisioned deployment degrades to the live API rather than 500-ing.
-#[tracing::instrument(name = "shirabe.search.local_tmdb_search", skip_all, fields(search.query = query, search.kind = kind, search.limit = limit, result.count = tracing::field::Empty))]
+#[tracing::instrument(skip_all, fields(search.query = query, search.kind = kind, search.limit = limit, result.count = tracing::field::Empty))]
 pub async fn local_tmdb_search(
     imdb_pool: Option<&PgPool>,
     tmdb_pool: Option<&PgPool>,
