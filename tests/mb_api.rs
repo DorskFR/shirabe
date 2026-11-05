@@ -247,3 +247,56 @@ async fn ws2_search_artist_filter_and_response_cache() {
     assert_eq!(status, StatusCode::OK);
     assert!(off.search_cache.is_empty(), "TTL 0 disables storage");
 }
+
+#[tokio::test]
+#[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
+async fn artist_qualified_searches_are_scoped_to_the_artist() {
+    let db = mb_fixture_db().await;
+    let st = state_with_db(&db, &[]);
+
+    let (status, body) =
+        get(&st, "/ws/2/release?query=release:(lights)%20AND%20artist:(seaside%20radio)").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2, "a word of the title matches within the artist");
+
+    let (status, body) =
+        get(&st, "/ws/2/release?query=release:(harbour%20lights)%20AND%20artist:(seasid%20radoi)")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2, "a typo'd artist falls back to trigram credits");
+
+    let (status, body) =
+        get(&st, "/ws/2/recording?query=recording:(keeper)%20AND%20artist:(seaside%20radio)").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["recordings"][0]["id"], RECORDING_MBID);
+
+    let (status, body) = get(&st, "/ws/2/recording?query=lighthous%20kepper").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 0, "title-only recording search has no trigram fallback");
+
+    let (status, body) = get(&st, "/ws/2/release?query=harbor%20lite").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 2, "title-only release search keeps its trigram fallback");
+}
+
+#[tokio::test]
+#[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
+async fn merged_mbids_resolve_to_the_canonical_entity() {
+    let db = mb_fixture_db().await;
+    let st = state_with_db(&db, &[]);
+
+    for (path, canonical) in [
+        ("/ws/2/artist/a1111111-1111-4111-8111-111111111111", ARTIST_MBID),
+        ("/ws/2/release/a3333333-3333-4333-8333-333333333333", RELEASE_MBID),
+        ("/ws/2/release-group/a2222222-2222-4222-8222-222222222222", RELEASE_GROUP_MBID),
+        (
+            "/ws/2/recording/a5555555-5555-4555-8555-555555555555",
+            "55555555-5555-4555-8555-555555555555",
+        ),
+    ] {
+        let (status, body) = get(&st, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(body["id"], canonical, "{path}");
+    }
+}

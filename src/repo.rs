@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{PgConnection, PgPool, Postgres, Row};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 
 use crate::date::{DateEvent, select_release_date};
@@ -15,7 +15,9 @@ use crate::models::{
     Track, UrlRelation, UrlResource,
 };
 use crate::queries;
-use crate::search::configure_search_session;
+use crate::search::{
+    DEFAULT_STATEMENT_TIMEOUT_MS, FUZZY_STATEMENT_TIMEOUT_MS, configure_search_session,
+};
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
 ///
@@ -36,25 +38,46 @@ fn dedup_ids(mut ids: Vec<i32>) -> Vec<i32> {
     ids
 }
 
-/// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
-/// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
-/// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
-/// than erroring the whole request — the FTS primary already returned none.
-#[tracing::instrument(skip_all, err(level = "info"))]
-async fn fetch_fuzzy(
+/// Rows of `query`, or none when it hits the session `statement_timeout`
+/// (SQLSTATE 57014): an over-broad search answers empty instead of failing.
+async fn fetch_bounded(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PgConnection,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
     match query.fetch_all(conn).await {
-        Ok(rows) => Ok(rows),
-        Err(e)
-            if e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref()
-                == Some("57014") =>
-        {
+        Err(e) if is_statement_timeout(&e) => {
+            tracing::Span::current().record("search.timed_out", true);
             Ok(Vec::new())
         }
-        Err(e) => Err(e),
+        other => other,
     }
+}
+
+fn is_statement_timeout(e: &sqlx::Error) -> bool {
+    e.as_database_error().and_then(sqlx::error::DatabaseError::code).as_deref() == Some("57014")
+}
+
+/// Trigram fuzzy fallback for a title-only search whose FTS primary matched
+/// nothing, capped at [`FUZZY_STATEMENT_TIMEOUT_MS`].
+#[tracing::instrument(skip_all, fields(search.timed_out = tracing::field::Empty), err(level = "info"))]
+async fn fetch_fuzzy(
+    query: sqlx::query::Query<'_, Postgres, PgArguments>,
+    conn: &mut PgConnection,
+) -> Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}")))
+        .execute(&mut *conn)
+        .await?;
+    let rows = fetch_bounded(query, conn).await;
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}")))
+        .execute(&mut *conn)
+        .await?;
+    rows
+}
+
+/// The artist an artist-qualified search is scoped to. "Various Artists" has
+/// too many releases to scope by; its searches stay title-first.
+fn scoping_artist(artist: Option<&str>) -> Option<&str> {
+    artist.map(str::trim).filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("various artists"))
 }
 
 // ── Batched (set-based) hydration ─────────────────────────
@@ -487,7 +510,7 @@ pub async fn lookup_artist(
         if inc.annotation { Some(load_artist_annotation(pool, id).await?) } else { None };
 
     Ok(Some(ArtistLookup {
-        id: gid.to_string(),
+        id: row.try_get::<Uuid, _>("gid")?.to_string(),
         name: row.try_get("name")?,
         sort_name: row.try_get("sort_name")?,
         artist_type: row.try_get("type_name").ok(),
@@ -608,7 +631,7 @@ pub struct ReleaseFilters<'a> {
 }
 
 /// `GET /ws/2/release?query=release:(..) AND artist:(..) [AND date:(YYYY*)]`
-#[tracing::instrument(skip_all, fields(search.query = title, search.limit = limit, search.offset = offset), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(search.query = title, search.artist = filters.artist.unwrap_or_default(), search.limit = limit, search.offset = offset, search.timed_out = tracing::field::Empty), err(level = "info"))]
 pub async fn search_releases(
     pool: &PgPool,
     title: &str,
@@ -625,21 +648,22 @@ pub async fn search_releases(
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let year_i32 = filters.year.and_then(|y| y.parse::<i32>().ok());
-    // FTS fast path (whole-word match); fall back to the trigram `%` scan only when
-    // FTS finds nothing (typo'd / partial query), so recall never regresses.
-    let mut rows = sqlx::query(queries::SEARCH_RELEASES)
-        .bind(title)
-        .bind(filters.artist)
-        .bind(year_i32)
-        .bind(limit)
-        .bind(filters.primary_type)
-        .bind(filters.status)
-        .bind(offset)
-        .fetch_all(&mut *conn)
-        .await?;
-    if rows.is_empty() {
-        rows = fetch_fuzzy(
-            sqlx::query(queries::SEARCH_RELEASES_FUZZY)
+    let rows = if let Some(artist) = scoping_artist(filters.artist) {
+        fetch_bounded(
+            sqlx::query(queries::SEARCH_RELEASES_BY_ARTIST)
+                .bind(title)
+                .bind(artist)
+                .bind(year_i32)
+                .bind(limit)
+                .bind(filters.primary_type)
+                .bind(filters.status)
+                .bind(offset),
+            &mut conn,
+        )
+        .await?
+    } else {
+        let rows = fetch_bounded(
+            sqlx::query(queries::SEARCH_RELEASES)
                 .bind(title)
                 .bind(filters.artist)
                 .bind(year_i32)
@@ -650,7 +674,23 @@ pub async fn search_releases(
             &mut conn,
         )
         .await?;
-    }
+        if rows.is_empty() {
+            fetch_fuzzy(
+                sqlx::query(queries::SEARCH_RELEASES_FUZZY)
+                    .bind(title)
+                    .bind(filters.artist)
+                    .bind(year_i32)
+                    .bind(limit)
+                    .bind(filters.primary_type)
+                    .bind(filters.status)
+                    .bind(offset),
+                &mut conn,
+            )
+            .await?
+        } else {
+            rows
+        }
+    };
     drop(conn);
     let total = total_from(&rows);
     Ok((total, hydrate_release_search_rows(pool, rows).await?))
@@ -815,7 +855,7 @@ pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>,
     let relations = load_release_relations(pool, id).await?;
 
     Ok(Some(Release {
-        id: gid.to_string(),
+        id: row.try_get::<Uuid, _>("gid")?.to_string(),
         title: row.try_get("name")?,
         date,
         score: None,
@@ -1049,7 +1089,7 @@ async fn load_release_group_releases(
 // ── Recording search ──────────────────────────────────────
 
 /// `GET /ws/2/recording?query=recording:".." AND artist:".."&inc=releases+...+media`
-#[tracing::instrument(skip_all, fields(search.query = title, search.artist = artist.unwrap_or_default(), search.limit = limit, search.offset = offset), err(level = "info"))]
+#[tracing::instrument(skip_all, fields(search.query = title, search.artist = artist.unwrap_or_default(), search.limit = limit, search.offset = offset, search.timed_out = tracing::field::Empty), err(level = "info"))]
 pub async fn search_recordings(
     pool: &PgPool,
     title: &str,
@@ -1065,24 +1105,32 @@ pub async fn search_recordings(
     // handful of rows containing every query word before ranking.
     let mut conn = pool.acquire().await?;
     configure_search_session(&mut conn, threshold, work_mem).await?;
-    let mut rows = sqlx::query(queries::SEARCH_RECORDINGS)
-        .bind(title)
-        .bind(artist)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&mut *conn)
-        .await?;
-    if rows.is_empty() {
-        rows = fetch_fuzzy(
-            sqlx::query(queries::SEARCH_RECORDINGS_FUZZY)
-                .bind(title)
-                .bind(artist)
-                .bind(limit)
-                .bind(offset),
-            &mut conn,
-        )
-        .await?;
-    }
+    // Title-only recording searches get no trigram fallback: a `%` scan of the
+    // recording table can run for minutes past its statement_timeout.
+    let rows = match scoping_artist(artist) {
+        Some(artist) => {
+            fetch_bounded(
+                sqlx::query(queries::SEARCH_RECORDINGS_BY_ARTIST)
+                    .bind(title)
+                    .bind(artist)
+                    .bind(limit)
+                    .bind(offset),
+                &mut conn,
+            )
+            .await?
+        }
+        None => {
+            fetch_bounded(
+                sqlx::query(queries::SEARCH_RECORDINGS)
+                    .bind(title)
+                    .bind(artist)
+                    .bind(limit)
+                    .bind(offset),
+                &mut conn,
+            )
+            .await?
+        }
+    };
     drop(conn);
     let total = total_from(&rows);
 
@@ -1137,7 +1185,7 @@ pub async fn lookup_recording(pool: &PgPool, gid: Uuid) -> Result<Option<Recordi
     let releases = releases_map.remove(&rec_id).unwrap_or_default();
 
     Ok(Some(Recording {
-        id: gid.to_string(),
+        id: row.try_get::<Uuid, _>("gid")?.to_string(),
         title: row.try_get("name")?,
         length: row.try_get("length").ok(),
         score: None,
@@ -1221,6 +1269,15 @@ pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searches_scope_to_a_named_artist_except_various_artists() {
+        assert_eq!(scoping_artist(Some(" The Cardigans ")), Some("The Cardigans"));
+        assert_eq!(scoping_artist(Some("Various Artists")), None);
+        assert_eq!(scoping_artist(Some("various artists")), None);
+        assert_eq!(scoping_artist(Some("  ")), None);
+        assert_eq!(scoping_artist(None), None);
+    }
 
     fn uuid(n: u128) -> Uuid {
         Uuid::from_u128(n)

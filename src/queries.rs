@@ -10,6 +10,48 @@
 //! example values, whether the query needs a trigram search session) so the page
 //! is runnable out of the box.
 
+/// The artist credits an artist-qualified search is scoped to: the 20 credits
+/// most similar to the artist (`$2`) among its full-text matches, or among its
+/// trigram matches when full text finds none (typo'd artist).
+macro_rules! artist_credits_cte {
+    () => {
+        r"
+        WITH fts AS MATERIALIZED (
+            SELECT ac.id, ac.name FROM musicbrainz.artist_credit ac
+            WHERE musicbrainz.mb_simple_tsvector(ac.name::text)
+                  @@ plainto_tsquery('musicbrainz.mb_simple', musicbrainz.mb_lower($2))
+            ORDER BY similarity(ac.name, $2) DESC, ac.id
+            LIMIT 20
+        ),
+        trg AS MATERIALIZED (
+            SELECT ac.id, ac.name FROM musicbrainz.artist_credit ac
+            WHERE NOT EXISTS (SELECT 1 FROM fts) AND ac.name % $2
+            ORDER BY similarity(ac.name, $2) DESC, ac.id
+            LIMIT 20
+        ),
+        credits AS (SELECT id, name FROM fts UNION ALL SELECT id, name FROM trg)"
+    };
+}
+
+/// A title (`$1`) matching `{col}` by whole words, trigram similarity, or as a
+/// word sequence inside a longer title ("Best Of" in "The Best of …").
+macro_rules! title_matches {
+    ($col:literal) => {
+        concat!(
+            "(to_tsvector('simple', musicbrainz.f_unaccent(",
+            $col,
+            "))
+                 @@ websearch_to_tsquery('simple', musicbrainz.f_unaccent($1))
+             OR similarity(musicbrainz.f_unaccent(",
+            $col,
+            "), musicbrainz.f_unaccent($1)) >= show_limit()
+             OR word_similarity(musicbrainz.f_unaccent($1), musicbrainz.f_unaccent(",
+            $col,
+            ")) >= show_limit())"
+        )
+    };
+}
+
 // ── SQL statements (shared with repo.rs / search.rs) ──────────
 
 // MusicBrainz mirror — search entry points
@@ -183,6 +225,41 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
         LIMIT $4 OFFSET $7
         ";
 
+// Artist-qualified release search: scoped to the artist's credits first, so a
+// common title ("Best Of") never ranks the whole release table. $1 title,
+// $2 artist, $3 year, $4 limit, $5 primary type, $6 status, $7 offset.
+pub const SEARCH_RELEASES_BY_ARTIST: &str = concat!(
+    artist_credits_cte!(),
+    r"
+        SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
+               similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))::real AS title_score,
+               COUNT(*) OVER ()::bigint AS total
+        FROM musicbrainz.release r
+        JOIN credits ac ON ac.id = r.artist_credit
+        WHERE r.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+          AND ",
+    title_matches!("r.name"),
+    r"
+          AND ($3::int IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_country rc
+                WHERE rc.release = r.id AND rc.date_year = $3
+                UNION ALL
+                SELECT 1 FROM musicbrainz.release_unknown_country ruc
+                WHERE ruc.release = r.id AND ruc.date_year = $3))
+          AND ($5::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_group rg
+                JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
+                WHERE rg.id = r.release_group AND lower(rgpt.name) = lower($5)))
+          AND ($6::text IS NULL OR EXISTS (
+                SELECT 1 FROM musicbrainz.release_status rs
+                WHERE rs.id = r.status AND lower(rs.name) = lower($6)))
+        ORDER BY (similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))
+                  + similarity(ac.name, $2) * 0.5::real) DESC,
+                 r.id ASC
+        LIMIT $4 OFFSET $7
+        "
+);
+
 pub const SEARCH_RECORDINGS: &str = r"
         SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
                similarity(musicbrainz.f_unaccent(c.name), musicbrainz.f_unaccent($1))::real AS title_score,
@@ -204,26 +281,27 @@ pub const SEARCH_RECORDINGS: &str = r"
         LIMIT $3 OFFSET $4
         ";
 
-// Trigram fallback for SEARCH_RECORDINGS (see SEARCH_RELEASES_FUZZY).
-pub const SEARCH_RECORDINGS_FUZZY: &str = r"
-        SELECT c.id, c.gid, c.name, c.length, c.artist_credit,
-               similarity(c.name, $1)::real AS title_score,
+// Artist-qualified recording search, scoped like SEARCH_RELEASES_BY_ARTIST: the
+// recording table is far too large to rank by title first. $1 title, $2 artist,
+// $3 limit, $4 offset.
+pub const SEARCH_RECORDINGS_BY_ARTIST: &str = concat!(
+    artist_credits_cte!(),
+    r"
+        SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
+               similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
-        FROM (
-            SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
-                   CASE WHEN $2::text IS NULL THEN NULL
-                        ELSE (SELECT ac.name FROM musicbrainz.artist_credit ac
-                              WHERE ac.id = rec.artist_credit) END AS ac_name
-            FROM musicbrainz.recording rec
-            WHERE rec.name % $1
-        ) c
-        WHERE ($2::text IS NULL OR c.ac_name % $2)
-        ORDER BY (similarity(c.name, $1)
-                  + CASE WHEN $2::text IS NULL THEN 0::real
-                         ELSE COALESCE(similarity(c.ac_name, $2), 0::real) * 0.5::real END) DESC,
-                 c.id ASC
+        FROM musicbrainz.recording rec
+        JOIN credits ac ON ac.id = rec.artist_credit
+        WHERE rec.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+          AND ",
+    title_matches!("rec.name"),
+    r"
+        ORDER BY (similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))
+                  + similarity(ac.name, $2) * 0.5::real) DESC,
+                 rec.id ASC
         LIMIT $3 OFFSET $4
-        ";
+        "
+);
 
 pub const BROWSE_RELEASES_BY_ARTIST: &str = r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
@@ -280,13 +358,17 @@ pub const LOOKUP_ARTIST: &str = r"
         SELECT a.id, a.gid, a.name, a.sort_name, a.comment, at.name AS type_name
         FROM musicbrainz.artist a
         LEFT JOIN musicbrainz.artist_type at ON at.id = a.type
-        WHERE a.gid = $1
+        WHERE a.id = COALESCE(
+            (SELECT id FROM musicbrainz.artist WHERE gid = $1),
+            (SELECT new_id FROM musicbrainz.artist_gid_redirect WHERE gid = $1))
         ";
 
 pub const LOOKUP_RELEASE: &str = r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group
         FROM musicbrainz.release r
-        WHERE r.gid = $1
+        WHERE r.id = COALESCE(
+            (SELECT id FROM musicbrainz.release WHERE gid = $1),
+            (SELECT new_id FROM musicbrainz.release_gid_redirect WHERE gid = $1))
         ";
 
 pub const LOOKUP_RELEASE_GROUP: &str = r"
@@ -298,13 +380,17 @@ pub const LOOKUP_RELEASE_GROUP: &str = r"
         FROM musicbrainz.release_group rg
         LEFT JOIN musicbrainz.release_group_primary_type rgpt ON rgpt.id = rg.type
         LEFT JOIN musicbrainz.release_group_meta rgm ON rgm.id = rg.id
-        WHERE rg.gid = $1
+        WHERE rg.id = COALESCE(
+            (SELECT id FROM musicbrainz.release_group WHERE gid = $1),
+            (SELECT new_id FROM musicbrainz.release_group_gid_redirect WHERE gid = $1))
         ";
 
 pub const LOOKUP_RECORDING: &str = r"
         SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit
         FROM musicbrainz.recording rec
-        WHERE rec.gid = $1
+        WHERE rec.id = COALESCE(
+            (SELECT id FROM musicbrainz.recording WHERE gid = $1),
+            (SELECT new_id FROM musicbrainz.recording_gid_redirect WHERE gid = $1))
         ";
 
 // MusicBrainz mirror — batched hydration
@@ -742,6 +828,23 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
+            id: "search_releases_by_artist",
+            title: "Release search scoped to an artist",
+            endpoint: "GET /ws/2/release (artist:)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: SEARCH_RELEASES_BY_ARTIST,
+            params: vec![
+                p("title", Text, "ok computer"),
+                p("artist", Text, "radiohead"),
+                pn("year", Int, ""),
+                p("limit", BigInt, "25"),
+                pn("primarytype", Text, ""),
+                pn("status", Text, ""),
+                p("offset", BigInt, "0"),
+            ],
+        },
+        QuerySpec {
             id: "search_releases",
             title: "Release search (FTS)",
             endpoint: "GET /ws/2/release",
@@ -790,15 +893,15 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
-            id: "search_recordings_fuzzy",
-            title: "Recording search (trigram fallback)",
-            endpoint: "GET /ws/2/recording (fallback)",
+            id: "search_recordings_by_artist",
+            title: "Recording search scoped to an artist",
+            endpoint: "GET /ws/2/recording (artist:)",
             db: TargetDb::Musicbrainz,
             trigram: true,
-            sql: SEARCH_RECORDINGS_FUZZY,
+            sql: SEARCH_RECORDINGS_BY_ARTIST,
             params: vec![
                 p("title", Text, "paranoid android"),
-                pn("artist", Text, ""),
+                p("artist", Text, "radiohead"),
                 p("limit", BigInt, "25"),
                 p("offset", BigInt, "0"),
             ],
