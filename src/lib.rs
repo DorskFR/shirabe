@@ -18,15 +18,13 @@ pub mod repo;
 pub mod search;
 pub mod search_cache;
 pub mod sources;
+pub mod telemetry;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
 use sqlx::PgPool;
-use tower_http::LatencyUnit;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::Level;
 
 use crate::config::Config;
 use crate::db::Pools;
@@ -72,7 +70,16 @@ impl AppState {
 }
 
 /// Run a single source's `refresh()` and exit non-zero on failure or unknown id.
+#[tracing::instrument(
+    name = "shirabe.sync",
+    skip_all,
+    fields(sync.source = source, otel.status_code, otel.status_description)
+)]
 pub async fn run_sync(registry: &Registry, source: &str) -> anyhow::Result<()> {
+    telemetry::traced_result(sync_source(registry, source).await)
+}
+
+async fn sync_source(registry: &Registry, source: &str) -> anyhow::Result<()> {
     tracing::info!(source, "running sync");
     match registry.run_refresh(source).await {
         Some(report) if report.ok => {
@@ -171,16 +178,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     app.fallback(error::no_such_route)
         .method_not_allowed_fallback(error::method_not_allowed)
-        // One INFO access-log line per request (method, uri, status, latency ms),
-        // visible at the default `RUST_LOG=info`.
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-                .on_request(())
-                .on_response(
-                    DefaultOnResponse::new().level(Level::INFO).latency_unit(LatencyUnit::Millis),
-                ),
-        )
+        .layer(telemetry::server::trace_layer())
         .with_state(state)
 }
 
@@ -251,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_log_is_one_info_line_with_status_and_latency() {
+    async fn access_log_is_one_info_line_without_the_query_string() {
         use tracing_subscriber::prelude::*;
         let capture = Capture::default();
         let subscriber = tracing_subscriber::registry()
@@ -260,21 +258,23 @@ mod tests {
         subscriber.try_init().expect("no other global subscriber in the lib test binary");
 
         let app = build_router(test_state());
-        let req = Request::builder().uri("/access-log-probe").body(Body::empty()).unwrap();
+        let req =
+            Request::builder().uri("/access-log-probe?api_key=sekrit").body(Body::empty()).unwrap();
         let status = app.oneshot(req).await.unwrap().status();
 
         let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = out
             .lines()
-            .filter(|l| l.contains("tower_http") && l.contains("uri=/access-log-probe"))
+            .filter(|l| l.contains("shirabe::access") && l.contains("url.path=/access-log-probe"))
             .collect();
         assert_eq!(lines.len(), 1, "expected one access-log line, got:\n{out}");
         let line = lines[0];
         assert!(line.contains(" INFO "), "{line}");
-        assert!(line.contains("method=GET"), "{line}");
+        assert!(line.contains("http.request.method=GET"), "{line}");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(line.contains("status=404"), "{line}");
         assert!(line.contains(" ms"), "{line}");
+        assert!(!out.contains("sekrit"), "query string leaked into logs:\n{out}");
     }
 
     /// Every provider alias must reach a handler (non-404), proving the route is

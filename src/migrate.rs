@@ -86,6 +86,12 @@ fn db_url<'a>(config: &'a Config, db: &str) -> Option<&'a str> {
 /// Apply one database's embedded migration SQL against its configured pool.
 /// Errors (and the caller exits non-zero) when the db id is unknown, its URL is
 /// unset, or the connection / SQL fails.
+#[tracing::instrument(
+    name = "shirabe.migrate.migrate_one",
+    skip_all,
+    fields(db),
+    err(level = "info")
+)]
 async fn migrate_one(config: &Config, db: &str) -> anyhow::Result<()> {
     let files = embedded_sql(db).ok_or_else(|| {
         anyhow::anyhow!("unknown db `{db}`; known: {}, musicbrainz", MIGRATABLE.join(", "))
@@ -117,6 +123,7 @@ async fn apply_sql(pool: &PgPool, sql: &'static str) -> Result<(), sqlx::Error> 
 /// Entry point for `shirabe migrate <db>`. `all` migrates every writable DB whose
 /// URL is configured (absent pools are skipped with a log line); a single db id
 /// migrates exactly that one (erroring if its URL is unset).
+#[tracing::instrument(name = "shirabe.migrate.run", skip_all, fields(db), err(level = "info"))]
 pub async fn run(config: &Config, db: &str) -> anyhow::Result<()> {
     if db == "all" {
         let mut applied = 0u32;

@@ -166,6 +166,7 @@ impl ImdbIndexSource {
 /// `(name, indisvalid)` for the expected indexes that exist in `public`.
 /// Validity matters: a failed `CREATE INDEX CONCURRENTLY` leaves an INVALID
 /// index behind, which the planner ignores but `IF NOT EXISTS` still skips.
+#[tracing::instrument(name = "shirabe.imdb_index.existing_indexes", skip_all, fields(batch.size = expected.len()), err(level = "info"))]
 async fn existing_indexes(
     pool: &PgPool,
     expected: &[IndexDef],
@@ -194,6 +195,7 @@ impl Source for ImdbIndexSource {
         IngestMode::IndexMaintenance
     }
 
+    #[tracing::instrument(name = "shirabe.imdb_index.refresh", skip_all, fields(sync.source = self.id()))]
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
         let Some(pool) = ctx.pools.imdb.as_ref() else {
             return RefreshReport::failed(

@@ -36,6 +36,7 @@ use tokio::sync::RwLock;
 
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
 use crate::config::Config;
+use crate::telemetry::client::TracedSend;
 
 /// A bearer token obtained from TheTVDB `/login`, with the wall-clock second at
 /// which we consider it expired. TheTVDB tokens live ~1 month; we refresh ahead of
@@ -133,6 +134,11 @@ impl TokenStore {
     }
 
     /// Acquire the write lock, log in against TheTVDB, and store the new token.
+    #[tracing::instrument(
+        name = "shirabe.tvdb_source.refresh_locked",
+        skip_all,
+        err(level = "info")
+    )]
     async fn refresh_locked(&self, config: &Config) -> Result<String, String> {
         let key = config
             .tvdb_api_key
@@ -157,6 +163,7 @@ impl TokenStore {
 
 /// Perform a `POST {base}/login {apikey, pin}` against TheTVDB and return the
 /// bearer token. Network/parse failures surface as an error string.
+#[tracing::instrument(name = "shirabe.tvdb_source.login", skip_all, err(level = "info"))]
 async fn login(base: &str, apikey: &str, pin: Option<&str>) -> Result<String, String> {
     let client = crate::http::client_builder()
         .user_agent(concat!("shirabe/", env!("CARGO_PKG_VERSION")))
@@ -171,12 +178,12 @@ async fn login(base: &str, apikey: &str, pin: Option<&str>) -> Result<String, St
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
-        .send()
+        .send_traced()
         .await
-        .map_err(|e| format!("tvdb login request: {e}"))?
+        .map_err(|e| format!("tvdb login request: {}", e.without_url()))?
         .error_for_status()
-        .map_err(|e| format!("tvdb login status: {e}"))?;
-    let bytes = resp.bytes().await.map_err(|e| format!("tvdb login body: {e}"))?;
+        .map_err(|e| format!("tvdb login status: {}", e.without_url()))?;
+    let bytes = resp.bytes().await.map_err(|e| format!("tvdb login body: {}", e.without_url()))?;
     let parsed: LoginResponse =
         serde_json::from_slice(&bytes).map_err(|e| format!("tvdb login json: {e}"))?;
     Ok(parsed.data.token)
@@ -215,6 +222,7 @@ impl Source for TvdbSource {
     /// probe: when a key is configured it verifies a login can be obtained;
     /// otherwise it records that the source is unconfigured (not an error — the
     /// operator simply has not supplied a key yet).
+    #[tracing::instrument(name = "shirabe.tvdb_source.refresh", skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, _ctx: &RefreshCtx) -> RefreshReport {
         if self.config.tvdb_api_key.is_none() {
             return RefreshReport::ok(

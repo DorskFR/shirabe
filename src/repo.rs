@@ -40,6 +40,7 @@ fn dedup_ids(mut ids: Vec<i32>) -> Vec<i32> {
 /// nothing). Bounded by the session `statement_timeout` (SHIB-19); a pathological
 /// common-token fallback that hits the cap yields no rows (SQLSTATE 57014) rather
 /// than erroring the whole request — the FTS primary already returned none.
+#[tracing::instrument(name = "shirabe.repo.fetch_fuzzy", skip_all, err(level = "info"))]
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PgConnection,
@@ -68,6 +69,7 @@ async fn fetch_fuzzy(
 
 /// Aliases for many artists at once, keyed by artist id, preserving `id ASC`
 /// order within each artist (matches the per-row loader).
+#[tracing::instrument(name = "shirabe.repo.batch_artist_aliases", skip_all, fields(batch.size = artist_ids.len()), err(level = "info"))]
 async fn batch_artist_aliases(
     pool: &PgPool,
     artist_ids: &[i32],
@@ -90,6 +92,7 @@ async fn batch_artist_aliases(
 /// `artist_credit` id and preserving `position ASC` order within each credit.
 /// When `with_aliases` is set, each artist's aliases are batched in one extra
 /// query and attached (recording credits carry aliases per the contract).
+#[tracing::instrument(name = "shirabe.repo.batch_artist_credits", skip_all, fields(batch.size = ac_ids.len(), with_aliases), err(level = "info"))]
 async fn batch_artist_credits(
     pool: &PgPool,
     ac_ids: &[i32],
@@ -126,6 +129,7 @@ async fn batch_artist_credits(
 }
 
 /// Release-groups for many rg ids at once, keyed by rg id.
+#[tracing::instrument(name = "shirabe.repo.batch_release_groups", skip_all, fields(batch.size = rg_ids.len()), err(level = "info"))]
 async fn batch_release_groups(
     pool: &PgPool,
     rg_ids: &[i32],
@@ -147,6 +151,7 @@ async fn batch_release_groups(
 }
 
 /// Secondary-type names for many release groups at once, keyed by rg id.
+#[tracing::instrument(name = "shirabe.repo.batch_release_group_secondary_types", skip_all, fields(batch.size = rg_ids.len()), err(level = "info"))]
 async fn batch_release_group_secondary_types(
     pool: &PgPool,
     rg_ids: &[i32],
@@ -168,6 +173,7 @@ async fn batch_release_group_secondary_types(
 
 /// Collapsed release dates for many releases at once, keyed by release id.
 /// Missing releases are simply absent (callers default to "").
+#[tracing::instrument(name = "shirabe.repo.batch_release_dates", skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
 async fn batch_release_dates(
     pool: &PgPool,
     release_ids: &[i32],
@@ -198,6 +204,7 @@ fn collapse_dates(events: HashMap<i32, Vec<DateEvent>>) -> HashMap<i32, String> 
 
 /// Release status names for many releases at once, keyed by release id (absent
 /// when the release has no status → caller emits `None`).
+#[tracing::instrument(name = "shirabe.repo.batch_release_statuses", skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
 async fn batch_release_statuses(
     pool: &PgPool,
     release_ids: &[i32],
@@ -216,6 +223,7 @@ async fn batch_release_statuses(
 }
 
 /// Non-empty release disambiguation comments for many releases at once.
+#[tracing::instrument(name = "shirabe.repo.batch_release_comments", skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
 async fn batch_release_comments(
     pool: &PgPool,
     release_ids: &[i32],
@@ -237,6 +245,7 @@ async fn batch_release_comments(
 }
 
 /// Summed medium track-counts for many releases at once (absent when 0).
+#[tracing::instrument(name = "shirabe.repo.batch_release_track_counts", skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
 async fn batch_release_track_counts(
     pool: &PgPool,
     release_ids: &[i32],
@@ -312,6 +321,7 @@ fn media_to_model(data: Vec<MediaData>) -> Vec<Medium> {
 
 /// Tracks for many media at once, keyed by medium id and preserving
 /// `position ASC` order. Track-level artist credits are batched in one query.
+#[tracing::instrument(name = "shirabe.repo.batch_tracks", skip_all, fields(batch.size = medium_ids.len()), err(level = "info"))]
 async fn batch_tracks(
     pool: &PgPool,
     medium_ids: &[i32],
@@ -349,6 +359,7 @@ async fn batch_tracks(
 
 /// Media (with tracks) for many releases at once, keyed by release id and
 /// preserving `position ASC` order within each release.
+#[tracing::instrument(name = "shirabe.repo.batch_media", skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
 async fn batch_media(
     pool: &PgPool,
     release_ids: &[i32],
@@ -386,6 +397,7 @@ async fn batch_media(
 /// `GET /ws/2/artist?query=<name>&inc=aliases`
 ///
 /// Trigram-ranks artists by name / sort-name and attaches their aliases.
+#[tracing::instrument(name = "shirabe.repo.search_artists", skip_all, fields(search.query = name, search.limit = limit, search.offset = offset), err(level = "info"))]
 pub async fn search_artists(
     pool: &PgPool,
     name: &str,
@@ -454,6 +466,7 @@ pub struct ArtistIncludes {
 }
 
 /// `GET /ws/2/artist/{mbid}[?inc=url-rels+genres+tags+annotation]`
+#[tracing::instrument(name = "shirabe.repo.lookup_artist", skip_all, fields(mb.mbid = %gid), err(level = "info"))]
 pub async fn lookup_artist(
     pool: &PgPool,
     gid: Uuid,
@@ -595,6 +608,7 @@ pub struct ReleaseFilters<'a> {
 }
 
 /// `GET /ws/2/release?query=release:(..) AND artist:(..) [AND date:(YYYY*)]`
+#[tracing::instrument(name = "shirabe.repo.search_releases", skip_all, fields(search.query = title, search.limit = limit, search.offset = offset), err(level = "info"))]
 pub async fn search_releases(
     pool: &PgPool,
     title: &str,
@@ -643,6 +657,7 @@ pub async fn search_releases(
 }
 
 /// `GET /ws/2/release?query=arid:{mbid} [AND primarytype:.. AND status:..]`
+#[tracing::instrument(name = "shirabe.repo.browse_releases_by_artist", skip_all, fields(mb.artist_mbid = %artist_gid, search.limit = limit, search.offset = offset), err(level = "info"))]
 pub async fn browse_releases_by_artist(
     pool: &PgPool,
     artist_gid: Uuid,
@@ -702,6 +717,7 @@ fn assemble_release(seed: ReleaseSeed, media: Vec<Medium>, maps: &ReleaseMaps) -
     }
 }
 
+#[tracing::instrument(name = "shirabe.repo.hydrate_release_search_rows", skip_all, fields(batch.size = rows.len()), err(level = "info"))]
 async fn hydrate_release_search_rows(
     pool: &PgPool,
     rows: Vec<PgRow>,
@@ -778,6 +794,7 @@ async fn load_release_comment(
 // ── Release lookup (full) ─────────────────────────────────
 
 /// `GET /ws/2/release/{mbid}?inc=...media+recordings+...rels`
+#[tracing::instrument(name = "shirabe.repo.lookup_release", skip_all, fields(mb.mbid = %gid), err(level = "info"))]
 pub async fn lookup_release(pool: &PgPool, gid: Uuid) -> Result<Option<Release>, sqlx::Error> {
     let Some(row) = sqlx::query(queries::LOOKUP_RELEASE).bind(gid).fetch_optional(pool).await?
     else {
@@ -904,6 +921,7 @@ fn first_release_date(row: &PgRow) -> String {
     .render()
 }
 
+#[tracing::instrument(name = "shirabe.repo.hydrate_release_groups", skip_all, fields(batch.size = rows.len()), err(level = "info"))]
 async fn hydrate_release_groups(
     pool: &PgPool,
     rows: Vec<PgRow>,
@@ -939,6 +957,7 @@ async fn hydrate_release_groups(
 ///
 /// Returns `(total, page)`: the full count for the artist plus one stable page
 /// ordered by first-release-date then gid.
+#[tracing::instrument(name = "shirabe.repo.browse_release_groups", skip_all, fields(mb.artist_mbid = %artist_gid, search.limit = limit, search.offset = offset), err(level = "info"))]
 pub async fn browse_release_groups(
     pool: &PgPool,
     artist_gid: Uuid,
@@ -967,6 +986,7 @@ pub struct ReleaseGroupIncludes {
 }
 
 /// `GET /ws/2/release-group/{mbid}?inc=artist-credits+releases[+genres+tags]`
+#[tracing::instrument(name = "shirabe.repo.lookup_release_group", skip_all, fields(mb.mbid = %gid), err(level = "info"))]
 pub async fn lookup_release_group(
     pool: &PgPool,
     gid: Uuid,
@@ -1029,6 +1049,7 @@ async fn load_release_group_releases(
 // ── Recording search ──────────────────────────────────────
 
 /// `GET /ws/2/recording?query=recording:".." AND artist:".."&inc=releases+...+media`
+#[tracing::instrument(name = "shirabe.repo.search_recordings", skip_all, fields(search.query = title, search.artist = artist.unwrap_or_default(), search.limit = limit, search.offset = offset), err(level = "info"))]
 pub async fn search_recordings(
     pool: &PgPool,
     title: &str,
@@ -1101,6 +1122,7 @@ pub async fn search_recordings(
 // ── Recording lookup ──────────────────────────────────────
 
 /// `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases`
+#[tracing::instrument(name = "shirabe.repo.lookup_recording", skip_all, fields(mb.mbid = %gid), err(level = "info"))]
 pub async fn lookup_recording(pool: &PgPool, gid: Uuid) -> Result<Option<Recording>, sqlx::Error> {
     let Some(row) = sqlx::query(queries::LOOKUP_RECORDING).bind(gid).fetch_optional(pool).await?
     else {
@@ -1135,6 +1157,7 @@ pub async fn lookup_recording(pool: &PgPool, gid: Uuid) -> Result<Option<Recordi
 /// groups, dates, statuses, comments, track-counts, and media/tracks when
 /// requested). A release shared by several recordings is materialised into a
 /// fresh `Release` per occurrence from the shared in-memory maps.
+#[tracing::instrument(name = "shirabe.repo.batch_recording_releases", skip_all, fields(batch.size = recording_ids.len(), with_media), err(level = "info"))]
 async fn batch_recording_releases(
     pool: &PgPool,
     recording_ids: &[i32],
@@ -1190,6 +1213,7 @@ async fn batch_recording_releases(
 }
 
 /// Cheap connectivity probe used by the health endpoint.
+#[tracing::instrument(name = "shirabe.repo.ping", skip_all, err(level = "info"))]
 pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(queries::PING).execute(pool).await.map(|_| ())
 }

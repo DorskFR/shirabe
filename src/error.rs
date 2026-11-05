@@ -34,6 +34,25 @@ pub enum ApiError {
     Unauthorized,
 }
 
+impl ApiError {
+    /// A 5xx response: the only kind that fails a span.
+    #[must_use]
+    pub const fn is_server_error(&self) -> bool {
+        matches!(self, Self::Database(_))
+    }
+}
+
+/// Marks the current span failed when `result` is a 5xx-class error, then
+/// returns it; 4xx outcomes are expected and leave the span unset.
+pub fn traced<T>(result: ApiResult<T>) -> ApiResult<T> {
+    if let Err(err) = &result
+        && err.is_server_error()
+    {
+        crate::telemetry::record_error(&tracing::Span::current(), err);
+    }
+    result
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -120,6 +139,33 @@ mod tests {
         let (status, body) = parts(ApiError::Unauthorized.into_response()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], "unauthorized");
+    }
+
+    #[test]
+    fn only_database_errors_fail_the_span() {
+        use opentelemetry::trace::Status;
+
+        use crate::telemetry::testing::Capture;
+
+        let capture = Capture::install();
+        let span = |name: &'static str| {
+            tracing::info_span!(
+                "shirabe.api",
+                otel.name = name,
+                otel.status_code = tracing::field::Empty,
+                otel.status_description = tracing::field::Empty,
+            )
+        };
+        {
+            let _enter = span("shirabe.db_error").entered();
+            let _ = traced::<()>(Err(ApiError::Database(sqlx::Error::RowNotFound)));
+        }
+        {
+            let _enter = span("shirabe.not_found").entered();
+            let _ = traced::<()>(Err(ApiError::NotFound));
+        }
+        assert!(matches!(capture.named("shirabe.db_error")[0].status, Status::Error { .. }));
+        assert_eq!(capture.named("shirabe.not_found")[0].status, Status::Unset);
     }
 
     #[test]

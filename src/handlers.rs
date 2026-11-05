@@ -10,9 +10,11 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::Span;
+use tracing::field::Empty;
 use uuid::Uuid;
 
-use crate::error::{ApiError, ApiQuery, ApiResult};
+use crate::error::{ApiError, ApiQuery, ApiResult, traced};
 use crate::models::{
     ArtistSearchResponse, RecordingSearchResponse, ReleaseGroupBrowseResponse,
     ReleaseSearchResponse,
@@ -75,117 +77,190 @@ where
     Ok(json_response(body))
 }
 
+/// Record the resolved paging of a search on the handler span.
+fn record_paging(span: &Span, query: &str, limit: i64, offset: i64) {
+    span.record("search.query", query);
+    span.record("search.limit", limit);
+    span.record("search.offset", offset);
+}
+
 /// `GET /ws/2/artist`
+#[tracing::instrument(
+    name = "shirabe.ws2.search_artist",
+    skip_all,
+    fields(
+        mb.entity = "artist",
+        search.query = Empty,
+        search.limit = Empty,
+        search.offset = Empty,
+        result.count = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn search_artist(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Response> {
-    let raw = params.query.unwrap_or_default();
-    let parsed = query::parse(&raw);
-    // Artist endpoint: the name is the bare query (or an explicit artist:field).
-    let name = parsed
-        .bare
-        .or(parsed.artist)
-        .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
-    let limit = state.config.resolve_limit(params.limit);
-    let offset = resolve_offset(params.offset);
-    let key = SearchKey::new("artist", &raw, limit, offset, params.fmt.as_deref());
-    cached_search(&state, key, || async {
-        let (count, artists) = repo::search_artists(
-            state.pool(),
-            &name,
-            limit,
-            offset,
-            state.config.similarity_threshold,
-            &state.config.search_work_mem,
-        )
-        .await?;
-        Ok(ArtistSearchResponse { count, offset, artists })
-    })
-    .await
+    let span = Span::current();
+    traced(
+        async {
+            let raw = params.query.unwrap_or_default();
+            let parsed = query::parse(&raw);
+            // Artist endpoint: the name is the bare query (or an explicit artist:field).
+            let name = parsed
+                .bare
+                .or(parsed.artist)
+                .ok_or_else(|| ApiError::BadRequest("missing query".into()))?;
+            let limit = state.config.resolve_limit(params.limit);
+            let offset = resolve_offset(params.offset);
+            record_paging(&span, &raw, limit, offset);
+            let key = SearchKey::new("artist", &raw, limit, offset, params.fmt.as_deref());
+            cached_search(&state, key, || async {
+                let (count, artists) = repo::search_artists(
+                    state.pool(),
+                    &name,
+                    limit,
+                    offset,
+                    state.config.similarity_threshold,
+                    &state.config.search_work_mem,
+                )
+                .await?;
+                span.record("result.count", count);
+                Ok(ArtistSearchResponse { count, offset, artists })
+            })
+            .await
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/release`
+#[tracing::instrument(
+    name = "shirabe.ws2.search_release",
+    skip_all,
+    fields(
+        mb.entity = "release",
+        search.query = Empty,
+        search.limit = Empty,
+        search.offset = Empty,
+        search.browse_arid = Empty,
+        result.count = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn search_release(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Response> {
-    let raw = params.query.unwrap_or_default();
-    let parsed = query::parse(&raw);
-    let limit = state.config.resolve_limit(params.limit);
-    let offset = resolve_offset(params.offset);
-    let key = SearchKey::new("release", &raw, limit, offset, params.fmt.as_deref());
-    if let Some(arid) = parsed.arid.as_deref() {
-        let gid = parse_mbid(arid)?;
-        return cached_search(&state, key, || async {
-            let (count, releases) = repo::browse_releases_by_artist(
-                state.pool(),
-                gid,
-                parsed.primary_type.as_deref(),
-                parsed.status.as_deref(),
-                limit,
-                offset,
-            )
-            .await?;
-            Ok(ReleaseSearchResponse { count, offset, releases })
-        })
-        .await;
-    }
-    let title = parsed
-        .release
-        .clone()
-        .or_else(|| parsed.bare.clone())
-        .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
-    cached_search(&state, key, || async {
-        let (count, releases) = repo::search_releases(
-            state.pool(),
-            &title,
-            repo::ReleaseFilters {
-                artist: parsed.artist.as_deref(),
-                year: parsed.date_year.as_deref(),
-                primary_type: parsed.primary_type.as_deref(),
-                status: parsed.status.as_deref(),
-            },
-            limit,
-            offset,
-            state.config.similarity_threshold,
-            &state.config.search_work_mem,
-        )
-        .await?;
-        Ok(ReleaseSearchResponse { count, offset, releases })
-    })
-    .await
+    let span = Span::current();
+    traced(
+        async {
+            let raw = params.query.unwrap_or_default();
+            let parsed = query::parse(&raw);
+            let limit = state.config.resolve_limit(params.limit);
+            let offset = resolve_offset(params.offset);
+            record_paging(&span, &raw, limit, offset);
+            let key = SearchKey::new("release", &raw, limit, offset, params.fmt.as_deref());
+            if let Some(arid) = parsed.arid.as_deref() {
+                let gid = parse_mbid(arid)?;
+                span.record("search.browse_arid", tracing::field::display(gid));
+                return cached_search(&state, key, || async {
+                    let (count, releases) = repo::browse_releases_by_artist(
+                        state.pool(),
+                        gid,
+                        parsed.primary_type.as_deref(),
+                        parsed.status.as_deref(),
+                        limit,
+                        offset,
+                    )
+                    .await?;
+                    span.record("result.count", count);
+                    Ok(ReleaseSearchResponse { count, offset, releases })
+                })
+                .await;
+            }
+            let title = parsed
+                .release
+                .clone()
+                .or_else(|| parsed.bare.clone())
+                .ok_or_else(|| ApiError::BadRequest("missing release title".into()))?;
+            cached_search(&state, key, || async {
+                let (count, releases) = repo::search_releases(
+                    state.pool(),
+                    &title,
+                    repo::ReleaseFilters {
+                        artist: parsed.artist.as_deref(),
+                        year: parsed.date_year.as_deref(),
+                        primary_type: parsed.primary_type.as_deref(),
+                        status: parsed.status.as_deref(),
+                    },
+                    limit,
+                    offset,
+                    state.config.similarity_threshold,
+                    &state.config.search_work_mem,
+                )
+                .await?;
+                span.record("result.count", count);
+                Ok(ReleaseSearchResponse { count, offset, releases })
+            })
+            .await
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/recording`
+#[tracing::instrument(
+    name = "shirabe.ws2.search_recording",
+    skip_all,
+    fields(
+        mb.entity = "recording",
+        search.query = Empty,
+        search.limit = Empty,
+        search.offset = Empty,
+        result.count = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn search_recording(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Response> {
-    let raw = params.query.unwrap_or_default();
-    let parsed = query::parse(&raw);
-    let title = parsed
-        .recording
-        .clone()
-        .or_else(|| parsed.bare.clone())
-        .ok_or_else(|| ApiError::BadRequest("missing recording title".into()))?;
-    let limit = state.config.resolve_limit(params.limit);
-    let offset = resolve_offset(params.offset);
-    let key = SearchKey::new("recording", &raw, limit, offset, params.fmt.as_deref());
-    cached_search(&state, key, || async {
-        let (count, recordings) = repo::search_recordings(
-            state.pool(),
-            &title,
-            parsed.artist.as_deref(),
-            limit,
-            offset,
-            state.config.similarity_threshold,
-            &state.config.search_work_mem,
-        )
-        .await?;
-        Ok(RecordingSearchResponse { count, offset, recordings })
-    })
-    .await
+    let span = Span::current();
+    traced(
+        async {
+            let raw = params.query.unwrap_or_default();
+            let parsed = query::parse(&raw);
+            let title = parsed
+                .recording
+                .clone()
+                .or_else(|| parsed.bare.clone())
+                .ok_or_else(|| ApiError::BadRequest("missing recording title".into()))?;
+            let limit = state.config.resolve_limit(params.limit);
+            let offset = resolve_offset(params.offset);
+            record_paging(&span, &raw, limit, offset);
+            let key = SearchKey::new("recording", &raw, limit, offset, params.fmt.as_deref());
+            cached_search(&state, key, || async {
+                let (count, recordings) = repo::search_recordings(
+                    state.pool(),
+                    &title,
+                    parsed.artist.as_deref(),
+                    limit,
+                    offset,
+                    state.config.similarity_threshold,
+                    &state.config.search_work_mem,
+                )
+                .await?;
+                span.record("result.count", count);
+                Ok(RecordingSearchResponse { count, offset, recordings })
+            })
+            .await
+        }
+        .await,
+    )
 }
 
 fn resolve_offset(offset: Option<i64>) -> i64 {
@@ -216,72 +291,167 @@ fn release_group_includes(inc: Option<&str>) -> repo::ReleaseGroupIncludes {
 }
 
 /// `GET /ws/2/artist/{mbid}`
+#[tracing::instrument(
+    name = "shirabe.ws2.lookup_artist",
+    skip_all,
+    fields(
+        mb.entity = "artist",
+        mb.mbid = %mbid,
+        mb.inc = params.inc.as_deref().unwrap_or_default(),
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn lookup_artist(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<Value>> {
-    let gid = parse_mbid(&mbid)?;
-    let inc = artist_includes(params.inc.as_deref());
-    let artist = repo::lookup_artist(state.pool(), gid, inc).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::to_value(artist).expect("artist serializes")))
+    traced(
+        async {
+            let gid = parse_mbid(&mbid)?;
+            let inc = artist_includes(params.inc.as_deref());
+            let artist =
+                repo::lookup_artist(state.pool(), gid, inc).await?.ok_or(ApiError::NotFound)?;
+            Ok(Json(serde_json::to_value(artist).expect("artist serializes")))
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/release/{mbid}`
+#[tracing::instrument(
+    name = "shirabe.ws2.lookup_release",
+    skip_all,
+    fields(
+        mb.entity = "release",
+        mb.mbid = %mbid,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn lookup_release(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let gid = parse_mbid(&mbid)?;
-    let release = repo::lookup_release(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::to_value(release).expect("release serializes")))
+    traced(
+        async {
+            let gid = parse_mbid(&mbid)?;
+            let release =
+                repo::lookup_release(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
+            Ok(Json(serde_json::to_value(release).expect("release serializes")))
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/recording/{mbid}`
+#[tracing::instrument(
+    name = "shirabe.ws2.lookup_recording",
+    skip_all,
+    fields(
+        mb.entity = "recording",
+        mb.mbid = %mbid,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn lookup_recording(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let gid = parse_mbid(&mbid)?;
-    let recording = repo::lookup_recording(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::to_value(recording).expect("recording serializes")))
+    traced(
+        async {
+            let gid = parse_mbid(&mbid)?;
+            let recording =
+                repo::lookup_recording(state.pool(), gid).await?.ok_or(ApiError::NotFound)?;
+            Ok(Json(serde_json::to_value(recording).expect("recording serializes")))
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/release-group?artist={mbid}`
+#[tracing::instrument(
+    name = "shirabe.ws2.browse_release_group",
+    skip_all,
+    fields(
+        mb.entity = "release-group",
+        mb.artist_mbid = params.artist.as_deref().unwrap_or_default(),
+        search.limit = Empty,
+        search.offset = Empty,
+        result.count = Empty,
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn browse_release_group(
     State(state): State<Arc<AppState>>,
     ApiQuery(params): ApiQuery<BrowseParams>,
 ) -> ApiResult<Json<ReleaseGroupBrowseResponse>> {
-    let artist =
-        params.artist.as_deref().ok_or_else(|| ApiError::BadRequest("missing artist".into()))?;
-    let gid = parse_mbid(artist)?;
-    let limit = state.config.resolve_limit(params.limit);
-    let offset = resolve_offset(params.offset);
-    let (total, release_groups) =
-        repo::browse_release_groups(state.pool(), gid, limit, offset).await?;
-    Ok(Json(ReleaseGroupBrowseResponse {
-        release_group_count: total,
-        release_group_offset: offset,
-        release_groups,
-    }))
+    let span = Span::current();
+    traced(
+        async {
+            let artist = params
+                .artist
+                .as_deref()
+                .ok_or_else(|| ApiError::BadRequest("missing artist".into()))?;
+            let gid = parse_mbid(artist)?;
+            let limit = state.config.resolve_limit(params.limit);
+            let offset = resolve_offset(params.offset);
+            span.record("search.limit", limit);
+            span.record("search.offset", offset);
+            let (total, release_groups) =
+                repo::browse_release_groups(state.pool(), gid, limit, offset).await?;
+            span.record("result.count", total);
+            Ok(Json(ReleaseGroupBrowseResponse {
+                release_group_count: total,
+                release_group_offset: offset,
+                release_groups,
+            }))
+        }
+        .await,
+    )
 }
 
 /// `GET /ws/2/release-group/{mbid}`
+#[tracing::instrument(
+    name = "shirabe.ws2.lookup_release_group",
+    skip_all,
+    fields(
+        mb.entity = "release-group",
+        mb.mbid = %mbid,
+        mb.inc = params.inc.as_deref().unwrap_or_default(),
+        otel.status_code = Empty,
+        otel.status_description = Empty,
+    )
+)]
 pub async fn lookup_release_group(
     State(state): State<Arc<AppState>>,
     Path(mbid): Path<String>,
     ApiQuery(params): ApiQuery<SearchParams>,
 ) -> ApiResult<Json<Value>> {
-    let gid = parse_mbid(&mbid)?;
-    let inc = release_group_includes(params.inc.as_deref());
-    let group =
-        repo::lookup_release_group(state.pool(), gid, inc).await?.ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::to_value(group).expect("release group serializes")))
+    traced(
+        async {
+            let gid = parse_mbid(&mbid)?;
+            let inc = release_group_includes(params.inc.as_deref());
+            let group = repo::lookup_release_group(state.pool(), gid, inc)
+                .await?
+                .ok_or(ApiError::NotFound)?;
+            Ok(Json(serde_json::to_value(group).expect("release group serializes")))
+        }
+        .await,
+    )
 }
 
 /// `GET /health` and `GET /ws/2` ping.
+#[tracing::instrument(
+    name = "shirabe.ws2.health",
+    skip_all,
+    fields(otel.status_code = Empty, otel.status_description = Empty)
+)]
 pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
-    repo::ping(state.pool()).await?;
+    traced(repo::ping(state.pool()).await.map_err(ApiError::from))?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -292,6 +462,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> ApiResult<Json<Value>
 /// `shirabe sync <source>` CronJob runs), so a stale or errored source is obvious
 /// at a glance via the `healthy` rollup. Degrades gracefully when the writable
 /// shirabe pool is absent (reports only what live `health()` can determine).
+#[tracing::instrument(name = "shirabe.ws2.health_sources", skip_all)]
 pub async fn health_sources(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::sources::SourcesHealthReport> {
