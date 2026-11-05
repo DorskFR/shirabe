@@ -342,75 +342,49 @@ fn media_to_model(data: Vec<MediaData>) -> Vec<Medium> {
         .collect()
 }
 
-/// Tracks for many media at once, keyed by medium id and preserving
-/// `position ASC` order. Track-level artist credits are batched in one query.
-#[tracing::instrument(skip_all, fields(batch.size = medium_ids.len()), err(level = "info"))]
-async fn batch_tracks(
+/// Recording search media keyed by `(recording, release)`: only the media that
+/// hold the recording, each with only its track(s).
+#[tracing::instrument(skip_all, fields(batch.size = recording_ids.len()), err(level = "info"))]
+async fn batch_recording_media(
     pool: &PgPool,
-    medium_ids: &[i32],
-) -> Result<HashMap<i32, Vec<TrackData>>, sqlx::Error> {
-    let mut map: HashMap<i32, Vec<TrackData>> = HashMap::new();
-    if medium_ids.is_empty() {
+    recording_ids: &[i32],
+) -> Result<HashMap<(i32, i32), Vec<MediaData>>, sqlx::Error> {
+    let mut map: HashMap<(i32, i32), Vec<MediaData>> = HashMap::new();
+    if recording_ids.is_empty() {
         return Ok(map);
     }
-    let rows = sqlx::query(queries::BATCH_TRACKS).bind(medium_ids).fetch_all(pool).await?;
-
+    let rows =
+        sqlx::query(queries::BATCH_RECORDING_MEDIA).bind(recording_ids).fetch_all(pool).await?;
     let ac_ids =
         dedup_ids(rows.iter().filter_map(|r| r.try_get::<i32, _>("track_ac").ok()).collect());
     let ac_map = batch_artist_credits(pool, &ac_ids, false).await?;
 
     for r in rows {
-        let mid: i32 = r.try_get("mid")?;
-        let track_gid: Uuid = r.try_get("track_gid")?;
-        let rec_gid: Uuid = r.try_get("rec_gid")?;
-        let position: i32 = r.try_get("position")?;
+        let key = (r.try_get::<i32, _>("rec")?, r.try_get::<i32, _>("rel")?);
+        let mid: i32 = r.try_get("id")?;
         let track_ac: Option<i32> = r.try_get("track_ac").ok();
-        let artist_credit = track_ac.and_then(|ac| ac_map.get(&ac).cloned()).unwrap_or_default();
-        map.entry(mid).or_default().push(TrackData {
-            track_gid,
+        let track = TrackData {
+            track_gid: r.try_get("track_gid")?,
             track_name: r.try_get("track_name")?,
-            position,
+            position: r.try_get("track_position")?,
             number: r.try_get("number")?,
-            rec_gid,
+            rec_gid: r.try_get("rec_gid")?,
             rec_name: r.try_get("rec_name")?,
             rec_length: r.try_get("rec_length").ok(),
-            artist_credit,
-        });
-    }
-    Ok(map)
-}
-
-/// Media (with tracks) for many releases at once, keyed by release id and
-/// preserving `position ASC` order within each release.
-#[tracing::instrument(skip_all, fields(batch.size = release_ids.len()), err(level = "info"))]
-async fn batch_media(
-    pool: &PgPool,
-    release_ids: &[i32],
-) -> Result<HashMap<i32, Vec<MediaData>>, sqlx::Error> {
-    let mut map: HashMap<i32, Vec<MediaData>> = HashMap::new();
-    if release_ids.is_empty() {
-        return Ok(map);
-    }
-    let rows = sqlx::query(queries::BATCH_MEDIA).bind(release_ids).fetch_all(pool).await?;
-
-    let medium_ids: Vec<i32> = rows.iter().filter_map(|r| r.try_get::<i32, _>("id").ok()).collect();
-    let mut tracks_map = batch_tracks(pool, &medium_ids).await?;
-
-    for r in rows {
-        let rel: i32 = r.try_get("rel")?;
-        let mid: i32 = r.try_get("id")?;
-        let position: i32 = r.try_get("position")?;
-        let track_count: i32 = r.try_get("track_count")?;
-        let title: Option<String> = r.try_get::<String, _>("title").ok().filter(|s| !s.is_empty());
-        let tracks = tracks_map.remove(&mid).unwrap_or_default();
-        map.entry(rel).or_default().push(MediaData {
-            id: mid,
-            position,
-            track_count,
-            title,
-            format: r.try_get("format").ok(),
-            tracks,
-        });
+            artist_credit: track_ac.and_then(|ac| ac_map.get(&ac).cloned()).unwrap_or_default(),
+        };
+        let media = map.entry(key).or_default();
+        match media.last_mut() {
+            Some(medium) if medium.id == mid => medium.tracks.push(track),
+            _ => media.push(MediaData {
+                id: mid,
+                position: r.try_get("position")?,
+                track_count: r.try_get("track_count")?,
+                title: r.try_get::<String, _>("title").ok().filter(|s| !s.is_empty()),
+                format: r.try_get("format").ok(),
+                tracks: vec![track],
+            }),
+        }
     }
     Ok(map)
 }
@@ -741,11 +715,12 @@ struct ReleaseSeed {
 }
 
 fn assemble_release(seed: ReleaseSeed, media: Vec<Medium>, maps: &ReleaseMaps) -> Release {
-    let track_count = if media.is_empty() {
-        maps.track_counts.get(&seed.id).copied()
-    } else {
-        Some(media.iter().map(|m| m.track_count).sum())
-    };
+    // The batched total, since recording search carries only the matched media.
+    let track_count = maps
+        .track_counts
+        .get(&seed.id)
+        .copied()
+        .or_else(|| (!media.is_empty()).then(|| media.iter().map(|m| m.track_count).sum()));
     Release {
         id: seed.gid.to_string(),
         title: seed.title,
@@ -1229,10 +1204,8 @@ async fn batch_recording_releases(
     let rg_ids: Vec<i32> =
         rows.iter().filter_map(|r| r.try_get::<i32, _>("release_group").ok()).collect();
 
-    let media_map =
-        if with_media { batch_media(pool, &release_ids).await? } else { HashMap::new() };
-    // track-count derives from media when present; media-less releases (and the
-    // no-media lookup path) fall back to the summed medium track-counts.
+    let mut media_map =
+        if with_media { batch_recording_media(pool, recording_ids).await? } else { HashMap::new() };
     let maps = ReleaseMaps {
         artist_credits: batch_artist_credits(pool, &ac_ids, false).await?,
         release_groups: batch_release_groups(pool, &rg_ids).await?,
@@ -1253,11 +1226,7 @@ async fn batch_recording_releases(
             artist_credit_id: row.try_get("artist_credit")?,
             release_group_id: row.try_get("release_group").ok(),
         };
-        let media = if with_media {
-            media_to_model(media_map.get(&id).cloned().unwrap_or_default())
-        } else {
-            Vec::new()
-        };
+        let media = media_to_model(media_map.remove(&(rec, id)).unwrap_or_default());
         result.entry(rec).or_default().push(assemble_release(seed, media, &maps));
     }
     Ok(result)
@@ -1473,30 +1442,24 @@ mod tests {
     }
 
     #[test]
-    fn assemble_release_track_count_prefers_media_sum() {
-        let mut maps = empty_maps();
-        maps.track_counts.insert(7, 99);
-        let media = media_to_model(vec![
-            MediaData {
+    fn assemble_release_track_count_prefers_the_release_total() {
+        let media = || {
+            media_to_model(vec![MediaData {
                 id: 1,
-                position: 1,
-                track_count: 8,
-                title: None,
-                format: None,
-                tracks: vec![],
-            },
-            MediaData {
-                id: 2,
                 position: 2,
                 track_count: 5,
                 title: None,
                 format: None,
                 tracks: vec![],
-            },
-        ]);
+            }])
+        };
+        let mut maps = empty_maps();
+        maps.track_counts.insert(7, 13);
+        let rel = assemble_release(seed(7, 70, None), media(), &maps);
+        assert_eq!(rel.track_count, Some(13), "partial recording-search media keep the total");
 
-        let rel = assemble_release(seed(7, 70, None), media, &maps);
-        assert_eq!(rel.track_count, Some(13), "media sum wins over batched fallback");
+        let rel = assemble_release(seed(7, 70, None), media(), &empty_maps());
+        assert_eq!(rel.track_count, Some(5), "media sum when no total is known");
     }
 
     #[test]
