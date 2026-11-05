@@ -74,6 +74,38 @@ async fn fetch_fuzzy(
     rows
 }
 
+/// Trigram cutoff for resolving a typo'd artist: the session's looser title
+/// cutoff matches so many credits (anything with "the") that fetching them
+/// takes seconds.
+const CREDIT_SIMILARITY_THRESHOLD: f32 = 0.5;
+
+/// The credit ids an artist-qualified search is scoped to: full-text matches,
+/// else trigram matches under the fuzzy cap. `threshold` is the session's
+/// trigram cutoff, restored afterwards.
+#[tracing::instrument(skip_all, fields(credits.count = tracing::field::Empty, search.timed_out = tracing::field::Empty), err(level = "info"))]
+async fn resolve_artist_credits(
+    artist: &str,
+    threshold: f64,
+    conn: &mut PgConnection,
+) -> Result<Vec<i32>, sqlx::Error> {
+    let mut rows =
+        fetch_bounded(sqlx::query(queries::RESOLVE_ARTIST_CREDITS).bind(artist), conn).await?;
+    if rows.is_empty() {
+        sqlx::query("SELECT set_limit($1)")
+            .bind(CREDIT_SIMILARITY_THRESHOLD)
+            .execute(&mut *conn)
+            .await?;
+        let fuzzy =
+            fetch_fuzzy(sqlx::query(queries::RESOLVE_ARTIST_CREDITS_FUZZY).bind(artist), conn)
+                .await;
+        sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut *conn).await?;
+        rows = fuzzy?;
+    }
+    let ids: Vec<i32> = rows.iter().filter_map(|r| r.try_get("id").ok()).collect();
+    tracing::Span::current().record("credits.count", ids.len());
+    Ok(ids)
+}
+
 /// The artist an artist-qualified search is scoped to. "Various Artists" has
 /// too many releases to scope by; its searches stay title-first.
 fn scoping_artist(artist: Option<&str>) -> Option<&str> {
@@ -623,6 +655,7 @@ pub async fn search_releases(
     configure_search_session(&mut conn, threshold, work_mem).await?;
     let year_i32 = filters.year.and_then(|y| y.parse::<i32>().ok());
     let rows = if let Some(artist) = scoping_artist(filters.artist) {
+        let credits = resolve_artist_credits(artist, threshold, &mut conn).await?;
         let scoped = |sql| {
             sqlx::query(sql)
                 .bind(title)
@@ -632,9 +665,14 @@ pub async fn search_releases(
                 .bind(filters.primary_type)
                 .bind(filters.status)
                 .bind(offset)
+                .bind(&credits)
         };
-        let rows = fetch_bounded(scoped(queries::SEARCH_RELEASES_BY_ARTIST), &mut conn).await?;
-        if rows.is_empty() {
+        let rows = if credits.is_empty() {
+            Vec::new()
+        } else {
+            fetch_bounded(scoped(queries::SEARCH_RELEASES_BY_ARTIST), &mut conn).await?
+        };
+        if rows.is_empty() && !credits.is_empty() {
             fetch_fuzzy(scoped(queries::SEARCH_RELEASES_BY_ARTIST_FUZZY), &mut conn).await?
         } else {
             rows
@@ -1088,10 +1126,16 @@ pub async fn search_recordings(
     // recording table can run for minutes past its statement_timeout.
     let rows = match scoping_artist(artist) {
         Some(artist) => {
-            let scoped = |sql| sqlx::query(sql).bind(title).bind(artist).bind(limit).bind(offset);
-            let rows =
-                fetch_bounded(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST), &mut conn).await?;
-            if rows.is_empty() {
+            let credits = resolve_artist_credits(artist, threshold, &mut conn).await?;
+            let scoped = |sql| {
+                sqlx::query(sql).bind(title).bind(artist).bind(limit).bind(offset).bind(&credits)
+            };
+            let rows = if credits.is_empty() {
+                Vec::new()
+            } else {
+                fetch_bounded(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST), &mut conn).await?
+            };
+            if rows.is_empty() && !credits.is_empty() {
                 fetch_fuzzy(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST_FUZZY), &mut conn).await?
             } else {
                 rows

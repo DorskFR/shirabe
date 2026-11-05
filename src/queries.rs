@@ -10,29 +10,6 @@
 //! example values, whether the query needs a trigram search session) so the page
 //! is runnable out of the box.
 
-/// The artist credits an artist-qualified search is scoped to: the 20 credits
-/// most similar to the artist (`$2`) among its full-text matches, or among its
-/// trigram matches when full text finds none (typo'd artist).
-macro_rules! artist_credits_cte {
-    () => {
-        r"
-        WITH fts AS MATERIALIZED (
-            SELECT ac.id, ac.name FROM musicbrainz.artist_credit ac
-            WHERE musicbrainz.mb_simple_tsvector(ac.name::text)
-                  @@ plainto_tsquery('musicbrainz.mb_simple', musicbrainz.mb_lower($2))
-            ORDER BY similarity(ac.name, $2) DESC, ac.id
-            LIMIT 20
-        ),
-        trg AS MATERIALIZED (
-            SELECT ac.id, ac.name FROM musicbrainz.artist_credit ac
-            WHERE NOT EXISTS (SELECT 1 FROM fts) AND ac.name % $2
-            ORDER BY similarity(ac.name, $2) DESC, ac.id
-            LIMIT 20
-        ),
-        credits AS (SELECT id, name FROM fts UNION ALL SELECT id, name FROM trg)"
-    };
-}
-
 /// A title (`$1`) matching `{col}` by whole words: indexable, so the planner
 /// intersects the title and artist-credit indexes instead of reading every
 /// recording of a prolific artist.
@@ -235,18 +212,37 @@ pub const SEARCH_RELEASES_FUZZY: &str = r"
         LIMIT $4 OFFSET $7
         ";
 
+// The artist credits an artist-qualified search is scoped to: the 20 most
+// similar to the artist ($1) among its full-text matches.
+pub const RESOLVE_ARTIST_CREDITS: &str = r"
+        SELECT ac.id FROM musicbrainz.artist_credit ac
+        WHERE musicbrainz.mb_simple_tsvector(ac.name::text)
+              @@ plainto_tsquery('musicbrainz.mb_simple', musicbrainz.mb_lower($1))
+        ORDER BY similarity(ac.name, $1) DESC, ac.id
+        LIMIT 20
+        ";
+
+// RESOLVE_ARTIST_CREDITS for an artist full text cannot find (typo, odd
+// punctuation): trigram matches, run under the fuzzy timeout.
+pub const RESOLVE_ARTIST_CREDITS_FUZZY: &str = r"
+        SELECT ac.id FROM musicbrainz.artist_credit ac
+        WHERE ac.name % $1
+        ORDER BY similarity(ac.name, $1) DESC, ac.id
+        LIMIT 20
+        ";
+
 // Artist-qualified release search: scoped to the artist's credits first, so a
 // common title ("Best Of") never ranks the whole release table. $1 title,
-// $2 artist, $3 year, $4 limit, $5 primary type, $6 status, $7 offset.
+// $2 artist, $3 year, $4 limit, $5 primary type, $6 status, $7 offset,
+// $8 credit ids (RESOLVE_ARTIST_CREDITS).
 pub const SEARCH_RELEASES_BY_ARTIST: &str = concat!(
-    artist_credits_cte!(),
     r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
                similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM musicbrainz.release r
-        JOIN credits ac ON ac.id = r.artist_credit
-        WHERE r.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+        JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
+        WHERE r.artist_credit = ANY($8::int[])
           AND ",
     title_words_match!("r.name"),
     r"
@@ -273,14 +269,13 @@ pub const SEARCH_RELEASES_BY_ARTIST: &str = concat!(
 // Fallback for SEARCH_RELEASES_BY_ARTIST when no title word matches: scans the artist's
 // titles by similarity, so it runs under the tight fuzzy timeout.
 pub const SEARCH_RELEASES_BY_ARTIST_FUZZY: &str = concat!(
-    artist_credits_cte!(),
     r"
         SELECT r.id, r.gid, r.name, r.artist_credit, r.release_group,
                similarity(musicbrainz.f_unaccent(r.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM musicbrainz.release r
-        JOIN credits ac ON ac.id = r.artist_credit
-        WHERE r.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+        JOIN musicbrainz.artist_credit ac ON ac.id = r.artist_credit
+        WHERE r.artist_credit = ANY($8::int[])
           AND ",
     title_resembles!("r.name"),
     r"
@@ -327,16 +322,15 @@ pub const SEARCH_RECORDINGS: &str = r"
 
 // Artist-qualified recording search, scoped like SEARCH_RELEASES_BY_ARTIST: the
 // recording table is far too large to rank by title first. $1 title, $2 artist,
-// $3 limit, $4 offset.
+// $3 limit, $4 offset, $5 credit ids (RESOLVE_ARTIST_CREDITS).
 pub const SEARCH_RECORDINGS_BY_ARTIST: &str = concat!(
-    artist_credits_cte!(),
     r"
         SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
                similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM musicbrainz.recording rec
-        JOIN credits ac ON ac.id = rec.artist_credit
-        WHERE rec.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+        JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
+        WHERE rec.artist_credit = ANY($5::int[])
           AND ",
     title_words_match!("rec.name"),
     r"
@@ -350,14 +344,13 @@ pub const SEARCH_RECORDINGS_BY_ARTIST: &str = concat!(
 // Fallback for SEARCH_RECORDINGS_BY_ARTIST when no title word matches: scans the artist's
 // titles by similarity, so it runs under the tight fuzzy timeout.
 pub const SEARCH_RECORDINGS_BY_ARTIST_FUZZY: &str = concat!(
-    artist_credits_cte!(),
     r"
         SELECT rec.id, rec.gid, rec.name, rec.length, rec.artist_credit,
                similarity(musicbrainz.f_unaccent(rec.name), musicbrainz.f_unaccent($1))::real AS title_score,
                COUNT(*) OVER ()::bigint AS total
         FROM musicbrainz.recording rec
-        JOIN credits ac ON ac.id = rec.artist_credit
-        WHERE rec.artist_credit = ANY(ARRAY(SELECT id FROM credits))
+        JOIN musicbrainz.artist_credit ac ON ac.id = rec.artist_credit
+        WHERE rec.artist_credit = ANY($5::int[])
           AND ",
     title_resembles!("rec.name"),
     r"
@@ -890,6 +883,24 @@ pub fn catalog() -> Vec<QuerySpec> {
             ],
         },
         QuerySpec {
+            id: "resolve_artist_credits",
+            title: "Artist credits an artist-qualified search is scoped to",
+            endpoint: "GET /ws/2/release|recording (artist:)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: RESOLVE_ARTIST_CREDITS,
+            params: vec![p("artist", Text, "radiohead")],
+        },
+        QuerySpec {
+            id: "resolve_artist_credits_fuzzy",
+            title: "Artist credits by trigram (fallback)",
+            endpoint: "GET /ws/2/release|recording (artist:)",
+            db: TargetDb::Musicbrainz,
+            trigram: true,
+            sql: RESOLVE_ARTIST_CREDITS_FUZZY,
+            params: vec![p("artist", Text, "radiohead")],
+        },
+        QuerySpec {
             id: "search_releases_by_artist",
             title: "Release search scoped to an artist",
             endpoint: "GET /ws/2/release (artist:)",
@@ -904,6 +915,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 pn("primarytype", Text, ""),
                 pn("status", Text, ""),
                 p("offset", BigInt, "0"),
+                p("credit_ids", IntArray, "1"),
             ],
         },
         QuerySpec {
@@ -921,6 +933,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 pn("primarytype", Text, ""),
                 pn("status", Text, ""),
                 p("offset", BigInt, "0"),
+                p("credit_ids", IntArray, "1"),
             ],
         },
         QuerySpec {
@@ -983,6 +996,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("artist", Text, "radiohead"),
                 p("limit", BigInt, "25"),
                 p("offset", BigInt, "0"),
+                p("credit_ids", IntArray, "1"),
             ],
         },
         QuerySpec {
@@ -997,6 +1011,7 @@ pub fn catalog() -> Vec<QuerySpec> {
                 p("artist", Text, "radiohead"),
                 p("limit", BigInt, "25"),
                 p("offset", BigInt, "0"),
+                p("credit_ids", IntArray, "1"),
             ],
         },
         QuerySpec {
