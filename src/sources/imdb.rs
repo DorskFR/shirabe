@@ -27,8 +27,10 @@ use serde_json::json;
 use sqlx::postgres::PgPoolCopyExt;
 use sqlx::{AssertSqlSafe, PgPool};
 use tokio_util::io::StreamReader;
+use tracing::Instrument;
 
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
+use crate::telemetry::client::TracedSend;
 
 /// Base URL for the IMDb Non-Commercial Datasets.
 const DATASETS_BASE: &str = "https://datasets.imdbws.com";
@@ -298,6 +300,7 @@ fn tsv_reader<R: std::io::Read>(reader: R) -> csv::Reader<R> {
 
 /// Download + decode + COPY-load one dataset into its `_new` staging table, then
 /// atomically swap it into place. Returns the loaded row count.
+#[tracing::instrument(name = "shirabe.imdb.ingest_dataset", skip_all, fields(dataset = ds.table, imdb.rows = tracing::field::Empty), err(level = "info"))]
 async fn ingest_dataset(
     pool: &PgPool,
     client: &reqwest::Client,
@@ -314,7 +317,7 @@ async fn ingest_dataset(
     // Stream the gzip download → gunzip → synchronous TSV parse, building COPY
     // text and streaming it into the staging table.
     let url = format!("{DATASETS_BASE}/{}", ds.file);
-    let resp = client.get(&url).send().await?.error_for_status()?;
+    let resp = client.get(&url).send_traced().await?.error_for_status()?;
     let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
     let async_reader = StreamReader::new(stream);
     // Bridge the async byte stream into a blocking gzip+TSV reader.
@@ -330,7 +333,9 @@ async fn ingest_dataset(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let tsv_cols = ds.tsv_cols;
     let to_copy = ds.to_copy_fields;
+    let parse_span = tracing::info_span!("shirabe.imdb.parse", dataset = ds.table);
     let parse_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let _parse = parse_span.entered();
         let gz = flate2::read::MultiGzDecoder::new(bridge);
         let mut rdr = tsv_reader(gz);
         let mut record = csv::StringRecord::new();
@@ -371,19 +376,30 @@ async fn ingest_dataset(
     }
     copy.finish().await?;
     let rows = parse_handle.await??;
+    tracing::Span::current().record("imdb.rows", rows);
 
     // Build indexes on staging (named with a temp suffix to avoid clashing with
     // the live indexes, which get dropped with the live table in the swap).
+    let index_span = tracing::info_span!("shirabe.imdb.index", dataset = ds.table);
     for (i, idx_sql) in ds.indexes.iter().enumerate() {
         // The live `CREATE INDEX … ON <table> …` is rebuilt post-swap; on staging
         // we create equivalent indexes so the swapped-in table is fully indexed.
         let staged = idx_sql
             .replacen(&format!("ON {}", ds.table), &format!("ON {staging}"), 1)
             .replacen("CREATE INDEX ", &format!("CREATE INDEX tmp{i}_"), 1);
-        sqlx::query(AssertSqlSafe(staged)).execute(pool).await?;
+        sqlx::query(AssertSqlSafe(staged)).execute(pool).instrument(index_span.clone()).await?;
     }
+    drop(index_span);
 
     // Atomic swap: drop live, rename staging (+ its indexes) into place.
+    swap_into_place(pool, ds, &staging).await?;
+
+    Ok(rows)
+}
+
+/// Drop the live table and rename staging (+ its indexes) into place, atomically.
+#[tracing::instrument(name = "shirabe.imdb.swap", skip_all, fields(dataset = ds.table), err(level = "info"))]
+async fn swap_into_place(pool: &PgPool, ds: &Dataset, staging: &str) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {}", ds.table)))
         .execute(&mut *tx)
@@ -400,9 +416,7 @@ async fn ingest_dataset(
                 .await?;
         }
     }
-    tx.commit().await?;
-
-    Ok(rows)
+    tx.commit().await
 }
 
 /// Pull the index name out of a `CREATE INDEX <name> ON …` statement.
@@ -434,6 +448,7 @@ impl Source for ImdbSource {
         IngestMode::BulkDump
     }
 
+    #[tracing::instrument(name = "shirabe.imdb.refresh", skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
         let Some(pool) = ctx.pools.imdb.as_ref() else {
             return RefreshReport::failed(
@@ -502,6 +517,7 @@ impl Source for ImdbSource {
 
 /// Per-table row estimates for the imdb mirror. Returns an error if the pool is
 /// unreachable; missing individual tables surface as `-1`.
+#[tracing::instrument(name = "shirabe.imdb.table_counts", skip_all, err(level = "info"))]
 async fn table_counts(pool: &PgPool) -> Result<serde_json::Value, sqlx::Error> {
     // Reachability probe so a dead pool errors rather than reporting all -1.
     sqlx::query("SELECT 1").execute(pool).await?;

@@ -37,6 +37,7 @@ use std::io::BufRead;
 use tokio_util::io::StreamReader;
 
 use super::{IngestMode, RefreshCtx, RefreshReport, Source, SourceHealth};
+use crate::telemetry::client::TracedSend;
 
 /// Base URL for the daily TMDB id exports.
 const EXPORTS_BASE: &str = "https://files.tmdb.org/p/exports";
@@ -134,6 +135,7 @@ const BATCH_ROWS: usize = 1024;
 /// which is catastrophically slow on networked storage). Idempotent via
 /// `ON CONFLICT (id, kind)`. Runtime query; writes only the `tmdb` DB. TMDB id
 /// exports are unique per id, so a batch never conflicts with itself.
+#[tracing::instrument(name = "shirabe.tmdb_source.upsert_id_index", skip_all, fields(tmdb.kind = kind, batch.size = rows.len()), err(level = "info"))]
 async fn upsert_id_index(
     pool: &PgPool,
     kind: &str,
@@ -172,6 +174,7 @@ async fn upsert_id_index(
 
 /// Stream one export gz → gunzip → line-by-line parse → batched upsert. Never
 /// loads the whole export in memory. Returns the rows upserted.
+#[tracing::instrument(name = "shirabe.tmdb_source.ingest_export", skip_all, fields(dataset = filename, tmdb.kind = export.kind, tmdb.rows = tracing::field::Empty), err(level = "info"))]
 async fn ingest_export(
     pool: &PgPool,
     client: &reqwest::Client,
@@ -179,14 +182,16 @@ async fn ingest_export(
     filename: &str,
 ) -> anyhow::Result<u64> {
     let url = format!("{EXPORTS_BASE}/{filename}");
-    let resp = client.get(&url).send().await?.error_for_status()?;
+    let resp = client.get(&url).send_traced().await?.error_for_status()?;
     let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
     let async_reader = StreamReader::new(stream);
     let async_buf = tokio::io::BufReader::new(async_reader);
     let bridge = tokio_util::io::SyncIoBridge::new(async_buf);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<ExportRow>>(16);
+    let parse_span = tracing::info_span!("shirabe.tmdb_source.parse", dataset = filename);
     let parse_handle = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _parse = parse_span.entered();
         let gz = flate2::read::MultiGzDecoder::new(bridge);
         let reader = std::io::BufReader::new(gz);
         let mut batch: Vec<ExportRow> = Vec::with_capacity(BATCH_ROWS);
@@ -210,6 +215,7 @@ async fn ingest_export(
         total += upsert_id_index(pool, export.kind, &batch).await?;
     }
     parse_handle.await??;
+    tracing::Span::current().record("tmdb.rows", total);
     Ok(total)
 }
 
@@ -223,6 +229,7 @@ impl Source for TmdbSource {
         IngestMode::EnumerateLazyHydrate
     }
 
+    #[tracing::instrument(name = "shirabe.tmdb_source.refresh", skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
         let Some(pool) = ctx.pools.tmdb.as_ref() else {
             return RefreshReport::failed(

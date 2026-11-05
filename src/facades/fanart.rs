@@ -42,6 +42,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
+use crate::telemetry::client::TracedSend;
 use crate::{AppState, images};
 
 /// fanart.tv JSON keys whose values are ABSOLUTE image URLs (on `assets.fanart.tv`).
@@ -125,7 +126,14 @@ const fn fanart_pool(state: &AppState) -> Option<&PgPool> {
 /// Fetch a fresh cached payload for `(key, kind)`, honouring the configured TTL.
 /// The freshness test is done in SQL (`fetched_at` vs `now()`). Returns `None` on
 /// miss / stale / no pool.
+#[tracing::instrument(name = "shirabe.fanart.cache_get", skip_all, fields(fanart.kind = kind, fanart.key = key, cache.hit = tracing::field::Empty))]
 async fn cache_get(state: &AppState, key: &str, kind: &str) -> Option<Value> {
+    let hit = cache_lookup(state, key, kind).await;
+    tracing::Span::current().record("cache.hit", hit.is_some());
+    hit
+}
+
+async fn cache_lookup(state: &AppState, key: &str, kind: &str) -> Option<Value> {
     let pool = fanart_pool(state)?;
     let ttl_days = state.config.fanart_cache_ttl_days;
     if ttl_days <= 0 {
@@ -147,6 +155,7 @@ async fn cache_get(state: &AppState, key: &str, kind: &str) -> Option<Value> {
 
 /// Store (upsert) a payload into `fanart_cache` with `fetched_at = now()`.
 /// Best-effort: a cache write failure is logged but does not fail the request.
+#[tracing::instrument(name = "shirabe.fanart.cache_put", skip_all, fields(fanart.kind = kind, fanart.key = key))]
 async fn cache_put(state: &AppState, key: &str, kind: &str, payload: &Value) {
     let Some(pool) = fanart_pool(state) else {
         return;
@@ -186,7 +195,16 @@ fn upstream_query(api_key: &str, client_key: Option<&str>) -> Vec<(&'static str,
 /// Perform an upstream fanart.tv v3 GET, returning the parsed JSON body. `path` is
 /// the endpoint path under the configured API base (no leading slash). The held project
 /// `api_key` (and optional personal `client_key`) are appended as query params.
+#[tracing::instrument(name = "shirabe.fanart.upstream_get", skip_all, fields(fanart.path = path, otel.status_code = tracing::field::Empty, otel.status_description = tracing::field::Empty))]
 async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamError> {
+    let result = fetch_upstream(state, path).await;
+    if let Err(UpstreamError::Other(e)) = &result {
+        crate::telemetry::record_error(&tracing::Span::current(), e);
+    }
+    result
+}
+
+async fn fetch_upstream(state: &AppState, path: &str) -> Result<Value, UpstreamError> {
     let Some(api_key) = state.config.fanart_api_key.as_deref() else {
         return Err(UpstreamError::Other("fanart.tv api key not configured".to_string()));
     };
@@ -201,9 +219,9 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamErr
     let resp = client
         .get(&url)
         .query(&query)
-        .send()
+        .send_traced()
         .await
-        .map_err(|e| UpstreamError::Other(format!("upstream request: {e}")))?;
+        .map_err(|e| UpstreamError::Other(format!("upstream request: {}", e.without_url())))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         let body = resp
@@ -217,8 +235,10 @@ async fn upstream_get(state: &AppState, path: &str) -> Result<Value, UpstreamErr
     if !status.is_success() {
         return Err(UpstreamError::Other(format!("upstream status: {status}")));
     }
-    let bytes =
-        resp.bytes().await.map_err(|e| UpstreamError::Other(format!("upstream body: {e}")))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| UpstreamError::Other(format!("upstream body: {}", e.without_url())))?;
     serde_json::from_slice::<Value>(&bytes)
         .map_err(|e| UpstreamError::Other(format!("upstream json: {e}")))
 }
@@ -242,6 +262,7 @@ fn success_response(caache_base: Option<&str>, mut payload: Value) -> Response {
 /// fetch the upstream `path` once, cache it, and return it — always rewriting asset
 /// URLs through caache. Degrades to a clean 503 when no key is configured and the
 /// row is not cached.
+#[tracing::instrument(name = "shirabe.fanart.cached_fetch", skip_all, fields(fanart.kind = kind, fanart.key = key))]
 async fn cached_fetch(state: &Arc<AppState>, key: &str, kind: &str, path: &str) -> Response {
     if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return fanart_error(StatusCode::BAD_REQUEST, "invalid id");
@@ -263,22 +284,26 @@ async fn cached_fetch(state: &Arc<AppState>, key: &str, kind: &str, path: &str) 
 
 /// `GET /v3/music/{mbid}` → artist artwork (`artistthumb`, `artistbackground`,
 /// `musiclogo`, `hdmusiclogo`, `musicbanner`, …).
+#[tracing::instrument(name = "shirabe.fanart.music", skip_all)]
 async fn music(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) -> Response {
     cached_fetch(&state, &mbid, "music", &format!("music/{mbid}")).await
 }
 
 /// `GET /v3/music/albums/{mbid}` → album artwork (`albumcover`, `cdart`) keyed by
 /// the artist MBID.
+#[tracing::instrument(name = "shirabe.fanart.music_albums", skip_all)]
 async fn music_albums(State(state): State<Arc<AppState>>, Path(mbid): Path<String>) -> Response {
     cached_fetch(&state, &mbid, "music_albums", &format!("music/albums/{mbid}")).await
 }
 
 /// `GET /v3/movies/{id}` → movie artwork keyed by TMDB or IMDb id.
+#[tracing::instrument(name = "shirabe.fanart.movies", skip_all)]
 async fn movies(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     cached_fetch(&state, &id, "movies", &format!("movies/{id}")).await
 }
 
 /// `GET /v3/tv/{id}` → TV artwork keyed by TheTVDB id.
+#[tracing::instrument(name = "shirabe.fanart.tv", skip_all)]
 async fn tv(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     cached_fetch(&state, &id, "tv", &format!("tv/{id}")).await
 }

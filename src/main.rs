@@ -6,15 +6,10 @@ use shirabe::db::Pools;
 use shirabe::sources::Registry;
 use shirabe::sources::tvdb::TokenStore;
 use shirabe::{migrate, run_sync, serve};
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_ansi(std::io::stdout().is_terminal()))
-        .init();
+    let _telemetry = shirabe::telemetry::init("info", std::io::stdout().is_terminal());
 
     let cli = Cli::parse();
     let config = cli.config;

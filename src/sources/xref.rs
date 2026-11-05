@@ -27,6 +27,7 @@ const UPSERT_XREF: &str = "INSERT INTO shirabe.xref (wikidata_qid, source, exter
      ON CONFLICT (source, external_id) DO UPDATE SET
          wikidata_qid = COALESCE(EXCLUDED.wikidata_qid, shirabe.xref.wikidata_qid)";
 
+#[tracing::instrument(name = "shirabe.xref.upsert_xref", skip_all, fields(batch.size = rows.len()), err(level = "info"))]
 pub async fn upsert_xref(pool: &PgPool, rows: &[XrefRow]) -> Result<u64, sqlx::Error> {
     let mut affected = 0u64;
     for (qid, source, external_id) in rows {

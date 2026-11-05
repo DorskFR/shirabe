@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 use crate::sources::xref;
+use crate::telemetry::client::TracedSend;
 use crate::{AppState, images, search};
 
 /// TheTVDB JSON keys whose values are ABSOLUTE image URLs (e.g. on
@@ -132,7 +133,14 @@ const fn shirabe_pool(state: &AppState) -> Option<&PgPool> {
 /// Fetch a fresh cached payload for `(id, kind)`, honouring the configured TTL.
 /// The freshness test is done in SQL (`fetched_at` vs `now()`). Returns `None` on
 /// miss / stale / no pool.
+#[tracing::instrument(name = "shirabe.tvdb.cache_get", skip_all, fields(tvdb.kind = kind, tvdb.id = id, cache.hit = tracing::field::Empty))]
 async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
+    let hit = cache_lookup(state, id, kind).await;
+    tracing::Span::current().record("cache.hit", hit.is_some());
+    hit
+}
+
+async fn cache_lookup(state: &AppState, id: i64, kind: &str) -> Option<Value> {
     let pool = tvdb_pool(state)?;
     let ttl_days = state.config.tvdb_cache_ttl_days;
     if ttl_days <= 0 {
@@ -154,6 +162,7 @@ async fn cache_get(state: &AppState, id: i64, kind: &str) -> Option<Value> {
 
 /// Store (upsert) a payload into `tvdb_cache` with `fetched_at = now()`.
 /// Best-effort: a cache write failure is logged but does not fail the request.
+#[tracing::instrument(name = "shirabe.tvdb.cache_put", skip_all, fields(tvdb.kind = kind, tvdb.id = id))]
 async fn cache_put(state: &AppState, id: i64, kind: &str, payload: &Value) {
     let Some(pool) = tvdb_pool(state) else {
         return;
@@ -204,6 +213,7 @@ fn is_path_token(raw: &str) -> bool {
 /// A v4 `remoteIds` entry looks like `{ "id": "tt0903747", "type": 2,
 /// "sourceName": "IMDB" }`. We map known `sourceName`s to xref source tags and
 /// always record the TVDB id itself.
+#[tracing::instrument(name = "shirabe.tvdb.self_link_remote_ids", skip_all, fields(tvdb.id))]
 async fn self_link_remote_ids(state: &AppState, tvdb_id: i64, payload: &Value) {
     let Some(pool) = shirabe_pool(state) else {
         return;
@@ -247,6 +257,7 @@ async fn self_link_remote_ids(state: &AppState, tvdb_id: i64, payload: &Value) {
 /// the parsed JSON body. `path` is the endpoint path under the configured API base
 /// (no leading slash); `extra` are query pairs. Refreshes the token once on a 401
 /// and retries.
+#[tracing::instrument(name = "shirabe.tvdb.upstream_get", skip_all, fields(tvdb.path = path), err(level = "info"))]
 async fn upstream_get(
     state: &Arc<AppState>,
     path: &str,
@@ -266,16 +277,18 @@ async fn upstream_get(
             .get(&url)
             .bearer_auth(&bearer)
             .query(extra)
-            .send()
+            .send_traced()
             .await
-            .map_err(|e| format!("upstream request: {e}"))?;
+            .map_err(|e| format!("upstream request: {}", e.without_url()))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
             // Token lapsed early; force a fresh login and retry once.
             bearer = state.tvdb_tokens.force_refresh(&state.config).await?;
             continue;
         }
-        let resp = resp.error_for_status().map_err(|e| format!("upstream status: {e}"))?;
-        let bytes = resp.bytes().await.map_err(|e| format!("upstream body: {e}"))?;
+        let resp =
+            resp.error_for_status().map_err(|e| format!("upstream status: {}", e.without_url()))?;
+        let bytes =
+            resp.bytes().await.map_err(|e| format!("upstream body: {}", e.without_url()))?;
         return serde_json::from_slice::<Value>(&bytes).map_err(|e| format!("upstream json: {e}"));
     }
     Err("upstream auth retry exhausted".to_string())
@@ -288,6 +301,7 @@ async fn upstream_get(
 /// accepts back as a Bearer (any Bearer is accepted on data calls). When no
 /// server-side key is configured this still returns a clean failure (so Kusaritoi
 /// sees a graceful error), never a 500.
+#[tracing::instrument(name = "shirabe.tvdb.login", skip_all)]
 async fn login(State(state): State<Arc<AppState>>) -> Response {
     if state.config.tvdb_api_key.is_none() {
         return not_configured();
@@ -336,6 +350,7 @@ fn merge_live_data(data: &mut Vec<Value>, live: &Value) {
 /// 銀魂 → Gintama) FIRST; on a thin/empty local result fall through to the live
 /// v4 API and MERGE by `tvdb_id`. `name`/`aliases`/`translations` are preserved
 /// verbatim so Kusaritoi can score against the native + non-latin variants.
+#[tracing::instrument(name = "shirabe.tvdb.search", skip_all, fields(search.query = tracing::field::Empty, search.type = tracing::field::Empty))]
 async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>) -> Response {
     let Some(raw) = params.get("query").and_then(Value::as_str) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "query parameter is required");
@@ -345,6 +360,9 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>)
     };
     let query = query.as_str();
     let search_type = params.get("type").and_then(Value::as_str).unwrap_or("series").to_string();
+    let span = tracing::Span::current();
+    span.record("search.query", query);
+    span.record("search.type", search_type.as_str());
     let cache_kind = format!("search_{search_type}");
     let cache_id = stable_cache_id(query);
 
@@ -399,6 +417,7 @@ async fn search(State(state): State<Arc<AppState>>, Query(params): Query<Value>)
 
 /// Shared series detail handler for `/v4/series/{id}` and `/v4/series/{id}/extended`.
 /// `extended` rides the `…/extended` upstream path and carries `remoteIds`.
+#[tracing::instrument(name = "shirabe.tvdb.series_detail", skip_all, fields(tvdb.id = id_raw, tvdb.extended = extended))]
 async fn series_detail(state: &Arc<AppState>, id_raw: &str, extended: bool) -> Response {
     let Some(id) = numeric_id(id_raw) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "invalid series id");
@@ -429,11 +448,13 @@ async fn series_detail(state: &Arc<AppState>, id_raw: &str, extended: bool) -> R
 }
 
 /// `GET /v4/series/{id}`.
+#[tracing::instrument(name = "shirabe.tvdb.series", skip_all)]
 async fn series(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     series_detail(&state, &id, false).await
 }
 
 /// `GET /v4/series/{id}/extended` → `{data:{name,firstAired,seasons:[…],remoteIds}}`.
+#[tracing::instrument(name = "shirabe.tvdb.series_extended", skip_all)]
 async fn series_extended(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     series_detail(&state, &id, true).await
 }
@@ -441,6 +462,7 @@ async fn series_extended(State(state): State<Arc<AppState>>, Path(id): Path<Stri
 /// `GET /v4/series/{id}/episodes/{season_type}?season=&page=` → paginated episodes.
 /// `{data:{episodes:[…]}, links:{next}}`. One page is fetched per call (Kusaritoi
 /// walks `links.next`); the cache key includes the season type, season, and page.
+#[tracing::instrument(name = "shirabe.tvdb.series_episodes", skip_all)]
 async fn series_episodes(
     State(state): State<Arc<AppState>>,
     Path((id_raw, season_type)): Path<(String, String)>,
@@ -451,6 +473,7 @@ async fn series_episodes(
 
 /// `GET /v4/series/{id}/episodes/{season_type}/{lang}?season=&page=` → the same
 /// paginated episodes with names/overviews translated to `lang` (e.g. `eng`).
+#[tracing::instrument(name = "shirabe.tvdb.series_episodes_lang", skip_all)]
 async fn series_episodes_lang(
     State(state): State<Arc<AppState>>,
     Path((id_raw, season_type, lang)): Path<(String, String, String)>,
@@ -462,6 +485,7 @@ async fn series_episodes_lang(
     episodes(&state, &id_raw, &season_type, Some(&lang), &params).await
 }
 
+#[tracing::instrument(name = "shirabe.tvdb.episodes", skip_all, fields(tvdb.id = id_raw, tvdb.season_type = season_type, tvdb.lang = lang.unwrap_or_default()))]
 async fn episodes(
     state: &Arc<AppState>,
     id_raw: &str,
@@ -532,6 +556,7 @@ fn value_as_str_or_num(v: &Value) -> Option<String> {
 }
 
 /// `GET /v4/movies/{id}` → movie record (cross-IDs via `remoteIds`).
+#[tracing::instrument(name = "shirabe.tvdb.movie", skip_all, fields(tvdb.id = %id_raw))]
 async fn movie(State(state): State<Arc<AppState>>, Path(id_raw): Path<String>) -> Response {
     let Some(id) = numeric_id(&id_raw) else {
         return tvdb_failure(StatusCode::BAD_REQUEST, "invalid movie id");

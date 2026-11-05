@@ -133,12 +133,24 @@ impl SearchCache {
     /// Serve `key` from cache, or run `compute` once for all concurrent callers
     /// of the same key. A failed compute is not cached: waiters re-run it
     /// themselves, one at a time.
+    #[tracing::instrument(
+        name = "shirabe.search_cache.get_or_compute",
+        skip_all,
+        fields(
+            cache.entity = key.entity,
+            cache.enabled = self.enabled(),
+            cache.hit = tracing::field::Empty,
+            cache.single_flight = tracing::field::Empty,
+        )
+    )]
     pub async fn get_or_compute<F, Fut, E>(&self, key: SearchKey, compute: F) -> Result<Bytes, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Bytes, E>>,
     {
+        let span = tracing::Span::current();
         if let Some(hit) = self.get(&key) {
+            span.record("cache.hit", true);
             return Ok(hit);
         }
         let slot = {
@@ -150,8 +162,11 @@ impl SearchCache {
         if let Some(hit) = shared {
             drop(guard);
             self.release_inflight(&key, &slot);
+            span.record("cache.hit", true);
+            span.record("cache.single_flight", true);
             return Ok(hit);
         }
+        span.record("cache.hit", false);
         let result = compute().await;
         if let Ok(body) = &result {
             *guard = Some(body.clone());
@@ -260,6 +275,49 @@ mod tests {
             cache.get_or_compute(key("x"), || async { Ok(Bytes::from_static(b"ok")) }).await;
         assert_eq!(r.unwrap(), Bytes::from_static(b"ok"));
         assert!(cache.inner.lock().unwrap().inflight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spans_nest_under_the_caller_and_record_hit_or_miss() {
+        use tracing::Instrument;
+
+        use crate::telemetry::testing::{Capture, attribute};
+
+        let capture = Capture::install();
+        let cache = SearchCache::new(Duration::from_secs(60), 10);
+        let caller = tracing::info_span!("shirabe.caller");
+        async {
+            for _ in 0..2 {
+                let body = cache
+                    .get_or_compute(key("q"), || async {
+                        tokio::spawn(
+                            async { tracing::info_span!("shirabe.spawned").in_scope(|| ()) }
+                                .in_current_span(),
+                        )
+                        .await
+                        .unwrap();
+                        Ok::<_, ()>(Bytes::from_static(b"body"))
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(body, Bytes::from_static(b"body"));
+            }
+        }
+        .instrument(caller)
+        .await;
+
+        let caller = &capture.named("shirabe.caller")[0];
+        let cached = capture.named("shirabe.search_cache.get_or_compute");
+        assert_eq!(cached.len(), 2);
+        for span in &cached {
+            assert_eq!(span.parent_span_id, caller.span_context.span_id());
+            assert_eq!(attribute(span, "cache.entity").as_deref(), Some("release"));
+        }
+        assert_eq!(attribute(&cached[0], "cache.hit").as_deref(), Some("false"));
+        assert_eq!(attribute(&cached[1], "cache.hit").as_deref(), Some("true"));
+        let spawned = &capture.named("shirabe.spawned")[0];
+        assert_eq!(spawned.parent_span_id, cached[0].span_context.span_id());
+        assert_eq!(spawned.span_context.trace_id(), caller.span_context.trace_id());
     }
 
     #[tokio::test]

@@ -14,6 +14,10 @@ consumer applications that only need a few ws/2 endpoints.
 - `src/config.rs` — clap `Cli` / `Config`; every env var, mirrored in
   `.env.example` (unit test enforces it).
 - `src/db.rs` — Postgres pools.
+- `src/telemetry/` — subscriber + opt-in OTLP trace export (`OTEL_*`), the HTTP
+  server span / access-log layer, `send_traced()` client spans for every
+  outbound call, and the bridge turning sqlx's finished-statement events into
+  `db.query` spans (no per-query wrapping).
 - `src/error.rs` — `ApiError` and its JSON error contract.
 - `src/query.rs` — Lucene-subset query parser (unit-tested).
 - `src/date.rs` — release-date selection from MB date events (unit-tested).
@@ -49,6 +53,8 @@ consumer applications that only need a few ws/2 endpoints.
 - Read-only DB: only `SELECT`. Never write to the mirror.
 - Use sqlx **runtime** queries (`sqlx::query`), not compile-time macros — the
   build must not need a live DB.
+- Outbound HTTP uses `send_traced()`, never bare `.send()`. Span fields never
+  carry API keys, tokens or URLs with query strings (`telemetry::client::redact`).
 - Keep clippy clean: `cargo clippy --all-targets -- -D warnings`.
 - Format with nightly rustfmt (`cargo +nightly fmt`) — uses unstable options.
 

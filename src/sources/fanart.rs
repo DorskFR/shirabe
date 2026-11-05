@@ -41,6 +41,7 @@ impl Source for FanartSource {
         IngestMode::LazyScrape
     }
 
+    #[tracing::instrument(name = "shirabe.fanart_source.refresh", skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, _ctx: &RefreshCtx) -> RefreshReport {
         let configured = self.configured();
         let summary = if configured {

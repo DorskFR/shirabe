@@ -153,7 +153,17 @@ fast with a clear error if it is unset.
 | `SHIRABE_COVERART_UPSTREAM_BASE` | no | `https://coverartarchive.org` | Upstream base for the `/release`, `/release-group` redirect layer |
 | `SHIRABE_DEBUG_UI` | no | `false` | Opt-in SQL query explorer at `/debug/queries`; keep off in exposed deployments. Only mounted when `SHIRABE_DEBUG_UI_TOKEN` is also set |
 | `SHIRABE_DEBUG_UI_TOKEN` | no | – | Bearer token required on every `/debug/*` request (`Authorization: Bearer <token>`, else 401). Without it the explorer is not mounted and a WARN is logged at boot |
-| `RUST_LOG` | no | `info` | tracing/`EnvFilter` filter; `info` already includes one access-log line per request (method, uri, status, latency ms). ANSI colours are off when stdout is not a tty |
+| `RUST_LOG` | no | `info` | tracing/`EnvFilter` log filter; `info` already includes one access-log line per request (method, path, status, latency ms). ANSI colours are off when stdout is not a tty |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | _(unset)_ | OTLP/HTTP collector; trace export is off unless set (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`). The other standard `OTEL_*` vars (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER[_ARG]`, `OTEL_SDK_DISABLED`) apply |
+
+### Telemetry
+
+With an OTLP endpoint set, shirabe exports one trace per request and per
+`sync` / `migrate` run: a server span per route (W3C `traceparent` honoured),
+internal spans on handlers, search, facades and ingest phases, a client span
+per upstream HTTP call (trace context propagated, secret query values
+redacted) and a `db.query` client span per SQL statement with its text and row
+count. Request query strings and API keys are never recorded.
 
 Testing-only (hidden from `--help`; never set in a real deployment):
 `TMDB_API_BASE`, `TVDB_API_BASE`, `FANART_API_BASE` point a facade at a mock

@@ -65,6 +65,7 @@ impl Source for MusicBrainzSource {
         IngestMode::ReadOnlyMirror
     }
 
+    #[tracing::instrument(name = "shirabe.musicbrainz.refresh", skip_all, fields(sync.source = Self::ID))]
     async fn refresh(&self, ctx: &RefreshCtx) -> RefreshReport {
         // Read-only mirror: nothing to ingest, and we never write `musicbrainz`
         // (not even ANALYZE — keep it strictly read-only). Confirm reachability
