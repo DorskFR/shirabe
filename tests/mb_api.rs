@@ -308,3 +308,26 @@ async fn merged_mbids_resolve_to_the_canonical_entity() {
         assert_eq!(body["id"], canonical, "{path}");
     }
 }
+
+#[tokio::test]
+#[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
+async fn recording_search_media_carry_only_the_matched_track() {
+    let db = mb_fixture_db().await;
+    let st = state_with_db(&db, &[]);
+
+    let (status, body) = get(
+        &st,
+        "/ws/2/recording?query=recording:(lighthouse%20keeper)%20AND%20artist:(seaside%20radio)&inc=releases+artist-credits+media",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let release = &body["recordings"][0]["releases"][0];
+    assert_eq!(release["track-count"], 2, "the release total, not the matched media");
+    let media = release["media"].as_array().unwrap();
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0]["track-count"], 2);
+    let tracks = media[0]["tracks"].as_array().unwrap();
+    assert_eq!(tracks.len(), 1, "only the matched recording's track");
+    assert_eq!(tracks[0]["position"], 2);
+    assert_eq!(tracks[0]["recording"]["id"], RECORDING_MBID);
+}

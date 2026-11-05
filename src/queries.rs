@@ -519,23 +519,20 @@ pub const BATCH_RELEASE_TRACK_COUNTS: &str = r"
         GROUP BY release
         ";
 
-pub const BATCH_TRACKS: &str = r"
-        SELECT t.medium AS mid, t.gid AS track_gid, t.name AS track_name, t.position,
+// Recording search media, as MusicBrainz shapes them: per release, only the
+// media holding each recording, each with only that recording's track.
+pub const BATCH_RECORDING_MEDIA: &str = r"
+        SELECT t.recording AS rec, m.release AS rel, m.id, m.position, m.track_count,
+               m.name AS title, mf.name AS format,
+               t.gid AS track_gid, t.name AS track_name, t.position AS track_position,
                t.number, t.artist_credit AS track_ac,
                rec.gid AS rec_gid, rec.name AS rec_name, rec.length AS rec_length
         FROM musicbrainz.track t
-        JOIN musicbrainz.recording rec ON rec.id = t.recording
-        WHERE t.medium = ANY($1)
-        ORDER BY t.medium, t.position ASC
-        ";
-
-pub const BATCH_MEDIA: &str = r"
-        SELECT m.release AS rel, m.id, m.position, m.track_count, m.name AS title,
-               mf.name AS format
-        FROM musicbrainz.medium m
+        JOIN musicbrainz.medium m ON m.id = t.medium
         LEFT JOIN musicbrainz.medium_format mf ON mf.id = m.format
-        WHERE m.release = ANY($1)
-        ORDER BY m.release, m.position ASC
+        JOIN musicbrainz.recording rec ON rec.id = t.recording
+        WHERE t.recording = ANY($1)
+        ORDER BY t.recording, m.release, m.position, t.position
         ";
 
 pub const BATCH_RECORDING_RELEASES: &str = r"
@@ -1203,30 +1200,22 @@ pub fn catalog() -> Vec<QuerySpec> {
             params: vec![p("release_ids", IntArray, "1,2,3")],
         },
         QuerySpec {
-            id: "batch_tracks",
-            title: "Batch: tracks for media",
-            endpoint: "(hydration)",
-            db: TargetDb::Musicbrainz,
-            trigram: false,
-            sql: BATCH_TRACKS,
-            params: vec![p("medium_ids", IntArray, "1,2,3")],
-        },
-        QuerySpec {
-            id: "batch_media",
-            title: "Batch: media for releases",
-            endpoint: "(hydration)",
-            db: TargetDb::Musicbrainz,
-            trigram: false,
-            sql: BATCH_MEDIA,
-            params: vec![p("release_ids", IntArray, "1,2,3")],
-        },
-        QuerySpec {
             id: "batch_recording_releases",
             title: "Batch: releases per recording",
             endpoint: "(hydration)",
             db: TargetDb::Musicbrainz,
             trigram: false,
             sql: BATCH_RECORDING_RELEASES,
+            params: vec![p("recording_ids", IntArray, "1,2,3")],
+        },
+        // ── per-row loaders (lookup path) ──
+        QuerySpec {
+            id: "batch_recording_media",
+            title: "Recording search media (matched tracks only)",
+            endpoint: "(hydration)",
+            db: TargetDb::Musicbrainz,
+            trigram: false,
+            sql: BATCH_RECORDING_MEDIA,
             params: vec![p("recording_ids", IntArray, "1,2,3")],
         },
         // ── per-row loaders (lookup path) ──
