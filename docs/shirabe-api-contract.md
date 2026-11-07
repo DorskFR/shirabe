@@ -123,6 +123,35 @@ suffix (`term~` / `term~2`) is stripped (trigram search is already fuzzy). A
 release search with `arid:<mbid>` becomes an artist browse, optionally filtered
 by `primarytype:` and `status:`.
 
+### 2.1 Route summary
+
+| Method & path | Query shape | Notes |
+| --- | --- | --- |
+| `GET /ws/2/artist?query=&limit=&offset=&inc=aliases` | bare artist name | `id, name, score, type, country, disambiguation, aliases[].{name,sort-name}` |
+| `GET /ws/2/artist/{mbid}?inc=url-rels+genres+tags+annotation` | | artist lookup |
+| `GET /ws/2/release?query=&limit=&offset=` | `release:(title) AND artist:(name) [AND date:(YYYY*)]`, or `arid:<mbid>` (+ optional `primarytype:`, `status:`) for an artist browse | `id, title, date, score, status, disambiguation, artist-credit, track-count, release-group` |
+| `GET /ws/2/recording?query=&limit=&offset=&inc=releases+artist-credits+media` | `recording:"title" AND artist:"name"` | recordings + full release shapes (incl. media/tracks) |
+| `GET /ws/2/release/{mbid}?inc=...media+recordings+...rels` | | full album: media[] (ordered), tracks, release-group, relations[] |
+| `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases` | | recording + releases |
+| `GET /ws/2/release-group?artist=<mbid>&limit=&offset=` | browse by artist MBID | `{"release-group-count", "release-group-offset", "release-groups": [...]}` |
+| `GET /ws/2/release-group/{mbid}` | | release-group lookup |
+| `GET /health`, `GET /ws/2` | | DB ping, `{"status":"ok"}` |
+| `GET /health/sources` | | per-source health/staleness report |
+
+### 2.2 Scoring
+
+`score` (0-100) is `pg_trgm` `similarity()` (0.0-1.0) scaled to 0-100, so a
+client's own confidence re-scoring keeps working. Results are ordered by
+similarity descending and capped at `limit`. A bare query (no `field:`
+markers) is treated as the whole artist name.
+
+### 2.3 Dates
+
+Release dates live in `release_country` / `release_unknown_country` as
+per-country date events, not on the release row. shirabe picks the earliest
+event (preferring worldwide `XW` on ties) and renders it as `"YYYY"`,
+`"YYYY-MM"`, `"YYYY-MM-DD"`, or `""` (see `src/date.rs`).
+
 ## 3. TheTVDB v4 facade (`/v4`) — implemented, cache-first
 
 Default upstream base `https://api4.thetvdb.com/v4`. Auth is faked: callers may

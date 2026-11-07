@@ -1,212 +1,178 @@
 # shirabe
 
-A small, fast, self-hosted Rust API that implements a subset of the
-[MusicBrainz ws/2](https://musicbrainz.org/doc/MusicBrainz_API) web service. It
-queries a **synced MusicBrainz Postgres mirror** directly via `pg_trgm` trigram
-search, replacing the slow official MusicBrainz Docker stack + Apache SOLR.
+MusicBrainz ws/2 search and lookups served from a Postgres mirror with pg_trgm, in place of the SOLR search stack.
 
-`調べ` (shirabe) — "to look up / investigate".
+[![CI](https://github.com/DorskFR/shirabe/actions/workflows/ci.yml/badge.svg)](https://github.com/DorskFR/shirabe/actions/workflows/ci.yml)
+[![image](https://img.shields.io/github/v/tag/DorskFR/shirabe?label=ghcr.io)](https://github.com/DorskFR/shirabe/pkgs/container/shirabe)
+[![license](https://img.shields.io/badge/license-WTFPL-blue)](Cargo.toml)
 
-## Why
+```mermaid
+flowchart LR
+  client[ws/2 client] -->|"GET /ws/2/..."| shirabe
+  shirabe -->|"SELECT, pg_trgm"| mb[(MusicBrainz Postgres mirror)]
+  media[TMDB / TheTVDB / fanart.tv client] -.->|"GET /3, /v4, /v3"| shirabe
+  shirabe -.-> cache[(per-provider cache DBs)]
+  shirabe -.->|cache miss| upstream[upstream APIs]
+```
 
-A typical consumer only needs a handful of ws/2 endpoints. The official
-MB search server is heavy (SOLR + the full ws/2 app). shirabe answers those
-exact requests straight from the replicated `musicbrainz` Postgres schema,
-emitting MusicBrainz-compatible hyphenated-key JSON, so an existing client parser
-and confidence re-scoring work unchanged.
+```console
+$ curl -s 'localhost:8800/ws/2/artist?query=seaside%20radoi' | jq .
+{
+  "count": 1,
+  "offset": 0,
+  "artists": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Seaside Radio",
+      "score": 65,
+      "aliases": [
+        {
+          "name": "Régio Costera",
+          "sort-name": "Costera, Régio"
+        }
+      ],
+      "disambiguation": "test band",
+      "type": "Group",
+      "country": "GB"
+    }
+  ]
+}
+```
+
+^ A typo'd artist search against the test fixture. `score` is the trigram similarity scaled to 0-100.
+
+Running your own MusicBrainz search normally means the full ws/2 server plus Apache SOLR and its index rebuilds. Most clients only call a handful of ws/2 endpoints, so shirabe answers those straight from the replicated `musicbrainz` Postgres schema and returns MusicBrainz's hyphenated-key JSON, which lets an existing ws/2 client parser and its confidence re-scoring work unchanged. It also fronts TMDB, TheTVDB, fanart.tv and the Cover Art Archive under their native API paths as cache-first proxies, so one host serves all of a media app's metadata lookups. `調べ` (shirabe) means "to look up".
+
+## Quick start
+
+This runs the published image against the small fake dataset in `tests/fixtures/musicbrainz.sql` (two artists, four releases), so you can try it without a mirror. Requires Docker and a clone of the repo.
+
+```sh
+git clone https://github.com/DorskFR/shirabe && cd shirabe
+docker network create shirabe
+docker run -d --name mb-fixture --network shirabe -e POSTGRES_PASSWORD=mb postgres:17
+until docker exec mb-fixture pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
+cat tests/fixtures/musicbrainz.sql migrations/000*.sql | docker exec -i mb-fixture psql -q -U postgres
+docker run --rm -d --name shirabe --network shirabe -p 8800:8800 \
+  -e DATABASE_URL=postgres://postgres:mb@mb-fixture/postgres ghcr.io/dorskfr/shirabe:0.8.3
+```
+
+```console
+$ curl -s localhost:8800/health
+{"status":"ok"}
+```
+
+Clean up with `docker rm -f shirabe mb-fixture && docker network rm shirabe`.
+
+To serve real data, set `DATABASE_URL` to a MusicBrainz mirror (for example one built with [musicbrainz-docker](https://github.com/metabrainz/musicbrainz-docker)) after applying `migrations/000*.sql` to it once. Those add the trigram and full-text indexes and never touch replicated data; see [docs/deployment.md](docs/deployment.md).
+
+## Usage
+
+### Search releases by title and artist
+
+`query=` takes the fielded Lucene subset ws/2 clients send: `release:`, `artist:`, `recording:`, `date:(YYYY*)`, `arid:`, `primarytype:`, `status:`, with quotes, `(...)` groups and `AND`. The fuzzy suffix `term~` is stripped, since the trigram match is already fuzzy.
+
+```console
+$ curl -sG localhost:8800/ws/2/release --data-urlencode 'query=release:(harbor lights) AND artist:(seaside radio)' -d limit=1 | jq .
+{
+  "count": 2,
+  "offset": 0,
+  "releases": [
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "title": "Harbour Lights",
+      "date": "1997-05-21",
+      "score": 71,
+      "status": "Official",
+      "disambiguation": "deluxe edition",
+      "artist-credit": [
+        {
+          "artist": {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "Seaside Radio"
+          }
+        }
+      ],
+      "track-count": 2,
+      "release-group": {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "primary-type": "Album"
+      }
+    }
+  ]
+}
+```
+
+### Browse an artist's release groups
+
+```console
+$ curl -s 'localhost:8800/ws/2/release-group?artist=11111111-1111-4111-8111-111111111111' | jq -c .
+{"release-group-count":1,"release-group-offset":0,"release-groups":[{"id":"22222222-2222-4222-8222-222222222222","title":"Harbour Lights","primary-type":"Album","secondary-types":["Live"],"first-release-date":"1997-05-21","disambiguation":"rg comment","artist-credit":[{"artist":{"id":"11111111-1111-4111-8111-111111111111","name":"Seaside Radio"}}]}]}
+```
+
+### Point a ws/2 client at shirabe
+
+Set the client's MusicBrainz base URL to `http://<host>:8800/ws/2` instead of `https://musicbrainz.org/ws/2`. The paths and JSON shapes are the same, and since the queries hit your own database the 1 request/second courtesy limit no longer applies. The other providers follow the same pattern:
+
+```
+musicbrainz.base_url = http://shirabe:8800/ws/2
+tmdb.base_url        = http://shirabe:8800/3
+tvdb.base_url        = http://shirabe:8800/v4
+fanart.base_url      = http://shirabe:8800/v3
+coverart.base_url    = http://shirabe:8800
+```
+
+For TMDB, TheTVDB and fanart.tv, shirabe ignores the client's API key and uses its own server-side key.
 
 ## Endpoints
 
-All responses are JSON with MB's hyphenated keys (`artist-credit`,
-`track-count`, `release-group`, `primary-type`, `sort-name`, ...); `fmt=xml` is
-accepted for compatibility but still returns JSON. Search responses carry the
-ws/2 envelope: `{"count": <total>, "offset": <offset>, "<plural>": [...]}`;
-`limit=` and `offset=` page through it.
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/ws/2/artist`, `/ws/2/release`, `/ws/2/recording` `?query=` | ws/2 search envelope `{"count", "offset", "<plural>": [...]}` |
+| `GET` | `/ws/2/{artist,release,recording,release-group}/{mbid}` | Lookup, with the `inc=` tokens listed in the API doc |
+| `GET` | `/ws/2/release-group?artist=<mbid>` | Release groups of an artist |
+| `GET` | `/3/*`, `/v4/*`, `/v3/*` | TMDB, TheTVDB and fanart.tv in their native shapes, cache-first |
+| `GET` | `/release/*`, `/release-group/*`, `/_ia/*` | Cover Art Archive redirects and an on-disk image byte cache |
+| `GET` | `/health` | `{"status":"ok"}` when the mirror is reachable |
+| `GET` | `/health/sources` | Per-source health and staleness (diagnostic, not a probe) |
 
-| Method & path | Query shape | Notes |
-| --- | --- | --- |
-| `GET /ws/2/artist?query=&limit=&offset=&inc=aliases` | bare artist name | `id, name, score, type, country, disambiguation, aliases[].{name,sort-name}` |
-| `GET /ws/2/artist/{mbid}?inc=url-rels+genres+tags+annotation` | — | artist lookup; `inc` tokens `url-rels`, `genres`, `tags`, `annotation` |
-| `GET /ws/2/release?query=&limit=&offset=` | `release:(title) AND artist:(name) [AND date:(YYYY*)]` — or `arid:<mbid>` (+ optional `primarytype:`, `status:`) for an artist browse | `id, title, date, score, status, disambiguation, artist-credit, track-count, release-group` |
-| `GET /ws/2/recording?query=&limit=&offset=&inc=releases+artist-credits+media` | `recording:"title" AND artist:"name"` | recordings + full release shapes (incl. media/tracks) |
-| `GET /ws/2/release/{mbid}?inc=...media+recordings+...rels` | — | full album: media[] (ordered), tracks, release-group, relations[] |
-| `GET /ws/2/recording/{mbid}?inc=releases+artist-credits+aliases` | — | recording + releases |
-| `GET /ws/2/release-group?artist=<mbid>&limit=&offset=` | browse by artist MBID | `{"release-group-count", "release-group-offset", "release-groups": [...]}` |
-| `GET /ws/2/release-group/{mbid}` | — | release-group lookup |
-| `GET /health`, `GET /ws/2` | — | DB ping, `{"status":"ok"}` — use this as the k8s readiness/liveness probe |
-| `GET /health/sources` | — | per-source health/staleness report; probes every backing store (each capped at 2 s, run concurrently). Diagnostic only — do not wire it as a k8s probe |
+Unknown paths return JSON: `404 {"error":"shirabe: no such route: GET /ws/2/label"}`. Every prefix also has a provider alias (`/musicbrainz/ws/2`, `/music`, `/tmdb/3`, ...). The full route inventory, `inc=` tokens, error shapes and storage model are in [docs/shirabe-api-contract.md](docs/shirabe-api-contract.md).
 
-Unknown paths and wrong methods get JSON errors from every mount:
-`404 {"error":"shirabe: no such route: GET /x"}` /
-`405 {"error":"shirabe: method not allowed: POST /health"}`.
+## Configuration
 
-### Provider prefixes and aliases
+| Variable | Default | Effect |
+|---|---|---|
+| `DATABASE_URL` | required | MusicBrainz mirror DSN; shirabe only runs `SELECT`, so use a read-only role |
+| `SHIRABE_BIND` | `0.0.0.0:8800` | Listen address |
+| `SHIRABE_SIMILARITY_THRESHOLD` | `0.3` | Minimum `pg_trgm` similarity for a search hit |
+| `SHIRABE_DEFAULT_LIMIT` / `SHIRABE_MAX_LIMIT` | `25` / `100` | Default and maximum search `limit` |
+| `TMDB_API_KEY`, `TVDB_API_KEY`, `FANART_API_KEY` | unset | Server-side provider keys; without one that facade serves cached rows only |
+| `RUST_LOG` | `info` | Log filter; `info` logs one access line per request |
 
-Beyond ws/2, shirabe fronts several providers under their native API prefixes.
-Each native prefix is also served under a self-describing provider alias (the same
-handlers); embedded paths in responses stay canonical (native).
+Every variable, including the per-provider database URLs, the image cache and OpenTelemetry export, is in [docs/configuration.md](docs/configuration.md) and [`.env.example`](.env.example). Each one is also a `--flag` (`shirabe --help`). Container, probes, migrations and the `sync` / `migrate` subcommands are covered in [docs/deployment.md](docs/deployment.md).
 
-| Provider | Native prefix | Aliases |
-| --- | --- | --- |
-| MusicBrainz | `/ws/2/*` | `/musicbrainz/ws/2/*`, `/music/ws/2/*`, `/music/*` (version segment stripped) |
-| TMDB | `/3/*` | `/tmdb/3/*` |
-| TheTVDB | `/v4/*` | `/tvdb/v4/*` |
-| fanart.tv | `/v3/*` | `/fanart/v3/*` |
-| Cover Art Archive | `/release/*`, `/release-group/*`, `/_ia/*` | `/coverart/release/*`, `/coverart/release-group/*`, `/coverart/_ia/*` |
+## Limitations
 
-`/music` accepts both the stripped form (`GET /music/artist`) and the full tree
-(`GET /music/ws/2/artist`), so a ws/2 client can point its base URL at either
-`/music` or `/music/ws/2`. The former `/tv`, `/movie`, `/movies` category roots
-and the `/cover` namespace are retired and now 404.
-
-TMDB and TheTVDB are full cache-first facades: each request is served from the
-per-provider Postgres cache when fresh, otherwise fetched once upstream with the
-server-side API key and cached. fanart.tv works the same way. Image URLs in
-facade payloads are rewritten to route through the `/_ia/<host>/<path>` byte
-proxy (SSRF-guarded, on-disk cached), so the consumer never streams large images
-straight from upstream. See
-[docs/shirabe-api-contract.md](docs/shirabe-api-contract.md) for the full route
-inventory and JSON shapes.
-
-### Scoring
-
-`score` (0-100) is synthesized from `pg_trgm` `similarity()` (0.0-1.0 scaled to
-0-100), so a client's own confidence re-scoring keeps working. Results are
-ordered by similarity descending and capped at `limit`.
-
-### Query parser
-
-The `query=` string is **not** parsed as full Lucene. A small hand-rolled parser
-(`src/query.rs`) extracts the known fields (`release:`, `artist:`, `recording:`,
-`date:`, `arid:`, `primarytype:`, `status:`), handling `"..."` quotes, `(...)`
-groups, `AND`, escaped characters, and the `date:(YYYY*)` year-prefix wildcard.
-The Lucene fuzzy suffix (`term~` / `term~2`) is stripped — the trigram search is
-already fuzzy. A bare query (no `field:` markers) is treated as the whole artist
-name.
-
-### Dates
-
-Release dates live in `release_country` / `release_unknown_country` as per-country
-date events, not on the release row. shirabe picks the earliest event (preferring
-worldwide `XW` on ties) and renders it as `"YYYY"`, `"YYYY-MM"`, `"YYYY-MM-DD"`,
-or `""` (see `src/date.rs`).
-
-## How it connects to the MB mirror
-
-shirabe expects the standard MusicBrainz Postgres schema in a schema named
-`musicbrainz` (the layout produced by
-[musicbrainz-docker](https://github.com/metabrainz/musicbrainz-docker) /
-the replication mirror). It opens a read-only connection pool to `DATABASE_URL`
-and runs `SELECT`-only queries — use a read-only DB role.
-
-Before first use, apply the mirror migrations once (`migrations/000*.sql`):
-
-```sh
-DATABASE_URL=postgres://readonly@mirror.example.com/musicbrainz_db \
-  sqlx migrate run --source migrations
-# or: make db/migrate/up
-```
-
-They create `pg_trgm` + `unaccent` extensions and GIN trigram/FTS indexes on the
-searched name columns plus btree FK indexes on the join paths. They are
-idempotent (`CREATE ... IF NOT EXISTS`) and additive — they never touch
-replicated data and can be dropped without consequence.
-
-The optional writable per-provider databases (`shirabe`, `imdb`, `tmdb`, `tvdb`,
-`fanart`) are bootstrapped with `shirabe migrate <db>` (or `shirabe migrate all`)
-— the SQL is embedded in the binary, so nothing extra ships to the cluster.
-
-## Environment variables
-
-A ready-to-copy [`.env.example`](.env.example) lists every variable, its
-default, and meaning. `DATABASE_URL` is the only **required** one; startup fails
-fast with a clear error if it is unset.
-
-| Var | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `DATABASE_URL` | **yes** | _(none)_ | Postgres DSN for the MB mirror (read-only role) |
-| `SHIRABE_DATABASE_URL` | no | _(unset)_ | Writable `shirabe` coordination DB (source registry, xref, image_cache) |
-| `IMDB_DATABASE_URL` | no | _(unset)_ | Writable `imdb` bulk-mirror DB (IMDb TSV tables) |
-| `TMDB_DATABASE_URL` | no | _(unset)_ | Writable `tmdb` cache/index DB (`tmdb_cache` + `tmdb_id_index`) |
-| `TVDB_DATABASE_URL` | no | _(unset)_ | Writable `tvdb` cache DB (`tvdb_cache`) |
-| `FANART_DATABASE_URL` | no | _(unset)_ | Writable `fanart` cache DB (`fanart_cache`) |
-| `SHIRABE_BIND` | no | `0.0.0.0:8800` | HTTP bind address:port (server listens on **8800**) |
-| `SHIRABE_DB_POOL_SIZE` | no | `8` | Max Postgres connections per pool |
-| `SHIRABE_DEFAULT_LIMIT` | no | `25` | Default search `limit` |
-| `SHIRABE_MAX_LIMIT` | no | `100` | Hard cap on requested `limit` |
-| `SHIRABE_SIMILARITY_THRESHOLD` | no | `0.3` | Min `pg_trgm` similarity to keep a row |
-| `SHIRABE_STATEMENT_TIMEOUT_MS` | no | `10000` | Per-connection `statement_timeout` on trigram search sessions |
-| `SHIRABE_SEARCH_WORK_MEM` | no | `256MB` | Per-connection `work_mem` on trigram search sessions |
-| `TMDB_API_KEY` | no | _(unset)_ | Server-side TMDB v3 key; unset → `/3` degrades to cache-only/503 |
-| `TMDB_CACHE_TTL_DAYS` | no | `7` | TTL for cached TMDB payloads |
-| `TVDB_API_KEY` | no | _(unset)_ | Server-side TheTVDB v4 key; unset → `/v4` degrades to cache-only/503 |
-| `TVDB_PIN` | no | _(unset)_ | Optional operator PIN paired with `TVDB_API_KEY` |
-| `TVDB_CACHE_TTL_DAYS` | no | `7` | TTL for cached TheTVDB payloads |
-| `FANART_API_KEY` | no | _(unset)_ | Server-side fanart.tv key; unset → `/v3` degrades to cache-only/503 |
-| `FANART_PERSONAL_API_KEY` | no | _(unset)_ | Optional personal fanart.tv key (sent as `client_key`) |
-| `FANART_CACHE_TTL_DAYS` | no | `7` | TTL for cached fanart.tv payloads |
-| `SHIRABE_CAACHE_BASE_URL` | no | _(empty)_ | External image-proxy base for rewritten artwork URLs; empty → shirabe's own relative `/_ia` route |
-| `SHIRABE_COVERART_CACHE_DIR` | no | `/var/cache/shirabe/coverart` | On-disk byte cache for the `/_ia` proxy (put on a PVC) |
-| `SHIRABE_COVERART_CACHE_MAX_BYTES` | no | `9663676416` | Byte-cache soft budget (~9 GiB; oldest-mtime eviction) |
-| `SHIRABE_COVERART_POSITIVE_TTL_SECS` | no | `2592000` | Byte-cache TTL for 200 responses (30 days) |
-| `SHIRABE_COVERART_NEGATIVE_TTL_SECS` | no | `21600` | Byte-cache TTL for 404 responses (6 hours) |
-| `SHIRABE_COVERART_UPSTREAM_BASE` | no | `https://coverartarchive.org` | Upstream base for the `/release`, `/release-group` redirect layer |
-| `SHIRABE_DEBUG_UI` | no | `false` | Opt-in SQL query explorer at `/debug/queries`; keep off in exposed deployments. Only mounted when `SHIRABE_DEBUG_UI_TOKEN` is also set |
-| `SHIRABE_DEBUG_UI_TOKEN` | no | – | Bearer token required on every `/debug/*` request (`Authorization: Bearer <token>`, else 401). Without it the explorer is not mounted and a WARN is logged at boot |
-| `RUST_LOG` | no | `info` | tracing/`EnvFilter` log filter; `info` already includes one access-log line per request (method, path, status, latency ms). ANSI colours are off when stdout is not a tty |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | no | _(unset)_ | OTLP/HTTP collector; trace export is off unless set (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`). The other standard `OTEL_*` vars (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER[_ARG]`, `OTEL_SDK_DISABLED`) apply |
-
-### Telemetry
-
-With an OTLP endpoint set, shirabe exports one trace per request and per
-`sync` / `migrate` run: a server span per route (W3C `traceparent` honoured),
-internal spans on handlers, search, facades and ingest phases, a client span
-per upstream HTTP call (trace context propagated, secret query values
-redacted) and a `db.query` client span per SQL statement with its text and row
-count. Request query strings and API keys are never recorded.
-
-Testing-only (hidden from `--help`; never set in a real deployment):
-`TMDB_API_BASE`, `TVDB_API_BASE`, `FANART_API_BASE` point a facade at a mock
-upstream, and `SHIRABE_COVERART_INSECURE_IA` disables the `/_ia` SSRF guard so a
-local mock is reachable.
-
-## Deployment
-
-The container `EXPOSE`s and the server listens on **port 8800** (override with
-`SHIRABE_BIND`) — this is the port a Kubernetes `Service`/`HTTPRoute` should
-target. The image is built from `deploy/Dockerfile` (multi-stage,
-`debian:bookworm-slim` runtime) and published to GitHub Container Registry via
-`make image/release` (or the tag-driven `release` GitHub Actions workflow).
-
-shirabe is fully configured through environment variables (see above). Supply
-the `SHIRABE_*` tunables + `RUST_LOG` however your platform prefers (configMap,
-`.env`, plain env) and inject `DATABASE_URL` — the read-only MB-mirror DSN —
-from your secret store. shirabe reads it straight from the environment, no app
-changes needed.
-
-## Pointing a consumer at shirabe
-
-shirabe serves the exact same paths (`/ws/2/...`) and JSON shapes a MusicBrainz
-ws/2 client already parses. Point your client's base URL at the shirabe instance
-(e.g. `http://shirabe:8800`) instead of `https://musicbrainz.org`. Since shirabe
-talks to your own DB, the official 1 req/s courtesy rate limit is unnecessary —
-no consumer code changes are needed beyond config.
+- Only the endpoints above are implemented. Labels, works, events, places and other ws/2 entities return 404.
+- `query=` is not full Lucene: the known fields are always combined as `AND`, `OR` is not evaluated, and unknown fields are ignored.
+- `fmt=xml` is accepted but the response is always JSON.
+- `score` comes from trigram similarity, so it will not match musicbrainz.org's SOLR scores for the same query.
+- There are no write endpoints; the mirror is read-only and kept current by MusicBrainz replication, not by shirabe.
 
 ## Development
 
 ```sh
-make build      # cargo build --release
-make test       # cargo test (unit tests, no DB needed)
-make lint       # cargo clippy -D warnings
-make fmt        # cargo +nightly fmt
-make run        # cargo run (needs DATABASE_URL)
-make image/build
+git clone https://github.com/DorskFR/shirabe && cd shirabe
+make test               # cargo test, no database needed
+make db/up              # throwaway postgres:17 on port 5490
+make test-integration   # adds the DB-gated tests, seeding tests/fixtures/musicbrainz.sql
+make lint               # cargo clippy --all-targets -- -D warnings
+make fmt                # cargo +nightly fmt (unstable options)
+make run                # cargo run, needs DATABASE_URL
 ```
 
-`docker-compose.yaml` starts an **empty** local postgres for smoke-testing the
-migration + server boot. Real data requires loading a MusicBrainz Postgres dump
-(see musicbrainz-docker) or pointing `DATABASE_URL` at an existing mirror.
+Requires Rust 1.94 or newer, plus a nightly toolchain for `rustfmt`. The JSON responses in this README come from the Quick start setup above.
 
 ## License
 
-WTFPL.
+WTFPL, as declared in [`Cargo.toml`](Cargo.toml). The repository has no `LICENSE` file.
