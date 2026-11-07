@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "WTFPL"
 authors = ["DorskFR"]
-description = "A small, fast MusicBrainz ws/2 subset served directly from a MusicBrainz Postgres mirror via pg_trgm."
+description = "MusicBrainz ws/2 search and lookups served from a Postgres mirror with pg_trgm, in place of the SOLR search stack."
 
 [lints.rust]
 unsafe_code = "deny"
