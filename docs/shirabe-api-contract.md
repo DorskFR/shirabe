@@ -34,6 +34,9 @@ empty or a dummy: **Shirabe ignores the inbound key and uses its own server-side
 key** (`TMDB_API_KEY`, `TVDB_API_KEY`/`TVDB_PIN`, `FANART_API_KEY`). The real
 keys are never re-exposed to clients.
 
+MusicBrainz ws/2 queries hit the local mirror, so musicbrainz.org's 1 request/second
+courtesy limit does not apply.
+
 Cross-provider IDs are surfaced **inside** the native shapes (TMDB
 `external_ids.imdb_id`, TVDB `remoteIds`), backed by `shirabe.xref` — existing
 client parsing picks them up with no new endpoint.

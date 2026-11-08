@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "WTFPL"
 authors = ["DorskFR"]
-description = "MusicBrainz ws/2 search and lookups served from a Postgres mirror with pg_trgm, in place of the SOLR search stack."
+description = "MusicBrainz, TMDB, TheTVDB, fanart.tv and Cover Art Archive APIs served from local Postgres mirrors and caches."
 
 [lints.rust]
 unsafe_code = "deny"

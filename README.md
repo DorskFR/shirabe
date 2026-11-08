@@ -1,6 +1,6 @@
 # shirabe
 
-MusicBrainz ws/2 search and lookups served from a Postgres mirror with pg_trgm, in place of the SOLR search stack.
+MusicBrainz, TMDB, TheTVDB, fanart.tv and Cover Art Archive APIs served from local Postgres mirrors and caches.
 
 [![CI](https://github.com/DorskFR/shirabe/actions/workflows/ci.yml/badge.svg)](https://github.com/DorskFR/shirabe/actions/workflows/ci.yml)
 [![image](https://img.shields.io/github/v/tag/DorskFR/shirabe?label=ghcr.io)](https://github.com/DorskFR/shirabe/pkgs/container/shirabe)
@@ -8,11 +8,16 @@ MusicBrainz ws/2 search and lookups served from a Postgres mirror with pg_trgm, 
 
 ```mermaid
 flowchart LR
-  client[ws/2 client] -->|"GET /ws/2/..."| shirabe
-  shirabe -->|"SELECT, pg_trgm"| mb[(MusicBrainz Postgres mirror)]
-  media[TMDB / TheTVDB / fanart.tv client] -.->|"GET /3, /v4, /v3"| shirabe
-  shirabe -.-> cache[(per-provider cache DBs)]
-  shirabe -.->|cache miss| upstream[upstream APIs]
+  client[API clients] --> shirabe
+  shirabe -->|"/ws/2"| mb["MusicBrainz<br/>read-only mirror<br/>MB replication"]
+  shirabe -->|"/3"| tmdb["TMDB<br/>daily ID export + lazy cache<br/>api.themoviedb.org"]
+  shirabe -->|"/v4"| tvdb["TheTVDB<br/>lazy cache<br/>api4.thetvdb.com"]
+  shirabe -->|"/v3"| fanart["fanart.tv<br/>lazy cache<br/>webservice.fanart.tv"]
+  shirabe -->|"/release, /_ia"| caa["Cover Art Archive<br/>redirects + byte cache<br/>coverartarchive.org"]
+  tmdb -.->|"search"| imdb["IMDb<br/>bulk dump<br/>datasets.imdbws.com"]
+  tvdb -.->|"search"| imdb
+  tmdb -.->|"ids"| xref[(xref)]
+  tvdb -.->|"ids"| xref
 ```
 
 ```console
@@ -39,13 +44,13 @@ $ curl -s 'localhost:8800/ws/2/artist?query=seaside%20radoi' | jq .
 }
 ```
 
-^ A typo'd artist search against the test fixture. `score` is the trigram similarity scaled to 0-100.
+^ Typo'd artist search against the test fixture. `score` is trigram similarity scaled to 0-100.
 
-Running your own MusicBrainz search normally means the full ws/2 server plus Apache SOLR and its index rebuilds. Most clients only call a handful of ws/2 endpoints, so shirabe answers those straight from the replicated `musicbrainz` Postgres schema and returns MusicBrainz's hyphenated-key JSON, which lets an existing ws/2 client parser and its confidence re-scoring work unchanged. It also fronts TMDB, TheTVDB, fanart.tv and the Cover Art Archive under their native API paths as cache-first proxies, so one host serves all of a media app's metadata lookups. `調べ` (shirabe) means "to look up".
+Each API keeps its native paths and JSON shapes, so existing clients only change their base URL; ws/2 search runs on `pg_trgm` instead of SOLR. TMDB and TheTVDB searches also consult a local IMDb title index, and cross-provider ids from their payloads go into an `xref` table.
 
 ## Quick start
 
-This runs the published image against the small fake dataset in `tests/fixtures/musicbrainz.sql` (two artists, four releases), so you can try it without a mirror. Requires Docker and a clone of the repo.
+Published image against the fixture in `tests/fixtures/musicbrainz.sql` (two artists, four releases). Requires Docker.
 
 ```sh
 git clone https://github.com/DorskFR/shirabe && cd shirabe
@@ -62,15 +67,17 @@ $ curl -s localhost:8800/health
 {"status":"ok"}
 ```
 
-Clean up with `docker rm -f shirabe mb-fixture && docker network rm shirabe`.
+```sh
+docker rm -f shirabe mb-fixture && docker network rm shirabe
+```
 
-To serve real data, set `DATABASE_URL` to a MusicBrainz mirror (for example one built with [musicbrainz-docker](https://github.com/metabrainz/musicbrainz-docker)) after applying `migrations/000*.sql` to it once. Those add the trigram and full-text indexes and never touch replicated data; see [docs/deployment.md](docs/deployment.md).
+For a real mirror, apply `migrations/000*.sql` once and set `DATABASE_URL`: [docs/deployment.md](docs/deployment.md).
 
 ## Usage
 
 ### Search releases by title and artist
 
-`query=` takes the fielded Lucene subset ws/2 clients send: `release:`, `artist:`, `recording:`, `date:(YYYY*)`, `arid:`, `primarytype:`, `status:`, with quotes, `(...)` groups and `AND`. The fuzzy suffix `term~` is stripped, since the trigram match is already fuzzy.
+`query=` fields: `release:`, `artist:`, `recording:`, `date:(YYYY*)`, `arid:`, `primarytype:`, `status:`.
 
 ```console
 $ curl -sG localhost:8800/ws/2/release --data-urlencode 'query=release:(harbor lights) AND artist:(seaside radio)' -d limit=1 | jq .
@@ -110,9 +117,8 @@ $ curl -s 'localhost:8800/ws/2/release-group?artist=11111111-1111-4111-8111-1111
 {"release-group-count":1,"release-group-offset":0,"release-groups":[{"id":"22222222-2222-4222-8222-222222222222","title":"Harbour Lights","primary-type":"Album","secondary-types":["Live"],"first-release-date":"1997-05-21","disambiguation":"rg comment","artist-credit":[{"artist":{"id":"11111111-1111-4111-8111-111111111111","name":"Seaside Radio"}}]}]}
 ```
 
-### Point a ws/2 client at shirabe
+### Point clients at shirabe
 
-Set the client's MusicBrainz base URL to `http://<host>:8800/ws/2` instead of `https://musicbrainz.org/ws/2`. The paths and JSON shapes are the same, and since the queries hit your own database the 1 request/second courtesy limit no longer applies. The other providers follow the same pattern:
 
 ```
 musicbrainz.base_url = http://shirabe:8800/ws/2
@@ -122,7 +128,7 @@ fanart.base_url      = http://shirabe:8800/v3
 coverart.base_url    = http://shirabe:8800
 ```
 
-For TMDB, TheTVDB and fanart.tv, shirabe ignores the client's API key and uses its own server-side key.
+Client API keys are ignored; shirabe uses its own server-side keys. Details: [docs/shirabe-api-contract.md](docs/shirabe-api-contract.md#1-the-facade-approach).
 
 ## Endpoints
 
@@ -136,28 +142,28 @@ For TMDB, TheTVDB and fanart.tv, shirabe ignores the client's API key and uses i
 | `GET` | `/health` | `{"status":"ok"}` when the mirror is reachable |
 | `GET` | `/health/sources` | Per-source health and staleness (diagnostic, not a probe) |
 
-Unknown paths return JSON: `404 {"error":"shirabe: no such route: GET /ws/2/label"}`. Every prefix also has a provider alias (`/musicbrainz/ws/2`, `/music`, `/tmdb/3`, ...). The full route inventory, `inc=` tokens, error shapes and storage model are in [docs/shirabe-api-contract.md](docs/shirabe-api-contract.md).
+Unknown paths: `404 {"error":"shirabe: no such route: GET /ws/2/label"}`. Aliases, `inc=` tokens, error shapes and storage model: [docs/shirabe-api-contract.md](docs/shirabe-api-contract.md).
 
 ## Configuration
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DATABASE_URL` | required | MusicBrainz mirror DSN; shirabe only runs `SELECT`, so use a read-only role |
+| `DATABASE_URL` | required | MusicBrainz mirror DSN; `SELECT` only, read-only role suffices |
 | `SHIRABE_BIND` | `0.0.0.0:8800` | Listen address |
 | `SHIRABE_SIMILARITY_THRESHOLD` | `0.3` | Minimum `pg_trgm` similarity for a search hit |
 | `SHIRABE_DEFAULT_LIMIT` / `SHIRABE_MAX_LIMIT` | `25` / `100` | Default and maximum search `limit` |
 | `TMDB_API_KEY`, `TVDB_API_KEY`, `FANART_API_KEY` | unset | Server-side provider keys; without one that facade serves cached rows only |
 | `RUST_LOG` | `info` | Log filter; `info` logs one access line per request |
 
-Every variable, including the per-provider database URLs, the image cache and OpenTelemetry export, is in [docs/configuration.md](docs/configuration.md) and [`.env.example`](.env.example). Each one is also a `--flag` (`shirabe --help`). Container, probes, migrations and the `sync` / `migrate` subcommands are covered in [docs/deployment.md](docs/deployment.md).
+Full list, also available as `--flag`s: [docs/configuration.md](docs/configuration.md). Container, probes, `sync` and `migrate`: [docs/deployment.md](docs/deployment.md).
 
 ## Limitations
 
-- Only the endpoints above are implemented. Labels, works, events, places and other ws/2 entities return 404.
-- `query=` is not full Lucene: the known fields are always combined as `AND`, `OR` is not evaluated, and unknown fields are ignored.
-- `fmt=xml` is accepted but the response is always JSON.
-- `score` comes from trigram similarity, so it will not match musicbrainz.org's SOLR scores for the same query.
-- There are no write endpoints; the mirror is read-only and kept current by MusicBrainz replication, not by shirabe.
+- Endpoints above only. Labels, works, events, places: 404.
+- `query=` is not full Lucene: fields always `AND`ed, no `OR`, unknown fields ignored, `term~` stripped.
+- `fmt=xml` returns JSON.
+- `score` will not match musicbrainz.org's SOLR scores.
+- No write endpoints. The MusicBrainz mirror is updated by replication, not by shirabe.
 
 ## Development
 
@@ -171,8 +177,8 @@ make fmt                # cargo +nightly fmt (unstable options)
 make run                # cargo run, needs DATABASE_URL
 ```
 
-Requires Rust 1.94 or newer, plus a nightly toolchain for `rustfmt`. The JSON responses in this README come from the Quick start setup above.
+Rust 1.94+, nightly for `rustfmt`. Responses in this README come from the Quick start setup.
 
 ## License
 
-WTFPL, as declared in [`Cargo.toml`](Cargo.toml). The repository has no `LICENSE` file.
+WTFPL, declared in [`Cargo.toml`](Cargo.toml). No `LICENSE` file.
