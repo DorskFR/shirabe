@@ -44,7 +44,7 @@ $ curl -s 'localhost:8800/ws/2/artist?query=seaside%20radoi' | jq .
 }
 ```
 
-^ Typo'd artist search against the test fixture. `score` is trigram similarity scaled to 0-100.
+`score` is trigram similarity scaled to 0-100.
 
 Each API keeps its native paths and JSON shapes, so existing clients only change their base URL; ws/2 search runs on `pg_trgm` instead of SOLR. TMDB and TheTVDB searches also consult a local IMDb title index, and cross-provider ids from their payloads go into an `xref` table.
 
@@ -119,7 +119,6 @@ $ curl -s 'localhost:8800/ws/2/release-group?artist=11111111-1111-4111-8111-1111
 
 ### Point clients at shirabe
 
-
 ```
 musicbrainz.base_url = http://shirabe:8800/ws/2
 tmdb.base_url        = http://shirabe:8800/3
@@ -177,7 +176,7 @@ make fmt                # cargo +nightly fmt (unstable options)
 make run                # cargo run, needs DATABASE_URL
 ```
 
-Rust 1.94+, nightly for `rustfmt`. Responses in this README come from the Quick start setup.
+Rust 1.94+, nightly for `rustfmt`.
 
 ## License
 
