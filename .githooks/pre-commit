@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+rs=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+[ -n "$rs" ] || exit 0
+cargo +nightly fmt --all
+printf '%s\n' "$rs" | xargs git add --
+cargo clippy --all-targets -- -D warnings
+cargo check
+cargo test --lib --quiet
