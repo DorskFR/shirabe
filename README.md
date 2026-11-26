@@ -1,3 +1,5 @@
+<img src="docs/assets/icon.svg" width="64" height="64" alt="">
+
 # shirabe
 
 MusicBrainz, TMDB, TheTVDB, fanart.tv and Cover Art Archive APIs served from local Postgres mirrors and caches.
