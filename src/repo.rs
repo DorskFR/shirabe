@@ -15,9 +15,7 @@ use crate::models::{
     Track, UrlRelation, UrlResource,
 };
 use crate::queries;
-use crate::search::{
-    DEFAULT_STATEMENT_TIMEOUT_MS, FUZZY_STATEMENT_TIMEOUT_MS, configure_search_session,
-};
+use crate::search::{SessionKnobs, configure_search_session};
 
 /// Scale a pg_trgm similarity (0.0-1.0) into a MusicBrainz-style score (0-100).
 ///
@@ -58,19 +56,23 @@ fn is_statement_timeout(e: &sqlx::Error) -> bool {
 }
 
 /// Trigram fuzzy fallback for a search whose FTS primary matched nothing,
-/// capped at [`FUZZY_STATEMENT_TIMEOUT_MS`].
+/// capped at [`SessionKnobs::fuzzy_timeout_ms`].
 #[tracing::instrument(skip_all, fields(search.timed_out = tracing::field::Empty), err(level = "info"))]
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PgConnection,
+    session: SessionKnobs<'_>,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}")))
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {}", session.fuzzy_timeout_ms())))
         .execute(&mut *conn)
         .await?;
     let rows = fetch_bounded(query, conn).await;
-    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}")))
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "SET statement_timeout = {}",
+        session.statement_timeout_ms()
+    )))
+    .execute(&mut *conn)
+    .await?;
     rows
 }
 
@@ -86,6 +88,7 @@ const CREDIT_SIMILARITY_THRESHOLD: f32 = 0.5;
 async fn resolve_artist_credits(
     artist: &str,
     threshold: f64,
+    session: SessionKnobs<'_>,
     conn: &mut PgConnection,
 ) -> Result<Vec<i32>, sqlx::Error> {
     let mut rows =
@@ -95,9 +98,12 @@ async fn resolve_artist_credits(
             .bind(CREDIT_SIMILARITY_THRESHOLD)
             .execute(&mut *conn)
             .await?;
-        let fuzzy =
-            fetch_fuzzy(sqlx::query(queries::RESOLVE_ARTIST_CREDITS_FUZZY).bind(artist), conn)
-                .await;
+        let fuzzy = fetch_fuzzy(
+            sqlx::query(queries::RESOLVE_ARTIST_CREDITS_FUZZY).bind(artist),
+            conn,
+            session,
+        )
+        .await;
         sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut *conn).await?;
         rows = fuzzy?;
     }
@@ -433,7 +439,7 @@ pub async fn search_artists(
     limit: i64,
     offset: i64,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<(i64, Vec<Artist>), sqlx::Error> {
     // SHIB-23: FTS + f_unaccent whole-word fast path across artist.name /
     // sort_name / artist_alias.name (3 UNION branches, de-duped by id with MAX
@@ -442,7 +448,7 @@ pub async fn search_artists(
     // partial query). SHIB-20: the alias branch keeps alias-only recall (localised
     // / alternate names), previously loaded per-row by FK but never searched.
     let mut conn = pool.acquire().await?;
-    configure_search_session(&mut conn, threshold, work_mem).await?;
+    configure_search_session(&mut conn, threshold, session).await?;
     let mut rows = sqlx::query(queries::SEARCH_ARTISTS)
         .bind(name)
         .bind(limit)
@@ -453,6 +459,7 @@ pub async fn search_artists(
         rows = fetch_fuzzy(
             sqlx::query(queries::SEARCH_ARTISTS_FUZZY).bind(name).bind(limit).bind(offset),
             &mut conn,
+            session,
         )
         .await?;
     }
@@ -645,17 +652,17 @@ pub async fn search_releases(
     limit: i64,
     offset: i64,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<(i64, Vec<Release>), sqlx::Error> {
     // SHIB-22: FTS whole-word fast path (0.4ms warm vs ~350ms for the trigram `%`
     // scan), ranked by similarity() with an optional artist-credit similarity bonus
     // so title stays the dominant signal; trigram `%` fallback only when FTS matches
     // nothing (typo'd / partial query).
     let mut conn = pool.acquire().await?;
-    configure_search_session(&mut conn, threshold, work_mem).await?;
+    configure_search_session(&mut conn, threshold, session).await?;
     let year_i32 = filters.year.and_then(|y| y.parse::<i32>().ok());
     let rows = if let Some(artist) = scoping_artist(filters.artist) {
-        let credits = resolve_artist_credits(artist, threshold, &mut conn).await?;
+        let credits = resolve_artist_credits(artist, threshold, session, &mut conn).await?;
         let scoped = |sql| {
             sqlx::query(sql)
                 .bind(title)
@@ -673,7 +680,8 @@ pub async fn search_releases(
             fetch_bounded(scoped(queries::SEARCH_RELEASES_BY_ARTIST), &mut conn).await?
         };
         if rows.is_empty() && !credits.is_empty() {
-            fetch_fuzzy(scoped(queries::SEARCH_RELEASES_BY_ARTIST_FUZZY), &mut conn).await?
+            fetch_fuzzy(scoped(queries::SEARCH_RELEASES_BY_ARTIST_FUZZY), &mut conn, session)
+                .await?
         } else {
             rows
         }
@@ -701,6 +709,7 @@ pub async fn search_releases(
                     .bind(filters.status)
                     .bind(offset),
                 &mut conn,
+                session,
             )
             .await?
         } else {
@@ -1114,19 +1123,19 @@ pub async fn search_recordings(
     limit: i64,
     offset: i64,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<(i64, Vec<Recording>), sqlx::Error> {
     // SHIB-22: FTS whole-word fast path, ranked by similarity(); trigram `%`
     // fallback only when FTS matches nothing. Recording is 36M rows, where the old
     // trigram-`%`-primary scan timed out — FTS reduces the candidate set to the
     // handful of rows containing every query word before ranking.
     let mut conn = pool.acquire().await?;
-    configure_search_session(&mut conn, threshold, work_mem).await?;
+    configure_search_session(&mut conn, threshold, session).await?;
     // Title-only recording searches get no trigram fallback: a `%` scan of the
     // recording table can run for minutes past its statement_timeout.
     let rows = match scoping_artist(artist) {
         Some(artist) => {
-            let credits = resolve_artist_credits(artist, threshold, &mut conn).await?;
+            let credits = resolve_artist_credits(artist, threshold, session, &mut conn).await?;
             let scoped = |sql| {
                 sqlx::query(sql).bind(title).bind(artist).bind(limit).bind(offset).bind(&credits)
             };
@@ -1136,7 +1145,8 @@ pub async fn search_recordings(
                 fetch_bounded(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST), &mut conn).await?
             };
             if rows.is_empty() && !credits.is_empty() {
-                fetch_fuzzy(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST_FUZZY), &mut conn).await?
+                fetch_fuzzy(scoped(queries::SEARCH_RECORDINGS_BY_ARTIST_FUZZY), &mut conn, session)
+                    .await?
             } else {
                 rows
             }

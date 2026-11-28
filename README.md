@@ -61,7 +61,7 @@ docker run -d --name mb-fixture --network shirabe -e POSTGRES_PASSWORD=mb postgr
 until docker exec mb-fixture pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
 cat tests/fixtures/musicbrainz.sql migrations/000*.sql | docker exec -i mb-fixture psql -q -U postgres
 docker run --rm -d --name shirabe --network shirabe -p 8800:8800 \
-  -e DATABASE_URL=postgres://postgres:mb@mb-fixture/postgres ghcr.io/dorskfr/shirabe:0.8.3
+  -e DATABASE_URL=postgres://postgres:mb@mb-fixture/postgres ghcr.io/dorskfr/shirabe:0.9.0
 ```
 
 ```console

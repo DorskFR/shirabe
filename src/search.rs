@@ -26,14 +26,15 @@ use sqlx::{AssertSqlSafe, PgPool, Postgres, Row};
 use crate::queries;
 
 /// Run a trigram fuzzy-fallback search (used only when the FTS primary matched
-/// nothing), time-boxed to [`FUZZY_STATEMENT_TIMEOUT_MS`]. Hitting the cap
+/// nothing), time-boxed to [`SessionKnobs::fuzzy_timeout_ms`]. Hitting the cap
 /// yields no rows (SQLSTATE 57014) rather than erroring the whole request.
 #[tracing::instrument(skip_all, err(level = "info"))]
 async fn fetch_fuzzy(
     query: sqlx::query::Query<'_, Postgres, PgArguments>,
     conn: &mut PoolConnection<Postgres>,
+    session: SessionKnobs<'_>,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
-    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {FUZZY_STATEMENT_TIMEOUT_MS}")))
+    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {}", session.fuzzy_timeout_ms())))
         .execute(&mut **conn)
         .await?;
     let result = match query.fetch_all(&mut **conn).await {
@@ -48,7 +49,8 @@ async fn fetch_fuzzy(
     };
     // The pooled connection must not carry the tight cap into later queries.
     let _ = sqlx::query(AssertSqlSafe(format!(
-        "SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}"
+        "SET statement_timeout = {}",
+        session.statement_timeout_ms()
     )))
     .execute(&mut **conn)
     .await;
@@ -75,18 +77,45 @@ pub const IMDB_PROBE_MIN_THRESHOLD: f64 = 0.4;
 /// Fallback `work_mem` when the configured value sanitises to nothing.
 const DEFAULT_SEARCH_WORK_MEM: &str = "256MB";
 
-/// Per-connection `statement_timeout` (ms) for trigram search sessions (SHIB-19).
-///
-/// A runaway trigram query would otherwise run unbounded server-side and only die
-/// at the client's request cap; this caps it server-side so it fails fast with a
-/// clear Postgres error on the SAME connection that runs the search. Mirrors the
-/// `SHIRABE_STATEMENT_TIMEOUT_MS` config default.
-pub(crate) const DEFAULT_STATEMENT_TIMEOUT_MS: i64 = 10_000;
-
 /// Tighter `statement_timeout` (ms) for the trigram fuzzy fallback only: a KNN
 /// scan that hasn't answered in 3s will not answer well, and it must not hold
 /// the request for the full session cap.
 pub(crate) const FUZZY_STATEMENT_TIMEOUT_MS: i64 = 3_000;
+
+/// Per-connection session settings applied by [`configure_search_session`].
+#[derive(Debug, Clone, Copy)]
+pub struct SessionKnobs<'a> {
+    pub work_mem: &'a str,
+    /// `statement_timeout` (ms) bounding runaway searches server-side; `0`
+    /// disables it, as in Postgres.
+    pub statement_timeout_ms: i64,
+}
+
+impl<'a> SessionKnobs<'a> {
+    #[must_use]
+    pub fn from_config(config: &'a crate::config::Config) -> Self {
+        Self {
+            work_mem: &config.search_work_mem,
+            statement_timeout_ms: config.statement_timeout_ms,
+        }
+    }
+
+    #[must_use]
+    pub const fn statement_timeout_ms(self) -> i64 {
+        if self.statement_timeout_ms < 0 { 0 } else { self.statement_timeout_ms }
+    }
+
+    /// The fuzzy-fallback cap, never looser than the session cap.
+    #[must_use]
+    pub const fn fuzzy_timeout_ms(self) -> i64 {
+        let session = self.statement_timeout_ms();
+        if session == 0 || session > FUZZY_STATEMENT_TIMEOUT_MS {
+            FUZZY_STATEMENT_TIMEOUT_MS
+        } else {
+            session
+        }
+    }
+}
 
 /// Clamp a configured similarity threshold to the IMDb probe floor
 /// ([`IMDB_PROBE_MIN_THRESHOLD`]). Pure so it is unit-testable.
@@ -260,23 +289,25 @@ pub fn is_thin_result(hits: &[ScoredHit]) -> bool {
 /// go lossy and recheck the heap), and `statement_timeout` (SHIB-19 — bound
 /// runaway queries server-side so they fail fast). `work_mem` cannot be bound as
 /// a parameter in `SET`, so the value is sanitised via [`sanitize_work_mem`]
-/// before splicing; `statement_timeout` is a fixed integer count of milliseconds
-/// ([`DEFAULT_STATEMENT_TIMEOUT_MS`]), so it is spliced directly (no injection
-/// surface).
+/// before splicing; `statement_timeout` is an integer count of milliseconds, so
+/// it is spliced directly (no injection surface).
 pub async fn configure_search_session(
     conn: &mut PoolConnection<Postgres>,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_limit($1)").bind(threshold as f32).execute(&mut **conn).await?;
-    sqlx::query(AssertSqlSafe(format!("SET work_mem = '{}'", sanitize_work_mem(work_mem))))
+    sqlx::query(AssertSqlSafe(format!("SET work_mem = '{}'", sanitize_work_mem(session.work_mem))))
         .execute(&mut **conn)
         .await?;
     // `statement_timeout` as a bare integer is interpreted by Postgres as ms.
     // Set on THIS connection so the search query below inherits the cap.
-    sqlx::query(AssertSqlSafe(format!("SET statement_timeout = {DEFAULT_STATEMENT_TIMEOUT_MS}")))
-        .execute(&mut **conn)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "SET statement_timeout = {}",
+        session.statement_timeout_ms()
+    )))
+    .execute(&mut **conn)
+    .await?;
     // Searches return a handful of rows; when a generic plan's estimate crosses
     // jit_optimize_above_cost, LLVM compilation alone costs 300+ ms of CPU per
     // execution and never pays back.
@@ -295,10 +326,10 @@ async fn search_tmdb_id_index(
     kind: &str,
     limit: i64,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    configure_search_session(&mut conn, threshold, work_mem).await?;
+    configure_search_session(&mut conn, threshold, session).await?;
     // FTS primary (SHIB-24); fall back to the trigram fuzzy query only when FTS
     // matched nothing (typos / partials), bounded by the session statement_timeout.
     let mut rows = sqlx::query(queries::SEARCH_TMDB_ID_INDEX)
@@ -311,6 +342,7 @@ async fn search_tmdb_id_index(
         rows = fetch_fuzzy(
             sqlx::query(queries::SEARCH_TMDB_ID_INDEX_FUZZY).bind(query).bind(kind).bind(limit),
             &mut conn,
+            session,
         )
         .await?;
     }
@@ -346,12 +378,12 @@ async fn search_imdb_titles(
     title_types: &[&str],
     limit: i64,
     threshold: f64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Result<Vec<ScoredHit>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
     // The IMDb tables are probed with `%`, so the cutoff is clamped to the
     // probe floor — see [`IMDB_PROBE_MIN_THRESHOLD`] (SHIB-16).
-    configure_search_session(&mut conn, imdb_probe_threshold(threshold), work_mem).await?;
+    configure_search_session(&mut conn, imdb_probe_threshold(threshold), session).await?;
     // Candidate tconsts come from EITHER a basics-title match OR an akas-title
     // match (the akas GIN index carries the non-latin variants). We then take the
     // GREATEST similarity over primary/original/aka for the score. `$3` is a
@@ -372,6 +404,7 @@ async fn search_imdb_titles(
                 .bind(limit)
                 .bind(title_types),
             &mut conn,
+            session,
         )
         .await?;
     }
@@ -548,7 +581,7 @@ pub async fn local_tmdb_search(
     query: &str,
     kind: &str,
     limit: i64,
-    work_mem: &str,
+    session: SessionKnobs<'_>,
 ) -> Vec<ScoredHit> {
     // The two pools are separate databases; probe them concurrently so their
     // latencies (worst case: one fuzzy-fallback cap each) overlap instead of
@@ -561,7 +594,7 @@ pub async fn local_tmdb_search(
                 kind,
                 limit,
                 LOCAL_SIMILARITY_THRESHOLD,
-                work_mem,
+                session,
             )
             .await
             {
@@ -574,15 +607,8 @@ pub async fn local_tmdb_search(
     let imdb_search = async {
         if let Some(pool) = imdb_pool {
             let types = imdb_title_types(kind);
-            match search_imdb_titles(
-                pool,
-                query,
-                types,
-                limit,
-                LOCAL_SIMILARITY_THRESHOLD,
-                work_mem,
-            )
-            .await
+            match search_imdb_titles(pool, query, types, limit, LOCAL_SIMILARITY_THRESHOLD, session)
+                .await
             {
                 // Cross-reference tconst hits to TMDB ids (via previously hydrated
                 // cache payloads) before merging, so an exact IMDb-akas match (e.g.
@@ -608,6 +634,34 @@ pub async fn local_tmdb_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_knobs_carry_the_configured_statement_timeout() {
+        use clap::Parser;
+        let cli = crate::config::Cli::try_parse_from([
+            "shirabe",
+            "--database-url",
+            "postgres://x/x",
+            "--statement-timeout-ms",
+            "25000",
+            "--search-work-mem",
+            "64MB",
+        ])
+        .unwrap();
+        let knobs = SessionKnobs::from_config(&cli.config);
+        assert_eq!(knobs.statement_timeout_ms(), 25_000);
+        assert_eq!(knobs.work_mem, "64MB");
+        assert_eq!(knobs.fuzzy_timeout_ms(), FUZZY_STATEMENT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn fuzzy_cap_is_never_looser_than_the_session_cap() {
+        let knobs = |ms| SessionKnobs { work_mem: "", statement_timeout_ms: ms };
+        assert_eq!(knobs(1_000).fuzzy_timeout_ms(), 1_000);
+        assert_eq!(knobs(10_000).fuzzy_timeout_ms(), FUZZY_STATEMENT_TIMEOUT_MS);
+        assert_eq!(knobs(0).fuzzy_timeout_ms(), FUZZY_STATEMENT_TIMEOUT_MS);
+        assert_eq!(knobs(-5).statement_timeout_ms(), 0);
+    }
 
     fn hit(id: &str, score: i32, pop: Option<f64>) -> ScoredHit {
         ScoredHit { id: id.to_string(), name: id.to_string(), score, popularity: pop, adult: None }

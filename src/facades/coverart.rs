@@ -14,14 +14,13 @@
 //!   caches the bytes on disk (30d positive, 6h negative) with single-flight per
 //!   key and an `X-Cache-Status` header.
 //!
-//! SSRF: the byte layer is HTTPS-only and refuses any host that is, or resolves
-//! to, a non-public address (private, loopback, link-local, CGNAT, unique-local,
-//! multicast, reserved, tunnel/translation prefixes embedding such an address).
-//! The check lives in the client's DNS resolver, so the vetted addresses are the
-//! ones the socket connects to — a 0-TTL name cannot swap in a private address
-//! between check and connect. IP literals bypass hyper's resolver and are vetted
-//! up front. This is the in-app equivalent of `caache`'s public-:443-only egress
-//! NetworkPolicy.
+//! SSRF: the byte layer only fetches over HTTPS from an allowlist of artwork
+//! hosts (`archive.org` and its subdomains, `coverartarchive.org`, and the TMDB,
+//! TVDB and fanart.tv image hosts), building the upstream URL from the vetted
+//! host alone. Those names are still resolved through a guard that refuses any
+//! non-public address, so the vetted addresses are the ones the socket connects
+//! to. Responses carry `nosniff`, a sandboxing CSP and only image content types,
+//! so nothing proxied can run on this origin.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -33,7 +32,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, State};
-use axum::http::header::{CONTENT_TYPE, LOCATION};
+use axum::http::header::{
+    CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, LOCATION, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -239,14 +240,23 @@ async fn ia_passthrough(
     Path((host, _path)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
-    let ca = &state.coverart;
+    let mut resp = ia_fetch(&state.coverart, &host, &uri).await;
+    let headers = resp.headers_mut();
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers
+        .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
+    headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("inline"));
+    resp
+}
 
-    if !ca.insecure_ia
-        && let Err(reason) = guard_host(&host)
-    {
-        tracing::warn!(host, reason, "coverart /_ia host rejected");
-        return (StatusCode::FORBIDDEN, "forbidden host").into_response();
-    }
+async fn ia_fetch(ca: &CoverArtState, host: &str, uri: &axum::http::Uri) -> Response {
+    let url = match ia_upstream_url(ia_rest(uri.path()), uri.query(), ca.insecure_ia) {
+        Ok(url) => url,
+        Err(reason) => {
+            tracing::warn!(host, reason, "coverart /_ia host rejected");
+            return (StatusCode::FORBIDDEN, "forbidden host").into_response();
+        }
+    };
 
     let key = ia_cache_key(uri.path(), uri.query());
     let pos = ca.positive_ttl.as_secs();
@@ -254,31 +264,24 @@ async fn ia_passthrough(
     let span = tracing::Span::current();
     if let Some((status, ct, body)) = cache_get(ca, &key, pos, neg).await {
         span.record("cache.hit", true);
-        return cached_response(status, ct.as_deref(), body);
+        return cached_response(status, Some(ia_content_type(ct.as_deref())), body);
     }
 
     let _lease = ca.locks.acquire(&key).await;
     if let Some((status, ct, body)) = cache_get(ca, &key, pos, neg).await {
         span.record("cache.hit", true);
-        return cached_response(status, ct.as_deref(), body);
+        return cached_response(status, Some(ia_content_type(ct.as_deref())), body);
     }
     span.record("cache.hit", false);
 
-    let scheme = if ca.insecure_ia { "http" } else { "https" };
-    let mut url = format!("{scheme}://{}", ia_rest(uri.path()));
-    if let Some(q) = uri.query() {
-        url.push('?');
-        url.push_str(q);
-    }
-
-    let resp = match ca.ia_client.get(&url).send_traced().await {
+    let resp = match ca.ia_client.get(url.clone()).send_traced().await {
         Ok(resp) => resp,
         Err(e) => {
             if let Some(reason) = blocked_host_reason(&e) {
                 tracing::warn!(host, reason, "coverart /_ia host rejected");
                 return (StatusCode::FORBIDDEN, "forbidden host").into_response();
             }
-            tracing::warn!(error = %e, url, "coverart /_ia upstream request failed");
+            tracing::warn!(error = %e, host, "coverart /_ia upstream request failed");
             return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
         }
     };
@@ -301,7 +304,17 @@ async fn ia_passthrough(
     if status == StatusCode::OK || status == StatusCode::NOT_FOUND {
         cache_put(ca, &key, status.as_u16(), ct.as_deref(), &body).await;
     }
-    body_response(status, ct.as_deref(), body, "MISS")
+    body_response(status, Some(ia_content_type(ct.as_deref())), body, "MISS")
+}
+
+/// Upstream `Content-Type` if it is an image type, else `application/octet-stream`.
+fn ia_content_type(upstream: Option<&str>) -> &str {
+    match upstream {
+        Some(ct) if ct.trim_start().get(..6).is_some_and(|p| p.eq_ignore_ascii_case("image/")) => {
+            ct
+        }
+        _ => "application/octet-stream",
+    }
 }
 
 enum BodyError {
@@ -570,22 +583,60 @@ fn blocked_host_reason(e: &reqwest::Error) -> Option<&'static str> {
     None
 }
 
-/// Up-front SSRF guard for what the client resolver never sees: an explicit port
-/// (HTTPS :443 is enforced by construction) and IP literals, which hyper connects
-/// to without resolving. Names are vetted by [`PublicOnlyResolver`] at connect.
-fn guard_host(host: &str) -> Result<(), &'static str> {
+/// Upstream hosts the byte layer may fetch from: where Cover Art Archive
+/// redirects to and where the facades' rewritten artwork URLs point.
+const IA_ALLOWED_HOSTS: &[&str] = &[
+    "archive.org",
+    "coverartarchive.org",
+    "image.tmdb.org",
+    "artworks.thetvdb.com",
+    "assets.fanart.tv",
+];
+
+fn ia_host_allowed(host: &str) -> bool {
+    IA_ALLOWED_HOSTS.contains(&host)
+        || host.strip_suffix(".archive.org").is_some_and(|sub| !sub.is_empty())
+}
+
+/// Build the upstream URL for a raw `host/path` remainder from the vetted host
+/// only: an allowlisted DNS name, no userinfo, no port, HTTPS. The insecure test
+/// seam accepts any `host[:port]` over plain HTTP.
+fn ia_upstream_url(
+    rest: &str,
+    query: Option<&str>,
+    insecure: bool,
+) -> Result<reqwest::Url, &'static str> {
+    let (raw_host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = raw_host.to_ascii_lowercase();
     if host.is_empty() {
         return Err("empty host");
     }
-    if host.contains(':') {
-        return Err("explicit port not allowed");
+    let scheme = if insecure { "http" } else { "https" };
+    if !insecure {
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        {
+            return Err("invalid host");
+        }
+        if !ia_host_allowed(&host) {
+            return Err("host not allowed");
+        }
     }
-    if let Ok(ip) = host.parse::<IpAddr>()
-        && ip_is_blocked(ip)
+    let mut url =
+        reqwest::Url::parse(&format!("{scheme}://{host}/")).map_err(|_| "invalid host")?;
+    url.set_path(path);
+    url.set_query(query);
+    if !insecure
+        && (url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.host_str() != Some(host.as_str()))
     {
-        return Err("non-public address");
+        return Err("invalid host");
     }
-    Ok(())
+    Ok(url)
 }
 
 /// Is `ip` outside the public unicast space the byte layer may reach?
@@ -827,16 +878,57 @@ mod tests {
     }
 
     #[test]
-    fn guard_rejects_ports_and_private_literals_but_defers_names() {
-        assert!(guard_host("").is_err());
-        assert!(guard_host("archive.org:443").is_err());
-        assert!(guard_host("[::1]").is_err());
-        assert!(guard_host("127.0.0.1").is_err());
-        assert!(guard_host("10.1.2.3").is_err());
-        assert!(guard_host("100.64.0.1").is_err());
-        assert!(guard_host("1.1.1.1").is_ok());
-        assert!(guard_host("archive.org").is_ok());
-        assert!(guard_host("localhost").is_ok());
+    fn ia_upstream_url_only_dials_allowlisted_names() {
+        for rest in [
+            "",
+            "/x.jpg",
+            "archive.org:443/x.jpg",
+            "x@127.0.0.1/x.jpg",
+            "x@archive.org/x.jpg",
+            "archive.org@evil.example/x.jpg",
+            "x%40127.0.0.1/x.jpg",
+            "2130706433/x.jpg",
+            "127.1/x.jpg",
+            "0x7f.0.0.1/x.jpg",
+            "10.1/x.jpg",
+            "[::1]/x.jpg",
+            "127.0.0.1/x.jpg",
+            "1.1.1.1/x.jpg",
+            "localhost/x.jpg",
+            "evil.example/x.jpg",
+            "archive.org.evil.example/x.jpg",
+            "evilarchive.org/x.jpg",
+            ".archive.org/x.jpg",
+        ] {
+            assert!(ia_upstream_url(rest, None, false).is_err(), "{rest}");
+        }
+        for (rest, want) in [
+            ("archive.org/download/x/front.jpg", "https://archive.org/download/x/front.jpg"),
+            (
+                "ia800000.us.archive.org/12/items/x.jpg",
+                "https://ia800000.us.archive.org/12/items/x.jpg",
+            ),
+            ("coverartarchive.org/release/m/front", "https://coverartarchive.org/release/m/front"),
+            ("image.tmdb.org/t/p/original/a.jpg", "https://image.tmdb.org/t/p/original/a.jpg"),
+            ("artworks.thetvdb.com/banners/b.jpg", "https://artworks.thetvdb.com/banners/b.jpg"),
+            ("Assets.Fanart.TV/fanart/c.jpg", "https://assets.fanart.tv/fanart/c.jpg"),
+        ] {
+            assert_eq!(ia_upstream_url(rest, None, false).unwrap().as_str(), want, "{rest}");
+        }
+        assert_eq!(
+            ia_upstream_url("archive.org/a@b/c.jpg", Some("x=1"), false).unwrap().as_str(),
+            "https://archive.org/a@b/c.jpg?x=1"
+        );
+    }
+
+    #[test]
+    fn ia_content_type_passes_only_images() {
+        assert_eq!(ia_content_type(Some("image/jpeg")), "image/jpeg");
+        assert_eq!(ia_content_type(Some("IMAGE/PNG")), "IMAGE/PNG");
+        for ct in [Some("text/html"), Some("application/json"), Some("imagex/y"), Some("img"), None]
+        {
+            assert_eq!(ia_content_type(ct), "application/octet-stream", "{ct:?}");
+        }
     }
 
     #[tokio::test]

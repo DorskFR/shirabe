@@ -93,11 +93,9 @@ pub struct Config {
     #[arg(long, env = "SHIRABE_SIMILARITY_THRESHOLD", default_value_t = 0.3)]
     pub similarity_threshold: f64,
 
-    /// Per-connection `statement_timeout` (milliseconds) applied to trigram search
-    /// sessions (SHIB-19). Without it a runaway query runs unbounded server-side and
-    /// only dies at the client's request cap; this makes it fail fast with a clear
-    /// Postgres error. Set on the SAME connection that runs the search (see
-    /// [`crate::search::configure_search_session`]).
+    /// Per-connection `statement_timeout` (milliseconds) bounding search sessions
+    /// server-side, set in [`crate::search::configure_search_session`]; the fuzzy
+    /// fallback is capped at the lower of this and 3 s. `0` disables it.
     #[arg(long, env = "SHIRABE_STATEMENT_TIMEOUT_MS", default_value_t = 10_000)]
     pub statement_timeout_ms: i64,
 

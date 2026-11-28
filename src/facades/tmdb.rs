@@ -530,7 +530,8 @@ fn merge_live_results(results: &mut Vec<Value>, live: &Value) {
 /// Local-first: search the deployed index (`tmdb_id_index` + IMDb akas)
 /// FIRST; on a thin or empty local result, fall through to the live API and MERGE
 /// (dedupe by id). Cache holds the merged payload so the second identical call is
-/// served without re-hitting upstream.
+/// served without re-hitting upstream; a payload degraded by a failed live call
+/// is served but never cached.
 #[tracing::instrument(skip_all, fields(tmdb.kind = kind, search.query = tracing::field::Empty))]
 async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
     let Some(query) = search_query(params) else {
@@ -555,7 +556,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
         &query,
         kind,
         SEARCH_LIMIT,
-        &state.config.search_work_mem,
+        crate::search::SessionKnobs::from_config(&state.config),
     )
     .await;
 
@@ -571,6 +572,7 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
 
     // 2) Fall through to the live API and merge on a thin/miss local result, or
     //    when local results still lack fields consumers score on.
+    let mut degraded = false;
     if search::is_thin_result(&renderable) || any_result_missing_fields(&payload, kind) {
         if let Some(key) = state.config.tmdb_api_key.as_deref() {
             let path = format!("search/{kind}");
@@ -582,7 +584,10 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
                         payload["results"] = json!(results);
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, kind, "tmdb search upstream failed"),
+                Err(e) => {
+                    degraded = true;
+                    tracing::warn!(error = %e, kind, "tmdb search upstream failed");
+                }
             }
         }
         // No key (or upstream error): serve whatever the local index produced —
@@ -598,7 +603,9 @@ async fn search(state: &Arc<AppState>, kind: &str, params: &Value) -> Response {
 
     ensure_result_fields(&mut payload, kind);
     finalize_envelope(&mut payload);
-    cache_put(state, cache_id, &cache_kind, &payload).await;
+    if !degraded {
+        cache_put(state, cache_id, &cache_kind, &payload).await;
+    }
     rewrite_image_urls(state.config.caache_base_url.as_deref(), &mut payload);
     Json(payload).into_response()
 }

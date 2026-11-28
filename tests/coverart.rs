@@ -150,6 +150,44 @@ async fn ia_bytes_are_cached_mount_invariantly() {
 }
 
 #[tokio::test]
+async fn ia_serves_only_image_types_with_hardening_headers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/x.html"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<script>1</script>", "text/html"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ok.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("jpg", "image/jpeg"))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let st = coverart_state("http://unused.invalid", &dir, true);
+    let host = server.uri().trim_start_matches("http://").to_string();
+    for (req, ct, cache) in [
+        ("x.html", "application/octet-stream", "MISS"),
+        ("x.html", "application/octet-stream", "HIT"),
+        ("ok.jpg", "image/jpeg", "MISS"),
+    ] {
+        let resp = send(&st, "GET", &format!("/_ia/{host}/{req}")).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{req}");
+        let h = resp.headers();
+        assert_eq!(h.get("x-cache-status").unwrap(), cache, "{req}");
+        assert_eq!(h.get("content-type").unwrap(), ct, "{req}");
+        assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff", "{req}");
+        assert_eq!(
+            h.get("content-security-policy").unwrap(),
+            "default-src 'none'; sandbox",
+            "{req}"
+        );
+        assert_eq!(h.get("content-disposition").unwrap(), "inline", "{req}");
+    }
+}
+
+#[tokio::test]
 async fn ia_upstream_redirect_bounces_back_through_local_ia() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

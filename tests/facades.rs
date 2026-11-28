@@ -383,6 +383,61 @@ async fn tmdb_detail_second_call_is_served_from_cache() {
 
 #[tokio::test]
 #[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
+async fn tmdb_search_never_caches_a_result_degraded_by_upstream_failure() {
+    let db = provider_db("tmdb").await;
+    let server = MockServer::start().await;
+    let st = state(&[
+        "--tmdb-api-key",
+        "test-key",
+        "--tmdb-api-base",
+        &server.uri(),
+        "--tmdb-database-url",
+        &db,
+    ]);
+    let pool = shirabe::db::connect(&db, 1).await.unwrap();
+    let cached = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tmdb_cache WHERE kind = 'search_movie'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    let failing = Mock::given(method("GET"))
+        .and(path("/search/movie"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(2)
+        .mount_as_scoped(&server)
+        .await;
+    for round in 1..=2 {
+        let (status, body) = get(&st, "/3/search/movie?query=matrix").await;
+        assert_eq!(status, StatusCode::OK, "round {round}");
+        assert_eq!(body["results"], json!([]), "round {round}");
+    }
+    assert_eq!(cached().await, 0, "a degraded result must not be cached");
+    drop(failing);
+
+    Mock::given(method("GET"))
+        .and(path("/search/movie"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "page": 1,
+            "results": [{ "id": 603, "title": "The Matrix", "release_date": "1999-03-31",
+                          "overview": "x", "popularity": 50.0 }],
+            "total_pages": 1, "total_results": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for round in 1..=2 {
+        let (status, body) = get(&st, "/3/search/movie?query=matrix").await;
+        assert_eq!(status, StatusCode::OK, "recovered round {round}");
+        assert_eq!(body["results"][0]["id"], 603, "recovered round {round}");
+    }
+    assert_eq!(cached().await, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+#[ignore = "needs postgres (DATABASE_URL_TEST); run via make test-integration"]
 async fn tvdb_series_second_call_is_served_from_cache() {
     let db = provider_db("tvdb").await;
     let server = MockServer::start().await;

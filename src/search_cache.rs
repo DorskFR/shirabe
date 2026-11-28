@@ -52,13 +52,32 @@ type Slot = tokio::sync::Mutex<Option<Bytes>>;
 struct Entry {
     body: Bytes,
     expires_at: Instant,
+    seq: u64,
 }
 
+/// `order` lists `(key, seq)` oldest first; an item whose `seq` no longer
+/// matches its entry is stale. Every entry shares one TTL, so the front is
+/// always the next to expire.
 #[derive(Default)]
 struct Inner {
     entries: HashMap<SearchKey, Entry>,
-    order: VecDeque<SearchKey>,
+    order: VecDeque<(SearchKey, u64)>,
+    next_seq: u64,
     inflight: HashMap<SearchKey, Arc<Slot>>,
+}
+
+impl Inner {
+    fn is_live(&self, key: &SearchKey, seq: u64) -> bool {
+        self.entries.get(key).is_some_and(|e| e.seq == seq)
+    }
+
+    fn pop_oldest(&mut self) {
+        if let Some((key, seq)) = self.order.pop_front()
+            && self.is_live(&key, seq)
+        {
+            self.entries.remove(&key);
+        }
+    }
 }
 
 /// Bounded TTL cache of serialised search responses. Cloning shares the store.
@@ -114,20 +133,24 @@ impl SearchCache {
         }
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
-        if inner.entries.len() >= self.max_entries {
-            inner.entries.retain(|_, e| e.expires_at > now);
-        }
-        while inner.entries.len() >= self.max_entries {
-            match inner.order.pop_front() {
-                Some(oldest) => {
-                    inner.entries.remove(&oldest);
-                }
-                None => break,
+        while let Some((front, seq)) = inner.order.front() {
+            match inner.entries.get(front) {
+                Some(e) if e.seq == *seq && e.expires_at > now => break,
+                _ => inner.pop_oldest(),
             }
         }
-        inner.order.retain(|k| k != &key);
-        inner.order.push_back(key.clone());
-        inner.entries.insert(key, Entry { body, expires_at: now + self.ttl });
+        while inner.entries.len() >= self.max_entries && !inner.order.is_empty() {
+            inner.pop_oldest();
+        }
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.order.push_back((key.clone(), seq));
+        inner.entries.insert(key, Entry { body, expires_at: now + self.ttl, seq });
+        if inner.order.len() > 2 * self.max_entries {
+            let Inner { entries, order, .. } = &mut *inner;
+            order.retain(|(k, s)| entries.get(k).is_some_and(|e| e.seq == *s));
+        }
+        drop(inner);
     }
 
     /// Serve `key` from cache, or run `compute` once for all concurrent callers
@@ -226,6 +249,46 @@ mod tests {
         assert!(cache.get(&key("a")).is_none());
         assert!(cache.get(&key("b")).is_some());
         assert!(cache.get(&key("c")).is_some());
+    }
+
+    #[test]
+    fn reinsert_refreshes_position() {
+        let cache = SearchCache::new(Duration::from_secs(60), 2);
+        cache.insert(key("a"), Bytes::from_static(b"1"));
+        cache.insert(key("b"), Bytes::from_static(b"2"));
+        cache.insert(key("a"), Bytes::from_static(b"1b"));
+        cache.insert(key("c"), Bytes::from_static(b"3"));
+        assert!(cache.get(&key("b")).is_none());
+        assert_eq!(cache.get(&key("a")).as_deref(), Some(&b"1b"[..]));
+        assert!(cache.get(&key("c")).is_some());
+    }
+
+    #[tokio::test]
+    async fn order_stays_bounded_across_ttls_and_reinserts() {
+        let max = 8;
+        let cache = SearchCache::new(Duration::from_millis(20), max);
+        for round in 0..6 {
+            for i in 0..(max / 2) {
+                let k = key(&format!("r{round}-{i}"));
+                cache.insert(k.clone(), Bytes::from_static(b"x"));
+                cache.insert(k, Bytes::from_static(b"y"));
+                cache.insert(key("hot"), Bytes::from_static(b"h"));
+                let (entries, order) = {
+                    let inner = cache.inner.lock().unwrap();
+                    (inner.entries.len(), inner.order.len())
+                };
+                assert!(entries <= max);
+                assert!(order <= 2 * max, "order {order} > {}", 2 * max);
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        cache.insert(key("last"), Bytes::from_static(b"z"));
+        let (entries, order) = {
+            let inner = cache.inner.lock().unwrap();
+            (inner.entries.len(), inner.order.len())
+        };
+        assert_eq!(entries, 1, "expired entries are swept on insert");
+        assert_eq!(order, 1, "stale order keys are swept with them");
     }
 
     #[test]
