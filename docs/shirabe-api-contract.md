@@ -247,12 +247,18 @@ Two layers:
   bouncing any further CDN redirect back through `/_ia/`, and caches bytes on
   disk (30 d positive / 6 h negative TTL, ~9 GiB budget with oldest-mtime
   eviction, single-flight per key). An `X-Cache-Status: HIT|MISS` header reports
-  disposition. SSRF guard: HTTPS-only, explicit ports refused, and any host that
-  is or resolves to a non-public address (private, loopback, link-local, CGNAT,
-  unique-local, multicast, reserved, benchmarking, documentation, or an IPv6
-  mapped/compatible/NAT64/6to4 form embedding one) is rejected with 403. The
-  vetted addresses are the ones the proxy connects to, so a DNS answer cannot
-  change between the check and the connection.
+  disposition. SSRF guard: HTTPS-only, and `{host}` must be an allowlisted
+  artwork host (`archive.org` or any `*.archive.org`, `coverartarchive.org`,
+  `image.tmdb.org`, `artworks.thetvdb.com`, `assets.fanart.tv`) given as a plain
+  DNS name: userinfo, ports, IP literals and anything else answer 403
+  `forbidden host`. The upstream URL is built from that vetted host only, and its
+  addresses must still be public (private, loopback, link-local, CGNAT,
+  unique-local, multicast, reserved, or an IPv6 form embedding one are refused);
+  the vetted addresses are the ones the proxy connects to. Every `/_ia`
+  response carries `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: default-src 'none'; sandbox` and
+  `Content-Disposition: inline`; an upstream `Content-Type` other than
+  `image/*` is served as `application/octet-stream`.
 
 Both layers cap upstream bodies at **20 MiB**: a larger `Content-Length` is
 refused before the body is read, and a chunked body is aborted the moment it

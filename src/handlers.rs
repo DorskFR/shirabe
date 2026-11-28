@@ -122,7 +122,7 @@ pub async fn search_artist(
                     limit,
                     offset,
                     state.config.similarity_threshold,
-                    &state.config.search_work_mem,
+                    crate::search::SessionKnobs::from_config(&state.config),
                 )
                 .await?;
                 span.record("result.count", count);
@@ -197,7 +197,7 @@ pub async fn search_release(
                     limit,
                     offset,
                     state.config.similarity_threshold,
-                    &state.config.search_work_mem,
+                    crate::search::SessionKnobs::from_config(&state.config),
                 )
                 .await?;
                 span.record("result.count", count);
@@ -248,7 +248,7 @@ pub async fn search_recording(
                     limit,
                     offset,
                     state.config.similarity_threshold,
-                    &state.config.search_work_mem,
+                    crate::search::SessionKnobs::from_config(&state.config),
                 )
                 .await?;
                 span.record("result.count", count);

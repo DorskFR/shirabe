@@ -28,13 +28,15 @@ const FTS_PREREQS: &[&str] = &[
 ];
 
 /// The bulk-dump swap drops the base tables and leaves this derived table stale,
-/// so it is TRUNCATEd and repopulated on every run, not incrementally updated.
+/// so it is rebuilt from scratch on every run into a staging table, indexed, and
+/// swapped in by [`SEARCH_TABLE_SWAP`]: readers see the old table or the complete
+/// new one, and a failed build leaves the old table serving.
 const SEARCH_TABLE_BUILD: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS imdb_search_titles ( \
+    "DROP TABLE IF EXISTS imdb_search_titles_new",
+    "CREATE TABLE imdb_search_titles_new ( \
         tconst text NOT NULL, title_ua text NOT NULL, title_type text, \
         num_votes integer NOT NULL DEFAULT 0, tsv tsvector NOT NULL )",
-    "TRUNCATE imdb_search_titles",
-    "INSERT INTO imdb_search_titles (tconst, title_ua, title_type, num_votes, tsv) \
+    "INSERT INTO imdb_search_titles_new (tconst, title_ua, title_type, num_votes, tsv) \
      SELECT DISTINCT ON (tconst, title_ua) \
             tconst, title_ua, title_type, num_votes, to_tsvector('simple', title_ua) \
      FROM ( \
@@ -59,6 +61,16 @@ const SEARCH_TABLE_BUILD: &[&str] = &[
      ) s \
      WHERE title_ua <> '' \
      ORDER BY tconst, title_ua, num_votes DESC",
+    "CREATE INDEX imdb_search_titles_new_tsv_gin ON imdb_search_titles_new USING gin (tsv)",
+    "CREATE INDEX imdb_search_titles_new_tconst_idx ON imdb_search_titles_new (tconst)",
+];
+
+/// Run in one transaction after [`SEARCH_TABLE_BUILD`].
+const SEARCH_TABLE_SWAP: &[&str] = &[
+    "DROP TABLE IF EXISTS imdb_search_titles",
+    "ALTER TABLE imdb_search_titles_new RENAME TO imdb_search_titles",
+    "ALTER INDEX imdb_search_titles_new_tsv_gin RENAME TO imdb_search_titles_tsv_gin",
+    "ALTER INDEX imdb_search_titles_new_tconst_idx RENAME TO imdb_search_titles_tconst_idx",
 ];
 
 const FTS_INDEXES: &[IndexDef] = &[
@@ -141,6 +153,13 @@ impl IndexSet {
         }
     }
 
+    const fn swap_steps(self) -> &'static [&'static str] {
+        match self {
+            Self::Fts => SEARCH_TABLE_SWAP,
+            Self::Trgm => &[],
+        }
+    }
+
     const fn indexes(self) -> &'static [IndexDef] {
         match self {
             Self::Fts => FTS_INDEXES,
@@ -185,6 +204,17 @@ async fn existing_indexes(
     Ok(rows.iter().map(|r| (r.get("indexname"), r.get("indisvalid"))).collect())
 }
 
+async fn run_in_tx(pool: &PgPool, steps: &[&'static str]) -> sqlx::Result<()> {
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for stmt in steps {
+        sqlx::query(*stmt).execute(&mut *tx).await?;
+    }
+    tx.commit().await
+}
+
 #[async_trait]
 impl Source for ImdbIndexSource {
     fn id(&self) -> &str {
@@ -214,6 +244,9 @@ impl Source for ImdbIndexSource {
             if let Err(e) = sqlx::query(*stmt).execute(pool).await {
                 return RefreshReport::failed(format!("search-table build failed: {e}"));
             }
+        }
+        if let Err(e) = run_in_tx(pool, self.set.swap_steps()).await {
+            return RefreshReport::failed(format!("search-table swap failed: {e}"));
         }
 
         let pre_existing = match existing_indexes(pool, self.set.indexes()).await {
@@ -341,6 +374,24 @@ mod tests {
             ]
         );
         assert!(!fts.iter().any(|n| trgm.contains(n)));
+    }
+
+    #[test]
+    fn search_table_is_built_in_staging_and_swapped_by_name() {
+        assert!(
+            SEARCH_TABLE_BUILD.iter().all(|s| !s.contains("imdb_search_titles ")
+                && !s.contains("imdb_search_titles\n")
+                && !s.contains("TRUNCATE")),
+            "the build must never touch the live table"
+        );
+        for def in &FTS_INDEXES[..2] {
+            let staged = def.name.replace("imdb_search_titles_", "imdb_search_titles_new_");
+            assert!(SEARCH_TABLE_BUILD.iter().any(|s| s.contains(&format!("INDEX {staged} "))));
+            assert!(
+                SEARCH_TABLE_SWAP
+                    .contains(&format!("ALTER INDEX {staged} RENAME TO {}", def.name).as_str())
+            );
+        }
     }
 
     #[test]

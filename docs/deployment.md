@@ -68,3 +68,5 @@ inject `DATABASE_URL` and the API keys from your secret store.
 
 If the `/_ia` image proxy is used, mount persistent storage at
 `SHIRABE_COVERART_CACHE_DIR` and size it to `SHIRABE_COVERART_CACHE_MAX_BYTES`.
+The image runs as uid/gid `65532`, so a mounted volume must be writable by it
+(e.g. `securityContext.fsGroup: 65532`).

@@ -273,9 +273,18 @@ async fn coverart_ia_guard_rejects_private_hosts_on_both_mounts() {
         "/_ia/10.0.0.1/some/image.jpg",
         "/coverart/_ia/127.0.0.1/some/image.jpg",
         "/_ia/localhost:9999/explicit/port.jpg",
+        "/_ia/x@127.0.0.1/anything",
+        "/_ia/x%40127.0.0.1/anything",
+        "/_ia/2130706433/x",
+        "/_ia/127.1/x",
+        "/_ia/0x7f.0.0.1/x",
+        "/_ia/x@169.254.169.254/latest/meta-data",
+        "/_ia/example.com/x.html",
+        "/coverart/_ia/attacker.example/x.svg",
     ] {
         let resp = send(&st, "GET", path).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(resp.headers().get("x-content-type-options").unwrap(), "nosniff", "{path}");
     }
 }
 

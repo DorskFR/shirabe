@@ -7,7 +7,7 @@ mod common;
 
 use common::{mb_fixture_db, provider_db};
 use shirabe::queries::{self, Param, ParamType, TargetDb};
-use shirabe::search::configure_search_session;
+use shirabe::search::{SessionKnobs, configure_search_session};
 use sqlx::postgres::PgArguments;
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
@@ -121,7 +121,13 @@ async fn every_catalog_statement_executes_against_real_schemas() {
         }
         let mut conn = pool.acquire().await.unwrap();
         if spec.trigram {
-            configure_search_session(&mut conn, 0.3, "64MB").await.unwrap();
+            configure_search_session(
+                &mut conn,
+                0.3,
+                SessionKnobs { work_mem: "64MB", statement_timeout_ms: 10_000 },
+            )
+            .await
+            .unwrap();
         }
         if let Err(e) = q.fetch_all(&mut *conn).await {
             panic!("catalog query `{}` failed to execute: {e}", spec.id);

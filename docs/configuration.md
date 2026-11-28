@@ -27,7 +27,7 @@ if it is unset.
 | `SHIRABE_DEFAULT_LIMIT` | `25` | Default search `limit` |
 | `SHIRABE_MAX_LIMIT` | `100` | Hard cap on requested `limit` |
 | `SHIRABE_SIMILARITY_THRESHOLD` | `0.3` | Min `pg_trgm` similarity to keep a row |
-| `SHIRABE_STATEMENT_TIMEOUT_MS` | `10000` | Per-connection `statement_timeout` on trigram search sessions |
+| `SHIRABE_STATEMENT_TIMEOUT_MS` | `10000` | Per-connection `statement_timeout` on search sessions; the fuzzy fallback uses the lower of this and 3 s; `0` disables it |
 | `SHIRABE_SEARCH_WORK_MEM` | `256MB` | Per-connection `work_mem` on trigram search sessions |
 | `SHIRABE_SEARCH_CACHE_TTL_SECS` | `300` | TTL of the in-process ws/2 search response cache; `0` disables storage (identical concurrent searches still share one query) |
 | `SHIRABE_SEARCH_CACHE_MAX_ENTRIES` | `4096` | Max cached search responses, oldest evicted first; `0` disables storage |

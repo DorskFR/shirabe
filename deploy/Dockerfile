@@ -14,5 +14,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/shirabe /usr/local/bin/shirabe
 COPY --from=builder /app/migrations /migrations
+RUN mkdir -p /var/cache/shirabe/coverart && chown -R 65532:65532 /var/cache/shirabe
+USER 65532:65532
 EXPOSE 8800
 CMD ["shirabe"]
