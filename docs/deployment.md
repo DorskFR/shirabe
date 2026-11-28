@@ -45,7 +45,7 @@ cron job. Source ids are listed by `GET /health/sources` (`musicbrainz`,
 
 ## Container
 
-The image is built from `deploy/Dockerfile` (multi-stage, `debian:bookworm-slim`
+The image is built from `deploy/Dockerfile` (multi-stage, `debian:trixie-slim`
 runtime) and published to `ghcr.io/dorskfr/shirabe:<version>` by the
 tag-driven `release` workflow, or by `make image/release`. Images are tagged
 with the `Cargo.toml` version only; there is no `latest`.
